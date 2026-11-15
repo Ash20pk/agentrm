@@ -99,6 +99,24 @@ func (c *infoCache) refresh(procs map[int]*sys.Proc) {
 	}
 }
 
+// getPID is the newest entry for a PID, for a process that may have just exited.
+func (c *infoCache) getPID(pid int) sys.ProcInfo {
+	if c.direct {
+		info, _ := c.read(pid)
+		return info
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var best procKey
+	var info sys.ProcInfo
+	for k, v := range c.m {
+		if k.pid == pid && k.start >= best.start {
+			best, info = k, v
+		}
+	}
+	return info
+}
+
 func (c *infoCache) get(p *sys.Proc) sys.ProcInfo {
 	if p == nil {
 		return sys.ProcInfo{}
@@ -612,6 +630,9 @@ func (m *Manager) withLeftovers(found []*model.Resource, procs map[int]*sys.Proc
 			}
 			if r.Cwd == "" {
 				r.Cwd = lo.Cwd
+			}
+			if len(r.RestartArgv) == 0 && len(lo.Argv) > 0 {
+				r.RestartArgv, r.RestartEnv = lo.Argv, lo.Env
 			}
 			r.AskOnly = r.AskOnly || lo.AskOnly
 			continue

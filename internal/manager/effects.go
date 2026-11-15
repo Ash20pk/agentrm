@@ -2,6 +2,7 @@ package manager
 
 import (
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -138,6 +139,16 @@ func (m *Manager) afterAsync(results []EffectResult) {
 func (m *Manager) recordStopped(r model.Resource, why, by string, now time.Time) {
 	if by == "" {
 		by = "agentrm"
+	}
+	// A process: keep how it was started, so a restore can start it again (the cache still has
+	// it until the next sweep notices it is gone).
+	if r.PID > 0 && len(r.RestartArgv) == 0 && m.infos != nil {
+		if info := m.infos.getPID(r.PID); len(info.Argv) > 0 {
+			r.RestartArgv, r.RestartEnv = info.Argv, info.EnvList()
+			if r.Restart == "" || strings.HasPrefix(r.Restart, "re-run") {
+				r.Restart = "agentrm restore " + r.ID
+			}
+		}
 	}
 	r.PausedAt, r.OrphanSince, r.LeaseID, r.Urgent = nil, nil, "", false
 	m.st.Stopped = append(m.st.Stopped, &model.Stopped{Resource: r, StoppedAt: now, Why: why, By: by})

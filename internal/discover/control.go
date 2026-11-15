@@ -164,6 +164,9 @@ func Restore(r *model.Resource) error {
 			return nil // loads on the next request
 		}
 	}
+	if len(r.RestartArgv) > 0 {
+		return restartLeftover(r) // any process AgentRM saw start: its command, directory, environment
+	}
 	return fmt.Errorf("%s cannot be restored by AgentRM: %s", r.ID, r.Restart)
 }
 
