@@ -1,43 +1,43 @@
 #!/usr/bin/env bash
-# Builds a signed, notarized, stapled AgentRM.dmg.
+# Builds a Developer ID signed, notarized and stapled AgentRM, as a .zip and a .dmg.
 #
-# Needs, once per machine:
-#   - a "Developer ID Application" certificate in the login keychain
-#   - notarization credentials:  xcrun notarytool store-credentials agentrm-notary \
-#         --apple-id <apple id> --team-id <team id>
-#   - DEVELOPMENT_TEAM = <team id> in app/Config/Local.xcconfig
+# Needs: an Apple ID signed in under Xcode → Settings → Accounts for a team that can create
+# Developer ID certificates, and DEVELOPMENT_TEAM = <team id> in app/Config/Local.xcconfig.
+# Xcode creates the Developer ID certificate and notarizes through that account.
 set -euo pipefail
 cd "$(dirname "$0")/../app"
-PROFILE="${NOTARY_PROFILE:-agentrm-notary}"
 VERSION=$(awk -F'"' '/MARKETING_VERSION/{print $2; exit}' project.yml)
 OUT="$PWD/build/release"
 rm -rf "$OUT" && mkdir -p "$OUT"
 
-security find-identity -v -p codesigning | grep -q "Developer ID Application" ||
-  { echo "No Developer ID Application certificate in the keychain." >&2; exit 1; }
-
 xcodegen generate -q
 xcodebuild -project AgentRM.xcodeproj -scheme AgentRM -configuration Release \
-  -derivedDataPath build/dd clean build | grep -E "error|BUILD (SUCCEEDED|FAILED)"
-APP=build/dd/Build/Products/Release/AgentRM.app
-codesign --verify --deep --strict --verbose=2 "$APP"
-codesign -dv "$APP" 2>&1 | grep -q "Developer ID Application" || { echo "app is not Developer ID signed" >&2; exit 1; }
+  -archivePath "$OUT/AgentRM.xcarchive" -allowProvisioningUpdates archive | grep -E "error|ARCHIVE (SUCCEEDED|FAILED)"
 
-echo "Notarizing the app…"
-ditto -c -k --keepParent "$APP" "$OUT/AgentRM.zip"
-xcrun notarytool submit "$OUT/AgentRM.zip" --keychain-profile "$PROFILE" --wait
-xcrun stapler staple "$APP"
+echo "Signing with Developer ID and uploading for notarization…"
+xcodebuild -exportArchive -archivePath "$OUT/AgentRM.xcarchive" -exportOptionsPlist ExportOptions.plist \
+  -exportPath "$OUT/upload" -allowProvisioningUpdates
 
-echo "Building the DMG…"
+echo "Waiting for Apple's notary service…"
+for i in $(seq 1 60); do
+  if xcodebuild -exportNotarizedApp -archivePath "$OUT/AgentRM.xcarchive" -exportPath "$OUT/app" >/dev/null 2>&1; then
+    break
+  fi
+  [ "$i" = 60 ] && { echo "Notarization did not finish in 30 minutes." >&2; exit 1; }
+  sleep 30
+done
+APP="$OUT/app/AgentRM.app"
+xcrun stapler validate "$APP"
+spctl --assess --type execute -v "$APP"
+codesign -dv "$APP/Contents/Helpers/agentrm" 2>&1 | grep -q "Developer ID Application" ||
+  { echo "the bundled agentrm helper is not Developer ID signed" >&2; exit 1; }
+
+ZIP="$OUT/AgentRM-$VERSION.zip"
+ditto -c -k --keepParent "$APP" "$ZIP"
 STAGE="$OUT/dmg" && mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/" && ln -s /Applications "$STAGE/Applications"
 DMG="$OUT/AgentRM-$VERSION.dmg"
 hdiutil create -volname "AgentRM $VERSION" -srcfolder "$STAGE" -ov -format UDZO "$DMG" >/dev/null
-IDENTITY=$(security find-identity -v -p codesigning | awk -F'"' '/Developer ID Application/{print $2; exit}')
-codesign --sign "$IDENTITY" --timestamp "$DMG"
-xcrun notarytool submit "$DMG" --keychain-profile "$PROFILE" --wait
-xcrun stapler staple "$DMG"
-spctl --assess --type open --context context:primary-signature -v "$DMG"
 
-shasum -a 256 "$DMG" | tee "$DMG.sha256"
-echo "Done: $DMG"
+(cd "$OUT" && shasum -a 256 "$(basename "$ZIP")" "$(basename "$DMG")" | tee SHA256SUMS)
+echo "Done: $ZIP $DMG"

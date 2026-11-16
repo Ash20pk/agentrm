@@ -1,11 +1,9 @@
-// Signing for local and release builds.
-// Put your own team in Config/Local.xcconfig (git-ignored), for example:
+// Signing. Put your own team in Config/Local.xcconfig (git-ignored):
 //   DEVELOPMENT_TEAM = ABCDE12345
-// Release builds for distribution use a Developer ID Application certificate.
+// Builds and archives sign with Apple Development; scripts/release.sh exports the archive
+// with a Developer ID certificate and notarizes it through your Xcode account.
 CODE_SIGN_STYLE = Automatic
 CODE_SIGN_IDENTITY = Apple Development
-CODE_SIGN_IDENTITY[config=Release] = Developer ID Application
-CODE_SIGN_STYLE[config=Release] = Manual
-OTHER_CODE_SIGN_FLAGS[config=Release] = --timestamp
+OTHER_CODE_SIGN_FLAGS = --timestamp
 
 #include? "Local.xcconfig"

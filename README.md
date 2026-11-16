@@ -99,7 +99,7 @@ State is in `~/.agentrm/state.json` and every decision is logged to `~/.agentrm/
 go test ./... && go build -o agentrm .        # the daemon and CLI
 cd app && echo "DEVELOPMENT_TEAM = <your team id>" > Config/Local.xcconfig
 xcodegen generate && open AgentRM.xcodeproj     # the menu-bar app (bundles the CLI)
-scripts/release.sh                              # signed, notarized DMG (maintainers)
+scripts/release.sh                              # notarized zip + DMG (maintainers; needs an Apple ID in Xcode)
 ```
 
 Requires Go 1.24+, Xcode 16+ and [XcodeGen](https://github.com/yonaskolb/XcodeGen).
