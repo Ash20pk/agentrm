@@ -72,6 +72,7 @@ const usage = `agentrm — a resource manager for coding agents on this Mac
   agentrm whoami                               which session the daemon thinks you are
   agentrm status [--json] | top                what is running, who holds it, memory
   agentrm stop RESOURCE                        stop something now (reversibly)
+  agentrm resume RESOURCE | --all              thaw something agentrm paused
   agentrm config [--dry-run=true|false] [--grace MIN] [--headroom GB] [--idle MIN]
   agentrm setup claude|codex|path [--uninstall]   install the Claude hooks / Codex note / CLI link
   agentrm setup check                          what is installed (JSON)
@@ -108,6 +109,7 @@ func main() {
 	grace := fs.Int("grace", 0, "minutes an orphan may run unclaimed")
 	headroom := fs.Float64("headroom", 0, "GB kept free after any grant")
 	idleMin := fs.Int("idle", 0, "minutes unused before a holder is asked")
+	pauseMin := fs.Int("pause", -1, "minutes frozen before an unclaimed resource is stopped (0 = stop directly)")
 	_ = fs.Parse(args)
 	if pos == "" && fs.NArg() > 0 {
 		pos = fs.Arg(0)
@@ -232,10 +234,21 @@ func main() {
 		if err = call("/stop", map[string]any{"resource_id": pos}, &resp); err == nil {
 			fmt.Printf("stopped %s. Restart with: %s\n", pos, resp.Restart)
 		}
+	case "resume":
+		if pos == "" && *all {
+			pos = "--all"
+		}
+		var resp struct{ Resumed int }
+		if err = call("/resume", with("resource_id", pos), &resp); err == nil {
+			fmt.Printf("resumed %d\n", resp.Resumed)
+		}
 	case "config":
 		req := map[string]any{"grace_minutes": *grace, "headroom_gb": *headroom, "idle_minutes": *idleMin}
 		if *dryRun != "" {
 			req["dry_run"] = *dryRun == "true"
+		}
+		if *pauseMin >= 0 {
+			req["pause_minutes"] = *pauseMin
 		}
 		var raw json.RawMessage
 		if err = call("/config", req, &raw); err == nil {
@@ -327,6 +340,8 @@ func printStatus() error {
 		switch {
 		case r.Pinned:
 			owner = "pinned"
+		case r.PausedAt != nil:
+			owner = "PAUSED " + time.Since(*r.PausedAt).Round(time.Minute).String()
 		case r.LeaseID == "" && r.OrphanSince != nil:
 			left := time.Until(r.OrphanSince.Add(grace)).Round(time.Second)
 			if left < 0 {

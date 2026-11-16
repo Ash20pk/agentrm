@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -339,5 +341,135 @@ func TestEstimatesLearnOnlyFromRealRuns(t *testing.T) {
 	d.dropLease(&Lease{ID: "d", Session: "s", Kind: "cargo-build", MemGB: 2.5, PeakMB: 12}, "failed at once")
 	if _, ok := d.st.Learned["cargo-build"]; ok {
 		t.Fatal("learned from a build that never got going")
+	}
+}
+
+func procState(pid int) string {
+	out, _ := run("ps", "-o", "state=", "-p", fmt.Sprint(pid))
+	return strings.TrimSpace(out)
+}
+
+func TestPauseBeforeStop(t *testing.T) {
+	cmd := exec.Command("sleep", "120")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(exited) }()
+	defer cmd.Process.Kill()
+	pid := cmd.Process.Pid
+
+	d := memDaemon(8)
+	d.cfg.DryRun = false
+	now := time.Now()
+	r := &Resource{ID: "srv:test", Kind: RKServer, Name: "sleep", PID: pid, MemMB: 10}
+	d.st.Resources[r.ID] = r
+
+	d.checkOrphans(now) // asked
+	if r.OrphanSince == nil || !strings.Contains(d.st.Questions[r.ID].Text, "paused") {
+		t.Fatal("not asked, or not told it would be paused first")
+	}
+	grace := time.Duration(d.cfg.GraceMinutes) * time.Minute
+	d.checkOrphans(now.Add(grace + time.Second)) // frozen, not stopped
+	if r.PausedAt == nil || !strings.HasPrefix(procState(pid), "T") {
+		t.Fatalf("expected the process to be frozen, state=%q", procState(pid))
+	}
+	select {
+	case <-exited:
+		t.Fatal("the process was stopped instead of frozen")
+	default:
+	}
+
+	// A command that uses it thaws it before it runs.
+	r.Ports = []string{"45678"}
+	if _, err := d.touchCmd(map[string]any{"session": "s1", "cmd": "curl http://localhost:45678/"}); err != nil {
+		t.Fatal(err)
+	}
+	if r.PausedAt != nil || strings.HasPrefix(procState(pid), "T") {
+		t.Fatalf("a command using it did not thaw it, state=%q", procState(pid))
+	}
+
+	// Unclaimed again: frozen again, then stopped once the hold is over.
+	d.checkOrphans(now.Add(time.Hour))
+	d.checkOrphans(now.Add(time.Hour + grace + time.Second))
+	if r.PausedAt == nil {
+		t.Fatal("not frozen the second time")
+	}
+	hold := time.Duration(d.cfg.PauseMinutes) * time.Minute
+	d.checkOrphans(now.Add(time.Hour + grace + hold/2))
+	select {
+	case <-exited:
+		t.Fatal("stopped before the hold was over")
+	default:
+	}
+	d.checkOrphans(now.Add(time.Hour + grace + hold + 2*time.Second))
+	select {
+	case <-exited:
+	case <-time.After(3 * time.Second):
+		t.Fatal("a frozen process was not stopped after the hold (TERM must be followed by CONT)")
+	}
+	if d.st.Resources[r.ID] != nil {
+		t.Fatal("stopped resource still listed")
+	}
+}
+
+func TestBlockedRequestSkipsThePause(t *testing.T) {
+	cmd := exec.Command("sleep", "120")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(exited) }()
+	defer cmd.Process.Kill()
+
+	d := memDaemon(1.2)
+	d.cfg.DryRun = false
+	now := time.Now()
+	since := now.Add(-time.Minute)
+	r := &Resource{ID: "srv:test", Kind: RKServer, Name: "sleep", PID: cmd.Process.Pid, MemMB: 900, OrphanSince: &since}
+	d.st.Resources[r.ID] = r
+	if ok, _ := d.admit("waiting", "server", 600, now); ok {
+		t.Fatal("granted without room")
+	}
+	if !r.Urgent {
+		t.Fatal("the orphan was not marked for a direct stop")
+	}
+	d.checkOrphans(now.Add(time.Duration(d.cfg.PressureGraceMinutes)*time.Minute + time.Second))
+	select {
+	case <-exited:
+	case <-time.After(3 * time.Second):
+		t.Fatal("with a request waiting for memory the orphan should be stopped, not frozen")
+	}
+}
+
+func TestClaimThawsAndDryRunNeverPauses(t *testing.T) {
+	cmd := exec.Command("sleep", "120")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = cmd.Wait() }()
+	defer cmd.Process.Kill()
+	pid := cmd.Process.Pid
+
+	d := memDaemon(8) // dry run is the default
+	now := time.Now()
+	r := &Resource{ID: "srv:test", Kind: RKServer, Name: "sleep", PID: pid}
+	d.st.Resources[r.ID] = r
+	d.checkOrphans(now)
+	d.checkOrphans(now.Add(24 * time.Hour))
+	if r.PausedAt != nil || strings.HasPrefix(procState(pid), "T") {
+		t.Fatal("dry run froze something")
+	}
+
+	d.cfg.DryRun = false
+	d.checkOrphans(now.Add(24 * time.Hour))
+	if r.PausedAt == nil {
+		t.Fatal("not frozen")
+	}
+	if _, err := d.claim(map[string]any{"resource_id": r.ID, "session": "you", "purpose": "mine", "_human": true}); err != nil {
+		t.Fatal(err)
+	}
+	if r.PausedAt != nil || strings.HasPrefix(procState(pid), "T") || r.LeaseID == "" {
+		t.Fatalf("claiming did not thaw it, state=%q", procState(pid))
 	}
 }

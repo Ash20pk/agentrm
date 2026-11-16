@@ -20,6 +20,7 @@ struct Config: Codable {
     var grace_minutes: Int
     var default_ttl_minutes: Int
     var dry_run: Bool
+    var pause_minutes: Int?
     var never_stop: [String]?
 }
 
@@ -48,6 +49,7 @@ struct Resource: Codable, Identifiable {
     var orphan_since: Date?
     var pinned: Bool?
     var started_by: String?
+    var paused_at: Date?
 }
 
 struct AgentSession: Codable, Identifiable {

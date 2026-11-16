@@ -81,6 +81,7 @@ final class Store: ObservableObject {
 
     func release(_ l: Lease) { act(["release", l.id]) }
     func stop(_ r: Resource) { act(["stop", r.id]) }
+    func resume(_ r: Resource) { act(["resume", r.id]) }
     func pin(_ r: Resource) { act([r.pinned == true ? "unpin" : "pin", r.id]) }
     func claim(_ r: Resource, purpose: String, hours: Int) {
         act(["claim", r.id, "--purpose", purpose, "--ttl", String(hours * 60), "--agent", "you", "--session", "you"])
@@ -112,9 +113,9 @@ final class Store: ObservableObject {
         defer { lastEventSeq = max(lastEventSeq, maxSeq) }
         // First load, or the daemon restarted: don't replay history.
         if lastEventSeq < 0 || maxSeq < lastEventSeq { return }
-        for e in events where e.seq > lastEventSeq && ["ORPHAN", "STOPPED", "STOP", "ASKYOU", "OVERRIDE", "UNLEASED-USE"].contains(e.kind) {
+        for e in events where e.seq > lastEventSeq && ["ORPHAN", "STOPPED", "STOP", "PAUSED", "ASKYOU", "OVERRIDE", "UNLEASED-USE"].contains(e.kind) {
             let content = UNMutableNotificationContent()
-            content.title = ["ORPHAN": "Unclaimed resource", "ASKYOU": "Still using this?",
+            content.title = ["ORPHAN": "Unclaimed resource", "ASKYOU": "Still using this?", "PAUSED": "Paused (nothing lost)",
                              "OVERRIDE": "Settings or leases changed from a terminal",
                              "UNLEASED-USE": "Heavy use without a lease"][e.kind] ?? "Stopped"
             content.body = e.text

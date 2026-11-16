@@ -38,6 +38,8 @@ type Resource struct {
 	CPU         float64    `json:"cpu,omitempty"`         // percent, where measured
 	LastActive  time.Time  `json:"last_active,omitempty"` // last sign of use seen by the sweeper
 	StartedBy   string     `json:"started_by,omitempty"`  // session that started it, when known
+	PausedAt    *time.Time `json:"paused_at,omitempty"`   // frozen since then, not yet stopped
+	Urgent      bool       `json:"urgent,omitempty"`      // a blocked request needs its memory: stop, do not freeze
 }
 
 func run(name string, args ...string) (string, error) {
@@ -288,6 +290,11 @@ func stop(r *Resource) error {
 		return err
 	case RKGradle, RKServer:
 		_, err := run("kill", "-TERM", strconv.Itoa(r.PID))
+		if err == nil && r.PausedAt != nil {
+			// A frozen process only sees the TERM once it runs again.
+			// (It may already be gone, so a failure here means nothing.)
+			_, _ = run("kill", "-CONT", strconv.Itoa(r.PID))
+		}
 		return err
 	}
 	return fmt.Errorf("don't know how to stop %s", r.Kind)
