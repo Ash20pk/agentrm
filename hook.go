@@ -53,6 +53,7 @@ func loadExtraPatterns() {
 }
 
 func classify(cmd string) string {
+	cmd = activeText(cmd)
 	for _, c := range extraClassifiers {
 		if c.re.MatchString(cmd) {
 			return c.kind

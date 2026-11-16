@@ -19,6 +19,9 @@ type MemStats struct {
 	DiskFreeGB   float64 `json:"disk_free_gb"` // on /
 	Load1        float64 `json:"load1"`
 	Cores        int     `json:"cores"`
+	// PressureLevel is the kernel's own verdict: 1 normal, 2 warning, 4 critical.
+	PressureLevel int     `json:"pressure_level"`
+	Swapouts      float64 `json:"-"` // cumulative, in MB
 }
 
 var vmStatLine = regexp.MustCompile(`^(.+?):\s+(\d+)\.?$`)
@@ -47,6 +50,7 @@ func readMem() MemStats {
 		mb := func(k string) float64 { return pages[k] * pageSize / 1048576 }
 		m.AvailableMB = mb("Pages free") + mb("Pages inactive") + mb("Pages purgeable") + mb("Pages speculative")
 		m.CompressedMB = mb("Pages occupied by compressor")
+		m.Swapouts = mb("Swapouts")
 		m.WiredMB = mb("Pages wired down")
 	}
 	if out, err := exec.Command("sysctl", "-n", "vm.swapusage").Output(); err == nil {
@@ -61,6 +65,12 @@ func readMem() MemStats {
 		re := regexp.MustCompile(`free percentage: (\d+)%`)
 		if mm := re.FindStringSubmatch(string(out)); mm != nil {
 			m.FreePercent, _ = strconv.Atoi(mm[1])
+		}
+	}
+	m.PressureLevel = 1
+	if out, err := exec.Command("sysctl", "-n", "kern.memorystatus_vm_pressure_level").Output(); err == nil {
+		if v, err := strconv.Atoi(strings.TrimSpace(string(out))); err == nil {
+			m.PressureLevel = v
 		}
 	}
 	m.DiskFreeGB = diskFreeGB("/")

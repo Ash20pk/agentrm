@@ -12,23 +12,27 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 type Config struct {
-	ReserveGB         float64            `json:"reserve_gb"`          // kept back for macOS and your own apps
-	MinFreePercent    int                `json:"min_free_percent"`    // refuse new leases below this memory_pressure free %
-	GraceMinutes      int                `json:"grace_minutes"`       // how long an orphan may run unclaimed
-	DefaultTTLMinutes int                `json:"default_ttl_minutes"` // lease lifetime, renewed while the session is active
-	BuildTTLMinutes   int                `json:"build_ttl_minutes"`   // builds are not renewed
-	SweepSeconds      int                `json:"sweep_seconds"`
-	DryRun            bool               `json:"dry_run"` // ask and notify, but never stop anything
-	KindMemGB         map[string]float64 `json:"kind_mem_gb"`
-	ServerNames       []string           `json:"server_names"`   // listening processes treated as dev servers
-	ServerExclude     []string           `json:"server_exclude"` // substrings of args that are never dev servers
-	NeverStop         []string           `json:"never_stop"`     // resource IDs or name substrings left alone
+	HeadroomGB           float64            `json:"headroom_gb"`            // memory kept free after any grant
+	MaxSwapMBPerMin      float64            `json:"max_swap_mb_per_min"`    // refuse new leases while swapping out faster than this
+	PressureGraceMinutes int                `json:"pressure_grace_minutes"` // deadline for holders when another request is blocked
+	PressureIdleMinutes  int                `json:"pressure_idle_minutes"`  // a lease unused this long can be reclaimed for a blocked request
+	UnleasedGB           float64            `json:"unleased_gb"`            // flag a session using this much with no lease
+	GraceMinutes         int                `json:"grace_minutes"`          // how long an orphan may run unclaimed
+	DefaultTTLMinutes    int                `json:"default_ttl_minutes"`    // lease lifetime, renewed while the session is active
+	BuildTTLMinutes      int                `json:"build_ttl_minutes"`      // builds are not renewed
+	SweepSeconds         int                `json:"sweep_seconds"`
+	DryRun               bool               `json:"dry_run"` // ask and notify, but never stop anything
+	KindMemGB            map[string]float64 `json:"kind_mem_gb"`
+	ServerNames          []string           `json:"server_names"`   // listening processes treated as dev servers
+	ServerExclude        []string           `json:"server_exclude"` // substrings of args that are never dev servers
+	NeverStop            []string           `json:"never_stop"`     // resource IDs or name substrings left alone
 	// ExtraPatterns adds command regexes per lease kind, e.g. {"compose": ["my-stack\\.sh\\s+start"]}.
 	ExtraPatterns map[string][]string `json:"extra_patterns"`
 
@@ -41,7 +45,8 @@ type Config struct {
 
 func defaultConfig() Config {
 	return Config{
-		ReserveGB: 4, MinFreePercent: 10, GraceMinutes: 10, DefaultTTLMinutes: 120,
+		HeadroomGB: 1, MaxSwapMBPerMin: 300, PressureGraceMinutes: 2, PressureIdleMinutes: 5, UnleasedGB: 2,
+		GraceMinutes: 10, DefaultTTLMinutes: 120,
 		BuildTTLMinutes: 30, SweepSeconds: 30, DryRun: true, ExtraPatterns: map[string][]string{},
 		IdleMinutes: 30, ClaimWindowMinutes: 60, UnverifiedTTLMinutes: 30, MinDiskGB: 10, MaxLoadPerCore: 1.5,
 		KindMemGB: map[string]float64{
@@ -90,6 +95,11 @@ type Lease struct {
 	LastUsed  time.Time  `json:"last_used"`
 	IdleAsked *time.Time `json:"idle_asked,omitempty"`
 	PeakMB    float64    `json:"peak_mb,omitempty"`
+	// BaseFootprintMB is the session's process-tree memory when the lease was granted.
+	BaseFootprintMB float64 `json:"base_footprint_mb,omitempty"`
+	Declared        bool    `json:"declared,omitempty"` // the holder chose MemGB itself
+	HadResources    bool    `json:"had_resources,omitempty"`
+	Overran         bool    `json:"overran,omitempty"`
 }
 
 type Session struct {
@@ -97,6 +107,13 @@ type Session struct {
 	Agent    string    `json:"agent"`
 	Cwd      string    `json:"cwd"`
 	LastSeen time.Time `json:"last_seen"`
+	// FootprintMB is the resident memory of everything running under the agent's process.
+	FootprintMB float64   `json:"footprint_mb"`
+	AgentPID    int       `json:"agent_pid,omitempty"`
+	FlaggedAt   time.Time `json:"flagged_at,omitempty"`
+	// DistrustUntil is set when a lease of this session used far more than it declared:
+	// until then its own memory figures are ignored.
+	DistrustUntil time.Time `json:"distrust_until,omitempty"`
 }
 
 type Question struct {
@@ -118,6 +135,10 @@ type State struct {
 	Touches map[string]map[string]time.Time `json:"touches"`
 	// Learned is the observed peak memory per lease kind, in MB (moving average).
 	Learned map[string]float64 `json:"learned_mb"`
+	// LearnedDev is the typical deviation of that peak, so estimates cover the bad runs too.
+	LearnedDev map[string]float64 `json:"learned_dev_mb"`
+	// AgentSessions remembers which agent process is which session across daemon restarts.
+	AgentSessions map[string]string `json:"agent_sessions"`
 }
 
 type Daemon struct {
@@ -133,6 +154,12 @@ type Daemon struct {
 
 	agentSessions map[int]string         // agent PID -> Claude session id, learned from hooks
 	recent        map[string][]cmdRecord // session -> recent commands
+
+	hookSeen     time.Time // last time an agent reported through a hook
+	waiters      []*waiter // blocked requests, oldest first by Since
+	swapRate     float64   // MB swapped out per minute over the last sweep interval
+	lastSwapouts float64
+	lastSwapAt   time.Time
 }
 
 type Event struct {
@@ -259,6 +286,25 @@ func runDaemon() error {
 	if d.st.Learned == nil {
 		d.st.Learned = map[string]float64{}
 	}
+	if d.st.LearnedDev == nil {
+		d.st.LearnedDev = map[string]float64{}
+	}
+	for kind, mb := range d.st.Learned {
+		if mb < minLearnMB {
+			delete(d.st.Learned, kind) // learned from a lease that never ran anything
+			delete(d.st.LearnedDev, kind)
+		}
+	}
+	// Keep only mappings whose process is still an agent; the rest are stale PIDs.
+	livePIDs := procCache.get()
+	kept := map[string]string{}
+	for pidStr, session := range d.st.AgentSessions {
+		if pid, err := strconv.Atoi(pidStr); err == nil && livePIDs[pid] != nil && agentKind(livePIDs[pid]) == "claude" {
+			d.agentSessions[pid] = session
+			kept[pidStr] = session
+		}
+	}
+	d.st.AgentSessions = kept
 	d.mem = readMem()
 
 	_ = os.Remove(sockPath())
@@ -266,7 +312,7 @@ func runDaemon() error {
 	if err != nil {
 		return err
 	}
-	d.event("daemon started (grace %dm, reserve %.0f GB, dry_run=%v)", d.cfg.GraceMinutes, d.cfg.ReserveGB, d.cfg.DryRun)
+	d.event("daemon started (grace %dm, headroom %.1f GB, dry_run=%v)", d.cfg.GraceMinutes, d.cfg.HeadroomGB, d.cfg.DryRun)
 
 	go func() {
 		for {
@@ -348,29 +394,6 @@ func (d *Daemon) touch(req map[string]any) *Session {
 	return s
 }
 
-// committedMB is what is already spoken for: each lease counts the larger of its
-// estimate and what its resources really use; unleased resources count as measured.
-func (d *Daemon) committedMB() float64 {
-	total := 0.0
-	for _, l := range d.st.Leases {
-		used := 0.0
-		for _, rid := range l.Resources {
-			if r := d.st.Resources[rid]; r != nil {
-				used += r.MemMB
-			}
-		}
-		total += max(l.MemGB*1024, used)
-	}
-	for _, r := range d.st.Resources {
-		if r.LeaseID == "" {
-			total += r.MemMB
-		}
-	}
-	return total
-}
-
-func (d *Daemon) budgetMB() float64 { return d.mem.TotalMB - d.cfg.ReserveGB*1024 }
-
 func (d *Daemon) holders() string {
 	var parts []string
 	for _, l := range d.st.Leases {
@@ -415,10 +438,7 @@ func (d *Daemon) acquire(req map[string]any) (any, error) {
 			return map[string]any{"granted": true, "lease": l, "reused": true}, nil
 		}
 	}
-	memGB := num(req, "mem_gb")
-	if memGB == 0 {
-		memGB = d.estimateGB(kind)
-	}
+	memGB := d.effectiveGB(kind, num(req, "mem_gb"), session, time.Now())
 	d.mem = readMem()
 	if diskKinds[kind] && d.mem.DiskFreeGB >= 0 && d.mem.DiskFreeGB < d.cfg.MinDiskGB {
 		return map[string]any{"granted": false, "reason": fmt.Sprintf(
@@ -430,16 +450,9 @@ func (d *Daemon) acquire(req map[string]any) (any, error) {
 			"the CPU is saturated (load %.1f on %d cores, limit %.1f per core). %s",
 			d.mem.Load1, d.mem.Cores, d.cfg.MaxLoadPerCore, d.holders())}, nil
 	}
-	committed, budget := d.committedMB(), d.budgetMB()
-	if committed+memGB*1024 > budget {
-		return map[string]any{"granted": false, "reason": fmt.Sprintf(
-			"not enough memory: %.1f GB committed + %.1f GB requested > %.1f GB budget (%.0f GB total, %.0f GB reserved). %s",
-			committed/1024, memGB, budget/1024, d.mem.TotalMB/1024, d.cfg.ReserveGB, d.holders())}, nil
-	}
-	if d.mem.FreePercent >= 0 && d.mem.FreePercent < d.cfg.MinFreePercent {
-		return map[string]any{"granted": false, "reason": fmt.Sprintf(
-			"the Mac is under memory pressure (%d%% free, minimum %d%%). %s",
-			d.mem.FreePercent, d.cfg.MinFreePercent, d.holders())}, nil
+	d.mem.Swapouts = 0 // the rate is kept by the sweeper
+	if ok, why := d.admit(session, kind, memGB*1024, time.Now()); !ok {
+		return map[string]any{"granted": false, "reason": why + ". " + d.holders()}, nil
 	}
 	ttl := int(num(req, "ttl_minutes"))
 	if ttl == 0 {
@@ -451,17 +464,52 @@ func (d *Daemon) acquire(req map[string]any) (any, error) {
 	l := &Lease{ID: newID(), Session: session, Agent: str(req, "agent"), Kind: kind, MemGB: memGB,
 		Purpose: str(req, "purpose"), Cmd: trunc(str(req, "cmd"), 200), TTL: ttl, Created: time.Now(),
 		Expires:  time.Now().Add(time.Duration(ttl) * time.Minute),
-		Verified: true, Evidence: "requested before starting", LastUsed: time.Now()}
+		Verified: true, Evidence: "requested before starting", LastUsed: time.Now(),
+		Declared: num(req, "mem_gb") > 0}
+	if s := d.st.Sessions[session]; s != nil {
+		l.BaseFootprintMB = s.FootprintMB
+	}
 	d.st.Leases[l.ID] = l
 	d.event("GRANT %s %s %.1f GB to %s (%s): %s", l.ID, kind, memGB, session, l.Agent, l.Purpose)
 	return map[string]any{"granted": true, "lease": l}, nil
+}
+
+// effectiveGB is the memory a request is charged. A requester may declare its own figure,
+// but declaring low is the obvious way past admission, so: where there is history the
+// figure cannot go below what leases of this kind really used, and a session caught using
+// far more than it declared loses the right to declare for an hour.
+func (d *Daemon) effectiveGB(kind string, declared float64, session string, now time.Time) float64 {
+	est := d.estimateGB(kind)
+	if declared <= 0 {
+		return est
+	}
+	if s := d.st.Sessions[session]; s != nil && now.Before(s.DistrustUntil) {
+		return max(declared, est)
+	}
+	if mean := d.st.Learned[kind]; mean > 0 {
+		return max(declared, mean/1024)
+	}
+	return declared
+}
+
+// checkOverrun flags a lease that took far more than its holder declared.
+func (d *Daemon) checkOverrun(l *Lease, now time.Time) {
+	if !l.Declared || l.Overran || l.PeakMB <= 1.5*l.MemGB*1024+256 {
+		return
+	}
+	l.Overran = true
+	if s := d.st.Sessions[l.Session]; s != nil {
+		s.DistrustUntil = now.Add(time.Hour)
+	}
+	d.event("OVERRAN lease %s (%s) declared %.1f GB and used %.1f GB. Memory figures from %s are ignored until %s.",
+		l.ID, l.Kind, l.MemGB, l.PeakMB/1024, short(l.Session), now.Add(time.Hour).Format("15:04"))
 }
 
 // estimateGB is the memory a new lease of kind is expected to need: what past leases of
 // that kind really used (plus 15%), or the configured default until there is history.
 func (d *Daemon) estimateGB(kind string) float64 {
 	if mb := d.st.Learned[kind]; mb > 0 {
-		return max(mb*1.15/1024, 0.25)
+		return max(max(mb+2*d.st.LearnedDev[kind], mb*1.15)/1024, 0.25)
 	}
 	if gb := d.cfg.KindMemGB[kind]; gb > 0 {
 		return gb
@@ -469,15 +517,25 @@ func (d *Daemon) estimateGB(kind string) float64 {
 	return 1
 }
 
+// minLearnMB is the smallest peak worth learning from.
+const minLearnMB = 100
+
 func (d *Daemon) learn(l *Lease) {
 	kind := l.Kind
 	if rk, ok := strings.CutPrefix(kind, "claim:"); ok {
 		kind = resourceToLease[rk]
 	}
-	if kind == "" || l.PeakMB <= 0 {
+	// Learn only from leases that really ran something: a promise that was released unused,
+	// or a build that never got going, says nothing about what the kind needs.
+	if kind == "" || l.PeakMB < minLearnMB || (leaseToResource[kind] != "" && !l.HadResources) {
 		return
 	}
 	if old := d.st.Learned[kind]; old > 0 {
+		dev := l.PeakMB - old
+		if dev < 0 {
+			dev = -dev
+		}
+		d.st.LearnedDev[kind] = 0.7*d.st.LearnedDev[kind] + 0.3*dev
 		d.st.Learned[kind] = 0.7*old + 0.3*l.PeakMB
 	} else {
 		d.st.Learned[kind] = l.PeakMB
@@ -500,6 +558,9 @@ func (d *Daemon) release(req map[string]any) (any, error) {
 	id, session, kind := str(req, "lease_id"), str(req, "session"), str(req, "kind")
 	if l := d.st.Leases[id]; id != "" && l != nil && l.Session != session && req["_human"] != true {
 		return nil, fmt.Errorf("lease %s belongs to %s; an agent can release only its own leases", id, l.Session)
+	}
+	if l := d.st.Leases[id]; id != "" && l != nil && l.Session != session {
+		d.override(req, "released lease "+id+" of "+l.Session)
 	}
 	n := 0
 	for _, l := range d.st.Leases {
@@ -618,6 +679,7 @@ func (d *Daemon) pin(req map[string]any) (any, error) {
 	if r := d.st.Resources[rid]; r != nil {
 		r.Pinned, r.OrphanSince = on, nil
 	}
+	d.override(req, fmt.Sprintf("pinned=%v %s", on, rid))
 	d.event("PIN %s = %v", rid, on)
 	return map[string]bool{"pinned": on}, nil
 }
@@ -641,7 +703,8 @@ func (d *Daemon) inbox(req map[string]any) (any, error) {
 
 func (d *Daemon) status(req map[string]any) (any, error) {
 	return map[string]any{
-		"mem": d.mem, "committed_mb": d.committedMB(), "budget_mb": d.budgetMB(), "config": d.cfg,
+		"mem": d.mem, "headroom_mb": d.headroomMB(), "pending_mb": d.pendingMB(), "swap_rate_mb_min": d.swapRate,
+		"waiters": d.waiters, "config": d.cfg,
 		"leases": d.st.Leases, "resources": d.st.Resources, "sessions": d.st.Sessions,
 		"questions": d.st.Questions, "last_sweep": d.lastSweep, "events": d.events,
 		"learned_mb": d.st.Learned, "touches": d.st.Touches,
@@ -661,6 +724,9 @@ func (d *Daemon) stopNow(req map[string]any) (any, error) {
 	}
 	if r.Pinned && req["_human"] != true {
 		return nil, fmt.Errorf("%s is pinned by the user", rid)
+	}
+	if l := d.st.Leases[r.LeaseID]; l != nil && l.Session != str(req, "session") {
+		d.override(req, "stopped "+rid+", held by "+l.Session)
 	}
 	if err := stop(r); err != nil {
 		return nil, err
@@ -685,11 +751,11 @@ func (d *Daemon) setConfig(req map[string]any) (any, error) {
 	if v := num(req, "grace_minutes"); v >= 1 {
 		d.cfg.GraceMinutes = int(v)
 	}
-	if v := num(req, "reserve_gb"); v >= 1 {
-		d.cfg.ReserveGB = v
+	if v := num(req, "headroom_gb"); v > 0 {
+		d.cfg.HeadroomGB = v
 	}
-	if v := num(req, "min_free_percent"); v >= 1 {
-		d.cfg.MinFreePercent = int(v)
+	if v := num(req, "idle_minutes"); v >= 1 {
+		d.cfg.IdleMinutes = int(v)
 	}
 	if v, ok := req["never_stop"].([]any); ok {
 		d.cfg.NeverStop = nil
@@ -703,8 +769,18 @@ func (d *Daemon) setConfig(req map[string]any) (any, error) {
 	if err := os.WriteFile(filepath.Join(d.dir, "config.json"), b, 0o644); err != nil {
 		return nil, err
 	}
-	d.event("CONFIG dry_run=%v grace=%dm reserve=%.0fGB min_free=%d%%", d.cfg.DryRun, d.cfg.GraceMinutes, d.cfg.ReserveGB, d.cfg.MinFreePercent)
+	d.override(req, "changed the settings")
+	d.event("CONFIG dry_run=%v grace=%dm headroom=%.1fGB idle=%dm", d.cfg.DryRun, d.cfg.GraceMinutes, d.cfg.HeadroomGB, d.cfg.IdleMinutes)
 	return d.cfg, nil
+}
+
+// override records a privileged action taken from a terminal rather than the app. An agent
+// with a shell can drive a terminal app, so these are made visible instead of being trusted
+// silently: the app turns each one into a notification.
+func (d *Daemon) override(req map[string]any, what string) {
+	if req["_human"] == true && req["_app"] != true {
+		d.event("OVERRIDE from a terminal: %s. If that was not you, an agent did it through a terminal app.", what)
+	}
 }
 
 func (d *Daemon) neverStop(r *Resource) bool {
@@ -726,12 +802,20 @@ func (d *Daemon) sweep() {
 	defer d.mu.Unlock()
 	defer d.save()
 	now := time.Now()
+	if !d.lastSwapAt.IsZero() && now.Sub(d.lastSwapAt) > time.Second && mem.Swapouts >= d.lastSwapouts {
+		d.swapRate = (mem.Swapouts - d.lastSwapouts) / now.Sub(d.lastSwapAt).Minutes()
+	}
+	d.lastSwapouts, d.lastSwapAt = mem.Swapouts, now
 	d.mem, d.lastSweep = mem, now
+	d.updateFootprints(procs, now)
 
-	// Expire leases.
+	// Expire leases, and drop promises that never turned into anything.
 	for _, l := range d.st.Leases {
-		if now.After(l.Expires) {
+		switch {
+		case now.After(l.Expires):
 			d.dropLease(l, "expired (not renewed or released)")
+		case !buildKinds[l.Kind] && len(l.Resources) == 0 && now.Sub(l.Created) > 15*time.Minute && d.materialisedMB(l) < 50:
+			d.dropLease(l, "granted 15 min ago but nothing was started under it")
 		}
 	}
 
@@ -745,9 +829,14 @@ func (d *Daemon) sweep() {
 			r.LastActive, r.StartedBy = old.LastActive, old.StartedBy
 		} else {
 			r.FirstSeen = now
-			if d.firstDone {
-				d.attribute(r, procs, now)
-			}
+		}
+		if r.LeaseID != "" && d.st.Leases[r.LeaseID] == nil {
+			r.LeaseID = ""
+		}
+		if r.LeaseID == "" {
+			// Process ancestry needs no history, so it is tried on every sweep (and after a
+			// restart); what recent commands say only counts for something that just appeared.
+			d.attribute(r, procs, now, old == nil && d.firstDone)
 		}
 		if isActive(r, est) {
 			r.LastActive = now
@@ -845,6 +934,8 @@ func (d *Daemon) checkLeases(now time.Time) {
 			}
 		}
 		l.PeakMB = max(l.PeakMB, mem)
+		l.HadResources = true
+		d.checkOverrun(l, now)
 		if used.After(l.LastUsed) {
 			l.LastUsed, l.IdleAsked = used, nil
 			delete(d.st.Questions, "idle:"+l.ID)
@@ -852,20 +943,13 @@ func (d *Daemon) checkLeases(now time.Time) {
 		if exp := l.LastUsed.Add(time.Duration(l.TTL) * time.Minute); exp.After(l.Expires) {
 			l.Expires = exp
 		}
-		if now.Sub(l.LastUsed) < idle {
+		if now.Sub(l.LastUsed) < idle && l.IdleAsked == nil {
 			continue
 		}
 		if l.IdleAsked == nil {
 			t := now
 			l.IdleAsked = &t
-			d.st.Questions["idle:"+l.ID] = &Question{ResourceID: strings.Join(l.Resources, ","), Created: now, For: l.Session,
-				Delivered: map[string]bool{}, Answers: map[string]string{},
-				Text: fmt.Sprintf("[agentrm] Your lease %s on %s has not been used for %s. Still need it? Run "+
-					"agentrm claim %s --purpose \"<why>\" to keep it, or agentrm release %s. "+
-					"No answer by %s releases it.", l.ID, strings.Join(l.Resources, ", "), now.Sub(l.LastUsed).Round(time.Minute),
-					l.Resources[0], l.ID, now.Add(grace).Format("15:04"))}
-			d.event("IDLE lease %s (%s) unused for %s: asking %s", l.ID, strings.Join(l.Resources, ","),
-				now.Sub(l.LastUsed).Round(time.Minute), short(l.Session))
+			d.askHolder(l, now, now.Add(grace), "FYI,")
 		} else if now.Sub(*l.IdleAsked) > grace {
 			d.dropLease(l, fmt.Sprintf("idle for %s and no reply", now.Sub(l.LastUsed).Round(time.Minute)))
 		}
@@ -895,8 +979,8 @@ func (d *Daemon) touchCmd(req map[string]any) (any, error) {
 }
 
 // attribute binds a newly seen resource to the session that started it.
-func (d *Daemon) attribute(r *Resource, procs map[int]*proc, now time.Time) {
-	if s := d.startedBy(r, procs); s != "" {
+func (d *Daemon) attribute(r *Resource, procs map[int]*proc, now time.Time, isNew bool) {
+	if s := d.startedBy(r, procs, now, isNew); s != "" {
 		r.StartedBy = s
 		var best *Lease
 		for _, l := range d.st.Leases {
@@ -906,26 +990,38 @@ func (d *Daemon) attribute(r *Resource, procs map[int]*proc, now time.Time) {
 		}
 		if best == nil {
 			// Started without asking: give it a lease so its holder is known and it is idle-checked.
-			agent := "claude"
-			if strings.HasPrefix(s, "codex-") {
+			agent, evidence := "claude", "this session started it"
+			switch {
+			case strings.HasPrefix(s, "codex-"):
 				agent = "codex"
+			case s == "you":
+				agent, evidence = "you", "you started it (no agent was involved)"
 			}
 			best = &Lease{ID: newID(), Session: s, Agent: agent, Kind: resourceToLease[r.Kind], MemGB: r.MemMB / 1024,
 				Purpose: "started without a lease", TTL: d.cfg.DefaultTTLMinutes, Created: now,
 				Expires: now.Add(time.Duration(d.cfg.DefaultTTLMinutes) * time.Minute), Verified: true,
-				Evidence: "this session started it", LastUsed: now}
+				Evidence: evidence, LastUsed: now}
 			d.st.Leases[best.ID] = best
-			d.event("UNLEASED %s was started by %s without a lease; recorded as lease %s", r.ID, short(s), best.ID)
+			if s == "you" {
+				best.Purpose = "started by you"
+				d.event("YOURS %s was started by you; recorded as lease %s", r.ID, best.ID)
+			} else {
+				d.event("UNLEASED %s was started by %s without a lease; recorded as lease %s", r.ID, short(s), best.ID)
+			}
 		}
 		r.LeaseID = best.ID
 		best.Resources = append(best.Resources, r.ID)
 		d.event("BIND %s to lease %s (%s started it)", r.ID, best.ID, short(s))
 		return
 	}
+	if !isNew {
+		return
+	}
 	// No evidence: bind only if exactly one recent lease of the right kind could own it.
 	var cands []*Lease
 	for _, l := range d.st.Leases {
-		if leaseToResource[l.Kind] == r.Kind && now.Sub(l.Created) < 15*time.Minute {
+		// Only a lease still waiting for what it asked for can be the owner.
+		if leaseToResource[l.Kind] == r.Kind && now.Sub(l.Created) < 15*time.Minute && len(l.Resources) == 0 {
 			cands = append(cands, l)
 		}
 	}

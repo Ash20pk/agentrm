@@ -21,7 +21,7 @@ func TestClassify(t *testing.T) {
 		"docker ps":                          "",
 		"cargo fmt":                          "",
 		"ls ~/.gradle":                       "",
-		"grep -r 'kind create cluster' docs": "cluster", // conservative: text mentions count
+		"grep -r 'kind create cluster' docs": "",
 	}
 	for cmd, want := range cases {
 		if got := classify(cmd); got != want {

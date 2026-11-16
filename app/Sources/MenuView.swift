@@ -52,7 +52,7 @@ struct MenuView: View {
         let used = max(0, s.mem.total_mb - s.mem.available_mb)
         return VStack(alignment: .leading, spacing: 6) {
             gauge("Memory", value: used, total: s.mem.total_mb,
-                  detail: "\(s.mem.available_mb.gb) available · \(s.mem.compressed_mb.gb) compressed · \(s.mem.free_percent)% free",
+                  detail: "\(s.mem.available_mb.gb) available · \(s.mem.compressed_mb.gb) compressed · pressure \([1: "normal", 2: "warning", 4: "critical"][s.mem.pressure_level ?? 1] ?? "?")",
                   warn: store.underPressure)
             gauge("Swap", value: s.mem.swap_used_mb, total: max(s.mem.swap_total_mb, 1),
                   detail: "\(s.mem.swap_used_mb.gb) of \(s.mem.swap_total_mb.gb)", warn: false)
@@ -64,9 +64,18 @@ struct MenuView: View {
                         .foregroundStyle(load > Double(cores) * 1.5 ? .red : .secondary)
                 }.font(.caption)
             }
-            gauge("Committed", value: s.committed_mb, total: s.budget_mb,
-                  detail: "\(s.committed_mb.gb) of \(s.budget_mb.gb) budget (\(Int(s.config.reserve_gb)) GB kept for macOS)",
-                  warn: s.committed_mb > s.budget_mb)
+            HStack {
+                Text("Can grant now").font(.caption.bold())
+                Text(max(0, s.headroom_mb).gb).font(.caption.bold())
+                    .foregroundStyle(s.headroom_mb < 512 ? .red : .primary)
+                Spacer()
+                Text("\(s.pending_mb.gb) promised · \(String(format: "%.0f", s.config.headroom_gb)) GB kept free · swap-out \(Int(s.swap_rate_mb_min ?? 0)) MB/min")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            ForEach(Array((s.waiters ?? []).enumerated()), id: \.offset) { i, w in
+                Text("Waiting \(i + 1): \(w.session.prefix(12)) wants \(w.need_mb.gb) for \(w.kind)")
+                    .font(.caption).foregroundStyle(.orange)
+            }
         }
     }
 

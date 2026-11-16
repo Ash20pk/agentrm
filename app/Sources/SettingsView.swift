@@ -94,25 +94,25 @@ struct SetupTab: View {
 
 struct LimitsTab: View {
     @EnvironmentObject var store: Store
-    @State private var reserve = 4.0
+    @State private var headroom = 1.0
     @State private var grace = 10
-    @State private var minFree = 10
+    @State private var idle = 30
     @State private var loaded = false
 
     var body: some View {
         Form {
-            Stepper(value: $reserve, in: 1...32, step: 1) {
-                LabeledContent("Keep back for macOS and apps", value: "\(Int(reserve)) GB")
+            Stepper(value: $headroom, in: 0.5...8, step: 0.5) {
+                LabeledContent("Keep free after any grant", value: String(format: "%.1f GB", headroom))
             }
             Stepper(value: $grace, in: 1...240, step: 5) {
                 LabeledContent("Stop unclaimed resources after", value: "\(grace) min")
             }
-            Stepper(value: $minFree, in: 1...50, step: 1) {
-                LabeledContent("Refuse leases below", value: "\(minFree)% free memory")
+            Stepper(value: $idle, in: 5...240, step: 5) {
+                LabeledContent("Ask a holder after", value: "\(idle) min unused")
             }
             HStack {
                 Spacer()
-                Button("Apply") { store.setLimits(reserve: reserve, grace: grace, minFree: minFree) }
+                Button("Apply") { store.setLimits(headroom: headroom, grace: grace, idle: idle) }
                     .keyboardShortcut(.defaultAction)
             }
             Text("Advanced settings (never-stop list, dev-server names, extra command patterns) live in ~/.agentrm/config.json.")
@@ -120,14 +120,14 @@ struct LimitsTab: View {
         }
         .formStyle(.grouped)
         .onAppear { load() }
-        .onChange(of: store.status?.config.reserve_gb) { _, _ in load() }
+        .onChange(of: store.status?.config.headroom_gb) { _, _ in load() }
     }
 
     private func load() {
         guard !loaded, let c = store.status?.config else { return }
-        reserve = c.reserve_gb
+        headroom = c.headroom_gb
         grace = c.grace_minutes
-        minFree = c.min_free_percent
+        idle = c.idle_minutes
         loaded = true
     }
 }

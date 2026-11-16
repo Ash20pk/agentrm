@@ -89,6 +89,23 @@ func agentAncestor(procs map[int]*proc, pid int) (int, string) {
 	return 0, ""
 }
 
+// guiAncestor reports whether pid descends from a GUI app (a terminal, an IDE, the AgentRM
+// app) and whether that app is AgentRM itself. A process that was detached and now hangs off
+// launchd has no such ancestor: it is nobody's, and is never treated as a person.
+func guiAncestor(procs map[int]*proc, pid int) (found, viaApp bool) {
+	for i := 0; i < 64 && pid > 1; i++ {
+		p := procs[pid]
+		if p == nil {
+			return false, false
+		}
+		if strings.Contains(p.exe, ".app/Contents/") {
+			return true, strings.Contains(p.exe, "/AgentRM.app/Contents/")
+		}
+		pid = p.ppid
+	}
+	return false, false
+}
+
 // ---- peer PID of a unix-socket connection (macOS LOCAL_PEERPID) ----
 
 type ctxKey struct{}
@@ -128,17 +145,34 @@ type Caller struct {
 // Must be called with d.mu held.
 func (d *Daemon) identify(pid int, req map[string]any) Caller {
 	c := Caller{PID: pid}
-	known := false
+	gui, viaApp := false, false
 	if pid > 0 {
 		procs := procCache.lookup(pid)
-		known = procs[pid] != nil
 		c.AgentPID, c.Agent = agentAncestor(procs, pid)
+		gui, viaApp = guiAncestor(procs, pid)
+	}
+	if str(req, "via") == "hook" && c.Agent != "" {
+		d.hookSeen = time.Now()
 	}
 	switch {
 	case c.Agent == "claude":
 		// Hooks carry Claude's own session id; remember which process it belongs to.
-		if str(req, "via") == "hook" && str(req, "session") != "" {
-			d.agentSessions[c.AgentPID] = str(req, "session")
+		if real := str(req, "session"); str(req, "via") == "hook" && real != "" && d.agentSessions[c.AgentPID] != real {
+			d.agentSessions[c.AgentPID] = real
+			d.st.AgentSessions[strconv.Itoa(c.AgentPID)] = real
+			// Anything recorded under the placeholder name belongs to the real session.
+			placeholder := fmt.Sprintf("claude-%d", c.AgentPID)
+			delete(d.st.Sessions, placeholder)
+			for _, l := range d.st.Leases {
+				if l.Session == placeholder {
+					l.Session = real
+				}
+			}
+			for _, r := range d.st.Resources {
+				if r.StartedBy == placeholder {
+					r.StartedBy = real
+				}
+			}
 		}
 		c.Session = d.agentSessions[c.AgentPID]
 		if c.Session == "" {
@@ -146,20 +180,18 @@ func (d *Daemon) identify(pid int, req map[string]any) Caller {
 		}
 	case c.Agent == "codex":
 		c.Session = fmt.Sprintf("codex-%d", c.AgentPID)
-	case known:
-		// Found in the process table with no agent above it: a person, or an app they run.
+	case gui:
+		// Run from a terminal or the AgentRM app, with no agent above it: a person.
 		c.Agent, c.Human = "you", true
+		req["_app"] = viaApp
 		c.Session = str(req, "session")
 		if c.Session == "" || strings.HasPrefix(c.Session, "manual-") {
 			c.Session = "you"
 		}
 	default:
-		// The caller could not be traced (it exited, or the peer PID was unreadable). Never
-		// trust it as a person: use what it claimed, marked unverified.
-		c.Agent, c.Session = str(req, "agent"), str(req, "session")
-		if c.Agent == "you" || c.Agent == "" {
-			c.Agent = "unknown"
-		}
+		// Detached from whatever started it (or untraceable). It gets no one's identity:
+		// not a person's, and not the session it says it is.
+		c.Agent, c.Session = "detached", "detached"
 	}
 	req["session"], req["agent"] = c.Session, c.Agent
 	req["_human"] = c.Human
@@ -218,6 +250,7 @@ func currentKubeContext() string {
 // touchedBy returns the resources a command (run in cwd) uses.
 func touchedBy(cmd, cwd string, resources map[string]*Resource, kubeCtx string) []string {
 	var out []string
+	cmd = activeText(cmd)
 	usesCurrentCtx := kubeToolRe.MatchString(cmd) && !kubeCtxFlagRe.MatchString(cmd)
 	isGradle := classify(cmd) == "gradle"
 	simAll := regexp.MustCompile(`\bsimctl\b.*\bbooted\b`).MatchString(cmd)
@@ -293,17 +326,17 @@ type cmdRecord struct {
 
 // startedBy finds the session that started r: by process ancestry where r has a PID,
 // otherwise by the most recent command (last 10 minutes) that names it.
-func (d *Daemon) startedBy(r *Resource, procs map[int]*proc) string {
+func (d *Daemon) startedBy(r *Resource, procs map[int]*proc, now time.Time, isNew bool) string {
 	if r.PID > 0 {
 		if apid, kind := agentAncestor(procs, r.PID); apid > 0 {
-			if kind == "claude" {
-				if s := d.agentSessions[apid]; s != "" {
-					return s
-				}
-				return fmt.Sprintf("claude-%d", apid)
-			}
-			return fmt.Sprintf("codex-%d", apid)
+			return d.sessionOf(apid, kind)
 		}
+		if gui, _ := guiAncestor(procs, r.PID); gui {
+			return "you" // started from your terminal or IDE, with no agent above it
+		}
+		// Detached (Gradle daemons always are): fall through to what recent commands say.
+	}
+	if !isNew {
 		return ""
 	}
 	single := map[string]*Resource{r.ID: r}
@@ -317,6 +350,9 @@ func (d *Daemon) startedBy(r *Resource, procs map[int]*proc) string {
 				best, bestAt = session, c.Time
 			}
 		}
+	}
+	if best == "" && d.agentsQuiet(procs, now) {
+		return "you" // no agent ran anything that could have started it
 	}
 	return best
 }
@@ -345,4 +381,154 @@ func loadAvg() (float64, int) {
 		}
 	}
 	return 0, cores
+}
+
+// agentsQuiet reports whether it is certain no agent started something that just appeared:
+// either no agent is running at all, or every running agent reports its commands through
+// hooks and none has run one in the last 10 minutes. Codex has no hooks, so a running Codex
+// is never certain.
+func (d *Daemon) agentsQuiet(procs map[int]*proc, now time.Time) bool {
+	agents := 0
+	for _, p := range procs {
+		switch agentKind(p) {
+		case "codex":
+			return false
+		case "claude":
+			agents++
+		}
+	}
+	if agents == 0 {
+		return true
+	}
+	if d.hookSeen.IsZero() {
+		return false // agents are running but have never reported: hooks are not installed
+	}
+	for _, cmds := range d.recent {
+		for _, c := range cmds {
+			if now.Sub(c.Time) < 10*time.Minute {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// ---- which parts of a command line actually execute something ----
+
+// inert commands only read or print: naming a resource in one is not using it, and naming
+// a heavy command in one is not running it.
+var inert = map[string]bool{}
+
+func init() {
+	for _, w := range strings.Fields("echo printf grep egrep fgrep rg ag cat bat less more head tail ls find fd " +
+		"sed awk wc sort uniq cut tr git diff cd pwd true false test [ [[ export set unset alias which type man " +
+		"tee touch mkdir rm cp mv ln chmod read sleep date basename dirname jq yq agentrm :") {
+		inert[w] = true
+	}
+}
+
+var wrappers = map[string]bool{"sudo": true, "time": true, "nohup": true, "env": true, "exec": true, "command": true,
+	"nice": true, "caffeinate": true, "then": true, "do": true, "else": true, "{": true, "(": true, "!": true}
+
+var assignRe = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
+
+var heredocRe = regexp.MustCompile(`<<-?\s*['"]?([A-Za-z_][A-Za-z0-9_]*)['"]?`)
+
+// stripHeredocs removes heredoc bodies: they are data written to a file or fed to a
+// program, not commands. A heredoc fed to a shell is the exception, and is kept.
+func stripHeredocs(cmd string) string {
+	lines := strings.Split(cmd, "\n")
+	var out []string
+	for i := 0; i < len(lines); i++ {
+		out = append(out, lines[i])
+		m := heredocRe.FindStringSubmatch(lines[i])
+		if m == nil {
+			continue
+		}
+		segs := segments(lines[i][:strings.Index(lines[i], "<<")])
+		toShell := false
+		if len(segs) > 0 {
+			switch commandWord(segs[len(segs)-1]) {
+			case "sh", "bash", "zsh", "dash", "ksh":
+				toShell = true
+			}
+		}
+		for i++; i < len(lines) && strings.TrimSpace(lines[i]) != m[1]; i++ {
+			if toShell {
+				out = append(out, lines[i])
+			}
+		}
+	}
+	return strings.Join(out, "\n")
+}
+
+// commandWord is the program a shell segment runs, past assignments and wrappers.
+func commandWord(seg string) string {
+	for _, tok := range strings.Fields(seg) {
+		tok = strings.TrimLeft(tok, "({")
+		if tok == "" || wrappers[tok] || assignRe.MatchString(tok) {
+			continue
+		}
+		return filepath.Base(tok)
+	}
+	return ""
+}
+
+// segments splits a shell command at ; | & newlines, $( and backticks, outside quotes.
+func segments(cmd string) []string {
+	var out []string
+	var cur strings.Builder
+	var quote byte
+	flush := func() {
+		if s := strings.TrimSpace(cur.String()); s != "" {
+			out = append(out, s)
+		}
+		cur.Reset()
+	}
+	for i := 0; i < len(cmd); i++ {
+		c := cmd[i]
+		switch {
+		case quote == '\'':
+			if c == '\'' {
+				quote = 0
+			}
+			cur.WriteByte(c)
+		case c == '\\' && i+1 < len(cmd):
+			cur.WriteByte(c)
+			i++
+			cur.WriteByte(cmd[i])
+		case c == '$' && i+1 < len(cmd) && cmd[i+1] == '(':
+			flush()
+			i++
+		case c == '`':
+			flush()
+		case quote == '"':
+			if c == '"' {
+				quote = 0
+			}
+			cur.WriteByte(c)
+		case c == '\'' || c == '"':
+			quote = c
+			cur.WriteByte(c)
+		case c == ';' || c == '|' || c == '&' || c == '\n':
+			flush()
+		default:
+			cur.WriteByte(c)
+		}
+	}
+	flush()
+	return out
+}
+
+// activeText keeps only the segments of cmd whose command word can start or use something.
+func activeText(cmd string) string {
+	var keep []string
+	for _, seg := range segments(stripHeredocs(cmd)) {
+		word := commandWord(seg)
+		if word == "" || inert[word] || strings.HasPrefix(word, "#") {
+			continue
+		}
+		keep = append(keep, seg)
+	}
+	return strings.Join(keep, "\n")
 }
