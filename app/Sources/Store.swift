@@ -43,7 +43,7 @@ final class Store: ObservableObject {
 
     var underPressure: Bool {
         guard let s = status else { return false }
-        return s.mem.free_percent >= 0 && s.mem.free_percent < s.config.min_free_percent
+        return (s.mem.pressure_level ?? 1) >= 2 || (s.swap_rate_mb_min ?? 0) > 300
     }
 
     func refresh() async {
@@ -86,8 +86,8 @@ final class Store: ObservableObject {
         act(["claim", r.id, "--purpose", purpose, "--ttl", String(hours * 60), "--agent", "you", "--session", "you"])
     }
     func setAutoStop(_ on: Bool) { act(["config", "--dry-run=\(on ? "false" : "true")"]) }
-    func setLimits(reserve: Double, grace: Int, minFree: Int) {
-        act(["config", "--reserve", String(reserve), "--grace", String(grace), "--min-free", String(minFree)])
+    func setLimits(headroom: Double, grace: Int, idle: Int) {
+        act(["config", "--headroom", String(headroom), "--grace", String(grace), "--idle", String(idle)])
     }
     func setup(_ what: String, install: Bool) { act(install ? ["setup", what] : ["setup", what, "--uninstall"]) }
 
@@ -112,9 +112,11 @@ final class Store: ObservableObject {
         defer { lastEventSeq = max(lastEventSeq, maxSeq) }
         // First load, or the daemon restarted: don't replay history.
         if lastEventSeq < 0 || maxSeq < lastEventSeq { return }
-        for e in events where e.seq > lastEventSeq && ["ORPHAN", "STOPPED", "STOP"].contains(e.kind) {
+        for e in events where e.seq > lastEventSeq && ["ORPHAN", "STOPPED", "STOP", "ASKYOU", "OVERRIDE", "UNLEASED-USE"].contains(e.kind) {
             let content = UNMutableNotificationContent()
-            content.title = e.kind == "ORPHAN" ? "Unclaimed resource" : "Stopped"
+            content.title = ["ORPHAN": "Unclaimed resource", "ASKYOU": "Still using this?",
+                             "OVERRIDE": "Settings or leases changed from a terminal",
+                             "UNLEASED-USE": "Heavy use without a lease"][e.kind] ?? "Stopped"
             content.body = e.text
             UNUserNotificationCenter.current().add(
                 UNNotificationRequest(identifier: "agentrm-\(e.seq)", content: content, trigger: nil))

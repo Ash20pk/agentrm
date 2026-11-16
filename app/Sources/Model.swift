@@ -11,11 +11,12 @@ struct MemStats: Codable {
     var disk_free_gb: Double?
     var load1: Double?
     var cores: Int?
+    var pressure_level: Int?
 }
 
 struct Config: Codable {
-    var reserve_gb: Double
-    var min_free_percent: Int
+    var headroom_gb: Double
+    var idle_minutes: Int
     var grace_minutes: Int
     var default_ttl_minutes: Int
     var dry_run: Bool
@@ -54,6 +55,14 @@ struct AgentSession: Codable, Identifiable {
     var agent: String
     var cwd: String
     var last_seen: Date
+    var footprint_mb: Double?
+}
+
+struct Waiter: Codable {
+    var session: String
+    var kind: String
+    var need_mb: Double
+    var since: Date
 }
 
 struct AgentEvent: Codable, Identifiable {
@@ -66,8 +75,10 @@ struct AgentEvent: Codable, Identifiable {
 
 struct Status: Codable {
     var mem: MemStats
-    var committed_mb: Double
-    var budget_mb: Double
+    var headroom_mb: Double
+    var pending_mb: Double
+    var swap_rate_mb_min: Double?
+    var waiters: [Waiter]?
     var config: Config
     var leases: [String: Lease]?
     var resources: [String: Resource]?

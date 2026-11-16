@@ -10,7 +10,7 @@ func newTestDaemon() *Daemon {
 	d := &Daemon{cfg: defaultConfig(), agentSessions: map[int]string{}, recent: map[string][]cmdRecord{}, dir: "/nonexistent"}
 	d.st = State{Leases: map[string]*Lease{}, Sessions: map[string]*Session{}, Resources: map[string]*Resource{},
 		Questions: map[string]*Question{}, Pinned: map[string]bool{}, Touches: map[string]map[string]time.Time{},
-		Learned: map[string]float64{}}
+		Learned: map[string]float64{}, LearnedDev: map[string]float64{}, AgentSessions: map[string]string{}}
 	return d
 }
 
@@ -198,7 +198,7 @@ func TestAttributionByProcessAndCommand(t *testing.T) {
 
 	// A dev server started by sessA without a lease gets a lease for sessA.
 	r := &Resource{ID: "srv:300", Kind: RKServer, PID: 300, Ports: []string{"3000"}}
-	d.attribute(r, procs, now)
+	d.attribute(r, procs, now, true)
 	if r.StartedBy != "sessA" || r.LeaseID == "" || d.st.Leases[r.LeaseID].Session != "sessA" {
 		t.Fatalf("server not attributed to its session: %+v", r)
 	}
@@ -208,14 +208,15 @@ func TestAttributionByProcessAndCommand(t *testing.T) {
 	d.st.Leases["Lc"] = &Lease{ID: "Lc", Session: "sessC", Kind: "cluster", Created: now.Add(time.Second)}
 	d.recent["sessB"] = []cmdRecord{{Time: now, Cmd: "kind create cluster --name obx"}}
 	c := &Resource{ID: "kind:obx", Kind: RKCluster, Containers: []string{"obx-control-plane"}}
-	d.attribute(c, procs, now)
+	d.attribute(c, procs, now, true)
 	if c.LeaseID != "Lb" {
 		t.Fatalf("cluster bound to %q, want the lease of the session that created it (Lb)", c.LeaseID)
 	}
 
 	// No evidence and two candidate leases: leave it unbound rather than guess.
+	d.st.Leases["Ld"] = &Lease{ID: "Ld", Session: "sessD", Kind: "cluster", Created: now}
 	u := &Resource{ID: "kind:other", Kind: RKCluster, Containers: []string{"other-control-plane"}}
-	d.attribute(u, procs, now)
+	d.attribute(u, procs, now, true)
 	if u.LeaseID != "" {
 		t.Fatal("bound without evidence while two leases could own it")
 	}

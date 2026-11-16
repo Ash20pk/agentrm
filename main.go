@@ -72,7 +72,7 @@ const usage = `agentrm — a resource manager for coding agents on this Mac
   agentrm whoami                               which session the daemon thinks you are
   agentrm status [--json] | top                what is running, who holds it, memory
   agentrm stop RESOURCE                        stop something now (reversibly)
-  agentrm config [--dry-run=true|false] [--grace MIN] [--reserve GB] [--min-free PCT]
+  agentrm config [--dry-run=true|false] [--grace MIN] [--headroom GB] [--idle MIN]
   agentrm setup claude|codex|path [--uninstall]   install the Claude hooks / Codex note / CLI link
   agentrm setup check                          what is installed (JSON)
   agentrm daemon                               run the manager (the app or launchd does this)
@@ -106,8 +106,8 @@ func main() {
 	uninstall := fs.Bool("uninstall", false, "remove instead of install")
 	dryRun := fs.String("dry-run", "", "true or false")
 	grace := fs.Int("grace", 0, "minutes an orphan may run unclaimed")
-	reserve := fs.Float64("reserve", 0, "GB kept back for macOS and apps")
-	minFree := fs.Int("min-free", 0, "refuse leases below this free %")
+	headroom := fs.Float64("headroom", 0, "GB kept free after any grant")
+	idleMin := fs.Int("idle", 0, "minutes unused before a holder is asked")
 	_ = fs.Parse(args)
 	if pos == "" && fs.NArg() > 0 {
 		pos = fs.Arg(0)
@@ -233,7 +233,7 @@ func main() {
 			fmt.Printf("stopped %s. Restart with: %s\n", pos, resp.Restart)
 		}
 	case "config":
-		req := map[string]any{"grace_minutes": *grace, "reserve_gb": *reserve, "min_free_percent": *minFree}
+		req := map[string]any{"grace_minutes": *grace, "headroom_gb": *headroom, "idle_minutes": *idleMin}
 		if *dryRun != "" {
 			req["dry_run"] = *dryRun == "true"
 		}
@@ -266,14 +266,16 @@ func main() {
 
 func printStatus() error {
 	var st struct {
-		Mem         MemStats             `json:"mem"`
-		CommittedMB float64              `json:"committed_mb"`
-		BudgetMB    float64              `json:"budget_mb"`
-		Leases      map[string]*Lease    `json:"leases"`
-		Resources   map[string]*Resource `json:"resources"`
-		Sessions    map[string]*Session  `json:"sessions"`
-		LastSweep   time.Time            `json:"last_sweep"`
-		Config      Config               `json:"config"`
+		Mem        MemStats             `json:"mem"`
+		HeadroomMB float64              `json:"headroom_mb"`
+		PendingMB  float64              `json:"pending_mb"`
+		SwapRate   float64              `json:"swap_rate_mb_min"`
+		Waiters    []*waiter            `json:"waiters"`
+		Leases     map[string]*Lease    `json:"leases"`
+		Resources  map[string]*Resource `json:"resources"`
+		Sessions   map[string]*Session  `json:"sessions"`
+		LastSweep  time.Time            `json:"last_sweep"`
+		Config     Config               `json:"config"`
 	}
 	if err := call("/status", map[string]any{}, &st); err != nil {
 		return err
@@ -282,9 +284,15 @@ func printStatus() error {
 	fmt.Printf("MEMORY  %.1f GB total · %.1f GB available · %.1f GB compressed · swap %.1f/%.1f GB · %d%% free\n",
 		m.TotalMB/1024, m.AvailableMB/1024, m.CompressedMB/1024, m.SwapUsedMB/1024, m.SwapTotalMB/1024, m.FreePercent)
 	fmt.Printf("SYSTEM  disk %.0f GB free · load %.1f on %d cores\n", m.DiskFreeGB, m.Load1, m.Cores)
-	fmt.Printf("BUDGET  %.1f of %.1f GB committed (%.0f GB reserved for macOS)   swept %s ago%s\n\n",
-		st.CommittedMB/1024, st.BudgetMB/1024, st.Config.ReserveGB, time.Since(st.LastSweep).Round(time.Second),
-		map[bool]string{true: "   [DRY RUN]"}[st.Config.DryRun])
+	pressure := map[int]string{1: "normal", 2: "WARNING", 4: "CRITICAL"}[m.PressureLevel]
+	fmt.Printf("PRESSURE %s · swapping out %.0f MB/min\n", pressure, st.SwapRate)
+	fmt.Printf("HEADROOM %.1f GB can be granted now (%.1f GB available - %.1f GB promised to leases - %.1f GB kept free)   swept %s ago%s\n",
+		max(0, st.HeadroomMB)/1024, m.AvailableMB/1024, st.PendingMB/1024, st.Config.HeadroomGB,
+		time.Since(st.LastSweep).Round(time.Second), map[bool]string{true: "   [DRY RUN]"}[st.Config.DryRun])
+	for i, w := range st.Waiters {
+		fmt.Printf("WAITING  %d. %s wants %.1f GB for %s (since %s)\n", i+1, short(w.Session), w.NeedMB/1024, w.Kind, w.Since.Format("15:04:05"))
+	}
+	fmt.Println()
 
 	fmt.Println("LEASES")
 	ls := make([]*Lease, 0, len(st.Leases))
@@ -344,7 +352,7 @@ func printStatus() error {
 		fmt.Println("  none yet")
 	}
 	for _, s := range ss {
-		fmt.Printf("  %-14s %-7s seen %-8s ago  %s\n", short(s.ID), s.Agent,
+		fmt.Printf("  %-14s %-7s using %5.1f GB  seen %-8s ago  %s\n", short(s.ID), s.Agent, s.FootprintMB/1024,
 			time.Since(s.LastSeen).Round(time.Second), s.Cwd)
 	}
 	return nil
