@@ -23,6 +23,7 @@ type Config struct {
 	MaxSwapMBPerMin      float64            `json:"max_swap_mb_per_min"`    // refuse new leases while swapping out faster than this
 	PressureGraceMinutes int                `json:"pressure_grace_minutes"` // deadline for holders when another request is blocked
 	PressureIdleMinutes  int                `json:"pressure_idle_minutes"`  // a lease unused this long can be reclaimed for a blocked request
+	PauseMinutes         int                `json:"pause_minutes"`          // how long an unclaimed resource stays frozen before it is stopped; 0 stops directly
 	UnleasedGB           float64            `json:"unleased_gb"`            // flag a session using this much with no lease
 	GraceMinutes         int                `json:"grace_minutes"`          // how long an orphan may run unclaimed
 	DefaultTTLMinutes    int                `json:"default_ttl_minutes"`    // lease lifetime, renewed while the session is active
@@ -45,7 +46,7 @@ type Config struct {
 
 func defaultConfig() Config {
 	return Config{
-		HeadroomGB: 1, MaxSwapMBPerMin: 300, PressureGraceMinutes: 2, PressureIdleMinutes: 5, UnleasedGB: 2,
+		HeadroomGB: 1, MaxSwapMBPerMin: 300, PressureGraceMinutes: 2, PressureIdleMinutes: 5, UnleasedGB: 2, PauseMinutes: 30,
 		GraceMinutes: 10, DefaultTTLMinutes: 120,
 		BuildTTLMinutes: 30, SweepSeconds: 30, DryRun: true, ExtraPatterns: map[string][]string{},
 		IdleMinutes: 30, ClaimWindowMinutes: 60, UnverifiedTTLMinutes: 30, MinDiskGB: 10, MaxLoadPerCore: 1.5,
@@ -353,6 +354,7 @@ func runDaemon() error {
 	handle("/stop", d.stopNow)
 	handle("/config", d.setConfig)
 	handle("/touch", d.touchCmd)
+	handle("/resume", d.resumeNow)
 	handle("/whoami", func(req map[string]any) (any, error) {
 		return map[string]any{"session": str(req, "session"), "agent": str(req, "agent"), "human": req["_human"]}, nil
 	})
@@ -594,6 +596,9 @@ func (d *Daemon) claim(req map[string]any) (any, error) {
 		return nil, fmt.Errorf("no running resource %q (see agentrm status)", rid)
 	}
 	session, now := str(req, "session"), time.Now()
+	if err := d.thaw(r, "claimed by "+session); err != nil {
+		return nil, fmt.Errorf("%s is paused and could not be resumed: %v", rid, err)
+	}
 	if r.LeaseID != "" {
 		if l := d.st.Leases[r.LeaseID]; l != nil {
 			if l.Session == session {
@@ -677,6 +682,9 @@ func (d *Daemon) pin(req map[string]any) (any, error) {
 		delete(d.st.Pinned, rid)
 	}
 	if r := d.st.Resources[rid]; r != nil {
+		if on {
+			_ = d.thaw(r, "pinned")
+		}
 		r.Pinned, r.OrphanSince = on, nil
 	}
 	d.override(req, fmt.Sprintf("pinned=%v %s", on, rid))
@@ -754,6 +762,9 @@ func (d *Daemon) setConfig(req map[string]any) (any, error) {
 	if v := num(req, "headroom_gb"); v > 0 {
 		d.cfg.HeadroomGB = v
 	}
+	if v, ok := req["pause_minutes"].(float64); ok && v >= 0 {
+		d.cfg.PauseMinutes = int(v)
+	}
 	if v := num(req, "idle_minutes"); v >= 1 {
 		d.cfg.IdleMinutes = int(v)
 	}
@@ -827,6 +838,7 @@ func (d *Daemon) sweep() {
 		if old != nil {
 			r.FirstSeen, r.LeaseID, r.OrphanSince = old.FirstSeen, old.LeaseID, old.OrphanSince
 			r.LastActive, r.StartedBy = old.LastActive, old.StartedBy
+			r.PausedAt, r.Urgent = old.PausedAt, old.Urgent
 		} else {
 			r.FirstSeen = now
 		}
@@ -838,7 +850,7 @@ func (d *Daemon) sweep() {
 			// restart); what recent commands say only counts for something that just appeared.
 			d.attribute(r, procs, now, old == nil && d.firstDone)
 		}
-		if isActive(r, est) {
+		if r.PausedAt == nil && isActive(r, est) {
 			r.LastActive = now
 		}
 		if r.LeaseID != "" && d.st.Leases[r.LeaseID] == nil {
@@ -860,46 +872,8 @@ func (d *Daemon) sweep() {
 	d.firstDone = true
 
 	d.checkLeases(now)
-	grace := time.Duration(d.cfg.GraceMinutes) * time.Minute
 
-	// Orphans: ask, then stop after the grace period.
-	for _, r := range d.st.Resources {
-		if r.LeaseID != "" || r.Pinned || d.neverStop(r) {
-			r.OrphanSince = nil
-			delete(d.st.Questions, r.ID)
-			continue
-		}
-		if r.OrphanSince == nil {
-			t := now
-			r.OrphanSince = &t
-			d.st.Questions[r.ID] = &Question{ResourceID: r.ID, Created: now,
-				Delivered: map[string]bool{}, Answers: map[string]string{},
-				Text: fmt.Sprintf("[agentrm] %s (%s, %s, %.1f GB) is running with no lease. If you are using it, run: "+
-					"agentrm claim %s --purpose \"<why>\"   — if not, run: agentrm disown %s. "+
-					"Unclaimed, it is stopped at %s.", r.ID, r.Name, r.Detail, r.MemMB/1024, r.ID, r.ID,
-					now.Add(grace).Format("15:04"))}
-			d.event("ORPHAN %s (%s, %.1f GB): asking active sessions; stop at %s",
-				r.ID, r.Name, r.MemMB/1024, now.Add(grace).Format("15:04"))
-			notify("Unclaimed: "+r.Name, fmt.Sprintf("%.1f GB. Stopping at %s unless an agent claims it.",
-				r.MemMB/1024, now.Add(grace).Format("15:04")))
-			continue
-		}
-		if now.Sub(*r.OrphanSince) < grace {
-			continue
-		}
-		if d.cfg.DryRun {
-			continue
-		}
-		if err := stop(r); err != nil {
-			d.event("STOP FAILED %s: %v", r.ID, err)
-			continue
-		}
-		d.event("STOPPED %s (%s, %.1f GB), unclaimed for %s. Restart: %s",
-			r.ID, r.Name, r.MemMB/1024, grace, howToRestart(r))
-		notify("Stopped "+r.Name, fmt.Sprintf("Freed ~%.1f GB. Restart: %s", r.MemMB/1024, howToRestart(r)))
-		delete(d.st.Resources, r.ID)
-		delete(d.st.Questions, r.ID)
-	}
+	d.checkOrphans(now)
 
 	// Forget sessions idle for a day.
 	for id, s := range d.st.Sessions {
@@ -970,6 +944,10 @@ func (d *Daemon) touchCmd(req map[string]any) (any, error) {
 	d.recent[session] = rec
 	ids := touchedBy(cmd, cwd, d.st.Resources, currentKubeContext())
 	for _, id := range ids {
+		if r := d.st.Resources[id]; r != nil && r.PausedAt != nil {
+			// The command about to run would hang on a frozen resource.
+			_ = d.thaw(r, "a command of "+short(session)+" is about to use it")
+		}
 		if d.st.Touches[id] == nil {
 			d.st.Touches[id] = map[string]time.Time{}
 		}

@@ -132,6 +132,7 @@ struct MenuView: View {
                     }
                     Spacer()
                     Menu {
+                        if r.paused_at != nil { Button("Resume") { store.resume(r) } }
                         if r.lease_id == nil { Button("Claim…") { claimPurpose = ""; claiming = r } }
                         Button(r.pinned == true ? "Unpin" : "Pin (never auto-stop)") { store.pin(r) }
                         Divider()
@@ -145,7 +146,10 @@ struct MenuView: View {
 
     @ViewBuilder
     private func owner(_ r: Resource, _ s: Status) -> some View {
-        if r.pinned == true {
+        if let paused = r.paused_at {
+            let stopAt = paused.addingTimeInterval(Double(s.config.pause_minutes ?? 30) * 60)
+            Text("paused, nothing lost: stops \(stopAt, style: .relative) unless claimed").foregroundStyle(.purple)
+        } else if r.pinned == true {
             Text("pinned").foregroundStyle(.blue)
         } else if let lid = r.lease_id, let l = s.leases?[lid] {
             Text("held by \(l.agent) · \(l.purpose)").foregroundStyle(.green).lineLimit(1)

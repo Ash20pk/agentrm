@@ -15,9 +15,12 @@ why, and clean up after yourself.**
   returns; everything a session holds is released when it ends.
 - **Orphans.** Every 30 seconds AgentRM lists what is actually running. Anything no lease
   covers is an orphan: each active agent session is asked whether it is using it and why. If no
-  one claims it within the grace period (10 minutes by default), it is stopped. Containers and
-  simulators are stopped, never removed; processes get SIGTERM. The event log says how to start
-  each one again.
+  one claims it within the grace period (10 minutes by default), it is **paused**: frozen in
+  place, losing nothing. Claiming it, pinning it, or running a command that uses it thaws it at
+  once. Still unclaimed 30 minutes later, it is stopped: containers and simulators are stopped,
+  never removed; processes get SIGTERM. The event log says how to start each one again. If a
+  request is blocked waiting for memory, the pause is skipped, because a frozen process still
+  holds its memory.
 - **A menu-bar view** of memory, swap, leases, running resources and orphans, with Claim, Pin
   and Stop.
 
@@ -49,6 +52,7 @@ agentrm release <lease-id>
 agentrm inbox                                     # questions for this session
 agentrm claim kind:dev --purpose "still debugging the ingress"
 agentrm disown compose:old-stack
+agentrm resume srv:4242                           # thaw something AgentRM paused (--all for everything)
 agentrm status        # or: agentrm top
 ```
 
@@ -146,6 +150,10 @@ another agent is waiting. A lease in active use is never pressed.
   connection open keeps a dev server "in use".
 - **Sampling is every 30 seconds.** A short spike between samples is not seen, and the swap
   rate is an average over that interval.
+- **A paused server looks hung to whoever uses it without AgentRM knowing:** your browser, or
+  a script that does not name it. The notification and the menu say how to resume. If the
+  daemon is removed while something is paused, run `agentrm resume --all` first (or
+  `kill -CONT <pid>` / `docker unpause <name>`). Simulators cannot be paused and are stopped.
 - **Stopping is reversible, not free.** A stopped container keeps its data; a dev server loses
   what it held in memory.
 
@@ -159,6 +167,7 @@ another agent is waiting. A lease in active use is never pressed.
 | `max_swap_mb_per_min` | 300 | Refuse new leases while swapping out faster than this |
 | `pressure_grace_minutes` | 2 | Deadline for pressed holders when a request is blocked |
 | `pressure_idle_minutes` | 5 | A lease unused this long can be reclaimed for a blocked request |
+| `pause_minutes` | 30 | How long an unclaimed resource stays frozen before it is stopped; 0 stops directly |
 | `unleased_gb` | 2 | Flag a session whose process tree uses this much with no lease |
 | `grace_minutes` | 10 | How long an orphan may run unclaimed |
 | `dry_run` | true | Ask and notify, never stop |

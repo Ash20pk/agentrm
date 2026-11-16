@@ -182,6 +182,7 @@ func (d *Daemon) reclaim(needMB float64, now time.Time) string {
 		if early := deadline.Add(-grace); r.OrphanSince.After(early) {
 			r.OrphanSince = &early
 		}
+		r.Urgent = true
 		freed += r.MemMB
 		done = append(done, fmt.Sprintf("unclaimed %s (%.1f GB)", r.ID, r.MemMB/1024))
 	}
