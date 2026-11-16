@@ -1,0 +1,752 @@
+package manager
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os/exec"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"agentrm/internal/api"
+	"agentrm/internal/discover"
+	"agentrm/internal/model"
+	"agentrm/internal/sys"
+)
+
+type clock struct{ t time.Time }
+
+func (c *clock) Now() time.Time               { return c.t }
+func (c *clock) Add(d time.Duration)          { c.t = c.t.Add(d) }
+func (c *clock) At(d time.Duration) time.Time { return c.t.Add(d) }
+
+func newTest(t *testing.T, availGB float64) (*Manager, *clock) {
+	t.Helper()
+	c := &clock{t: time.Date(2026, 11, 16, 12, 0, 0, 0, time.UTC)}
+	m := New(Options{NoDisk: true, Now: c.Now})
+	m.mem = sys.MemStats{TotalMB: 16384, WiredMB: 3000, AvailableMB: availGB * 1024, PressureLevel: 1, Cores: 10, DiskFreeGB: 100}
+	return m, c
+}
+
+// fakeEffects records effects instead of acting on the machine.
+func fakeEffects(t *testing.T, fail map[string]bool) *[]Effect {
+	t.Helper()
+	var mu sync.Mutex
+	var got []Effect
+	old := Executor
+	Executor = func(e Effect) error {
+		mu.Lock()
+		got = append(got, e)
+		mu.Unlock()
+		if fail[e.Op] {
+			return fmt.Errorf("%s failed", e.Op)
+		}
+		return nil
+	}
+	t.Cleanup(func() { Executor = old })
+	return &got
+}
+
+func agent(s string) api.Caller { return api.Caller{Agent: "claude", Session: s} }
+
+var you = api.Caller{Agent: "you", Session: "you", Human: true, ViaApp: true, App: "AgentRM.app"}
+var terminal = api.Caller{Agent: "you", Session: "you", Human: true, App: "Warp.app"}
+
+func acquire(t *testing.T, m *Manager, c api.Caller, kind string, gb float64) *api.AcquireResp {
+	t.Helper()
+	out, _, err := m.acquire(c, api.Req{Kind: kind, MemGB: gb, Purpose: "test"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out.(*api.AcquireResp)
+}
+
+func addRes(m *Manager, id, kind string, mb float64, lease string) *model.Resource {
+	r := &model.Resource{ID: id, Kind: kind, Name: id, MemMB: mb, LeaseID: lease, Source: "docker",
+		Containers: []string{strings.TrimPrefix(id, "kind:") + "-control-plane"}}
+	m.st.Resources[id] = r
+	if l := m.st.Leases[lease]; l != nil {
+		l.Resources = append(l.Resources, id)
+	}
+	return r
+}
+
+// ---- admission ----
+
+func TestAdmissionUsesMeasuredHeadroom(t *testing.T) {
+	m, _ := newTest(t, 4) // 4 GB available, 1 GB kept free
+	if r := acquire(t, m, agent("a"), "cluster", 2.5); !r.Granted {
+		t.Fatalf("2.5 GB refused with 3 GB headroom: %s", r.Reason)
+	}
+	// The grant is a promise until the cluster shows up: it counts against others.
+	if r := acquire(t, m, agent("b"), "cargo-build", 1); r.Granted {
+		t.Fatal("granted 1 GB with 2.5 of 3 GB promised")
+	}
+	// Once the promise is real use it is in the measurement, not counted twice.
+	l := m.findLease("a", "cluster")
+	addRes(m, "kind:x", model.RKCluster, 2400, l.ID)
+	m.mem.AvailableMB = 4*1024 - 2400
+	m.waiters = nil
+	if r := acquire(t, m, agent("b"), "server", 0.4); !r.Granted {
+		t.Fatalf("0.4 GB refused with 0.5 GB headroom: %s", r.Reason)
+	}
+}
+
+func TestAdmissionRefusesWhileThrashingOrFull(t *testing.T) {
+	m, _ := newTest(t, 8)
+	m.mem.PressureLevel = 2
+	if r := acquire(t, m, agent("a"), "server", 0.1); !r.Granted {
+		t.Fatalf("warning pressure with no swapping refused work: %+v", r)
+	}
+	m.st.Leases = map[string]*model.Lease{}
+	m.swapRate = 150
+	if r := acquire(t, m, agent("a"), "server", 0.1); r.Granted || !strings.Contains(r.Reason, "memory pressure") {
+		t.Fatalf("granted under pressure while swapping: %+v", r)
+	}
+	m.mem.PressureLevel, m.swapRate = 4, 0
+	if r := acquire(t, m, agent("a"), "server", 0.1); r.Granted || !strings.Contains(r.Reason, "critical") {
+		t.Fatalf("granted under critical pressure: %+v", r)
+	}
+	m.mem.PressureLevel, m.swapRate = 1, 900
+	if r := acquire(t, m, agent("a"), "server", 0.1); r.Granted || !strings.Contains(r.Reason, "swapping") {
+		t.Fatalf("granted while swapping: %+v", r)
+	}
+	m.swapRate, m.mem.DiskFreeGB = 0, 3
+	if r := acquire(t, m, agent("a"), "docker-build", 1); r.Granted || !strings.Contains(r.Reason, "disk") {
+		t.Fatalf("granted a build on a full disk: %+v", r)
+	}
+	m.mem.DiskFreeGB, m.mem.Load1 = 100, 40
+	if r := acquire(t, m, agent("a"), "cargo-build", 1); r.Granted || !strings.Contains(r.Reason, "CPU") {
+		t.Fatalf("granted a build on a saturated CPU: %+v", r)
+	}
+	m.mem.Load1 = 1
+	if r := acquire(t, m, agent("a"), "cluster", 40); r.Granted || !strings.Contains(r.Reason, "never fit") {
+		t.Fatalf("an impossible request: %+v", r)
+	}
+	for _, w := range m.waiters {
+		if w.NeedMB >= 40*1024 {
+			t.Fatal("an impossible request was queued")
+		}
+	}
+}
+
+func TestQueueOrder(t *testing.T) {
+	m, c := newTest(t, 3) // 2 GB headroom
+	if r := acquire(t, m, agent("big"), "cluster", 3); r.Granted {
+		t.Fatal("3 GB granted with 2 GB headroom")
+	}
+	c.Add(time.Second)
+	if r := acquire(t, m, agent("small"), "server", 1); r.Granted || !strings.Contains(r.Reason, "earlier requests") {
+		t.Fatalf("a later request jumped the queue: %+v", r)
+	}
+	// An urgent session goes ahead of normal waiters.
+	m.touchSession("urgent", "claude", "").Priority = 1
+	c.Add(time.Second)
+	if r := acquire(t, m, agent("urgent"), "server", 1); !r.Granted {
+		t.Fatalf("an urgent request waited behind normal ones: %s", r.Reason)
+	}
+	// Memory frees up: the first normal waiter gets it before the later one.
+	m.mem.AvailableMB = 6 * 1024
+	c.Add(time.Second)
+	if r := acquire(t, m, agent("big"), "cluster", 3); !r.Granted {
+		t.Fatalf("the head of the queue was refused: %s", r.Reason)
+	}
+	// A waiter that stops retrying loses its place.
+	m.mem.AvailableMB = 3 * 1024
+	acquire(t, m, agent("ghost"), "cluster", 3)
+	c.Add(2 * waiterTimeout)
+	m.st.Leases = map[string]*model.Lease{}
+	if r := acquire(t, m, agent("small"), "server", 1); !r.Granted {
+		t.Fatalf("an abandoned request still blocks the queue: %s", r.Reason)
+	}
+}
+
+func TestFairShare(t *testing.T) {
+	m, c := newTest(t, 10)
+	// "hog" holds a lot; while someone waits, it may not grow past its share.
+	acquire(t, m, agent("hog"), "cluster", 6)
+	acquire(t, m, agent("hog"), "compose", 1)
+	m.mem.AvailableMB = 1.5 * 1024 // the rest is gone
+	if r := acquire(t, m, agent("other"), "cluster", 2); r.Granted {
+		t.Fatal("granted without room")
+	}
+	m.mem.AvailableMB = 10 * 1024
+	c.Add(time.Second)
+	if r := acquire(t, m, agent("hog"), "docker-build", 1); r.Granted || !strings.Contains(r.Reason, "may hold at most") {
+		t.Fatalf("a session over its share grew while another waited: %+v", r)
+	}
+	if r := acquire(t, m, agent("other"), "cluster", 2); !r.Granted {
+		t.Fatalf("the waiter was refused: %s", r.Reason)
+	}
+}
+
+// ---- reclamation ----
+
+func TestReclaimPressesTheLeastUsed(t *testing.T) {
+	m, c := newTest(t, 1.5)
+	m.cfg.DryRun = false
+	now := c.Now()
+	since := now.Add(-time.Minute)
+	orphan := addRes(m, "compose:old", model.RKContainers, 800, "")
+	orphan.OrphanSince = &since
+	mk := func(id, sess string, mb float64, idle time.Duration, verified bool) {
+		m.st.Leases[id] = &model.Lease{ID: id, Session: sess, Kind: "cluster", MemGB: mb / 1024, TTL: 120,
+			Verified: verified, LastUsed: now.Add(-idle), Expires: now.Add(time.Hour)}
+		addRes(m, "kind:"+id, model.RKCluster, mb, id)
+	}
+	mk("busy", "s1", 2000, time.Minute, true)
+	mk("idle20", "s2", 2000, 20*time.Minute, true)
+	mk("idle8", "s3", 2000, 8*time.Minute, true)
+	mk("unver", "s4", 1000, 2*time.Minute, false)
+	mk("vip", "s5", 4000, time.Hour, true)
+	m.touchSession("s5", "claude", "").Priority = 1
+
+	if r := acquire(t, m, agent("new"), "cluster", 3); r.Granted {
+		t.Fatal("granted without room")
+	}
+	if m.st.Leases["busy"].IdleAsked != nil {
+		t.Error("a lease used a minute ago was pressed")
+	}
+	if m.st.Leases["vip"].IdleAsked != nil {
+		t.Error("an urgent session was pressed for a normal request")
+	}
+	if m.st.Leases["unver"].IdleAsked == nil || m.st.Leases["idle20"].IdleAsked == nil {
+		t.Error("unverified and longest-idle leases were not pressed")
+	}
+	if m.st.Leases["idle8"].IdleAsked != nil {
+		t.Error("pressed more holders than needed (0.8 + 1.0 + 2.0 GB covers 3 GB)")
+	}
+	if !orphan.Urgent {
+		t.Error("the orphan was not marked for a direct stop")
+	}
+	// No answer by the deadline releases it; using it keeps it.
+	deadline := now.Add(minutes(m.cfg.PressureGraceMinutes))
+	m.st.Touches["kind:unver"] = map[string]time.Time{"s4": now.Add(time.Minute)}
+	m.checkLeases(deadline.Add(time.Second))
+	if m.st.Leases["idle20"] != nil {
+		t.Error("a pressed lease with no answer was not released at the deadline")
+	}
+	if m.st.Leases["unver"] == nil || m.st.Leases["busy"] == nil {
+		t.Error("a used or unpressed lease was released")
+	}
+}
+
+// ---- claims and evidence ----
+
+func TestClaimNeedsEvidence(t *testing.T) {
+	m, c := newTest(t, 8)
+	addRes(m, "kind:obx", model.RKCluster, 1600, "")
+	claim := func(caller api.Caller) (*api.ClaimResp, error) {
+		out, _, err := m.claim(caller, api.Req{ResourceID: "kind:obx", Purpose: "tests"})
+		if err != nil {
+			return nil, err
+		}
+		return out.(*api.ClaimResp), nil
+	}
+	r, _ := claim(agent("s1"))
+	if r.Verified || r.Lease.TTL != m.cfg.UnverifiedTTLMinutes {
+		t.Fatalf("claim without evidence: %+v", r)
+	}
+	if _, err := claim(agent("s2")); err == nil {
+		t.Fatal("a second session took a held resource")
+	}
+	m.dropLease(r.Lease, "test")
+	m.st.Touches["kind:obx"] = map[string]time.Time{"s2": c.Now().Add(-5 * time.Minute)}
+	r, _ = claim(agent("s2"))
+	if !r.Verified || r.Lease.TTL != m.cfg.DefaultTTLMinutes {
+		t.Fatalf("claim after recent use: %+v", r)
+	}
+	m.dropLease(r.Lease, "test")
+	m.st.Touches["kind:obx"]["s3"] = c.Now().Add(-3 * time.Hour)
+	if r, _ = claim(agent("s3")); r.Verified {
+		t.Fatal("stale use verified a claim")
+	}
+	m.dropLease(r.Lease, "test")
+	if r, _ = claim(terminal); !r.Verified {
+		t.Fatal("a person's claim was not verified")
+	}
+	m.dropLease(r.Lease, "test")
+	if _, err := claim(api.Caller{Agent: "detached", Session: "detached"}); err == nil {
+		t.Fatal("a detached process claimed something")
+	}
+}
+
+func TestIdleLeaseIsAskedThenReleased(t *testing.T) {
+	m, c := newTest(t, 8)
+	now := c.Now()
+	m.st.Leases["L1"] = &model.Lease{ID: "L1", Session: "s1", Kind: "cluster", TTL: 120, Created: now.Add(-2 * time.Hour),
+		Expires: now.Add(time.Hour), LastUsed: now.Add(-45 * time.Minute)}
+	addRes(m, "kind:obx", model.RKCluster, 1600, "L1")
+	m.checkLeases(now)
+	if q := m.st.Questions["idle:L1"]; q == nil || q.For != "s1" {
+		t.Fatal("idle holder was not asked")
+	}
+	out, _, _ := m.inbox(agent("other"), api.Req{})
+	if len(out.(*api.InboxResp).Questions) != 0 {
+		t.Fatal("idle question leaked to another session")
+	}
+	m.st.Touches["kind:obx"] = map[string]time.Time{"s1": now}
+	m.checkLeases(now)
+	if m.st.Questions["idle:L1"] != nil {
+		t.Fatal("use did not clear the idle question")
+	}
+	m.checkLeases(now.Add(45 * time.Minute))
+	m.checkLeases(now.Add(45*time.Minute + minutes(m.cfg.GraceMinutes+1)))
+	if m.st.Leases["L1"] != nil || m.st.Resources["kind:obx"].LeaseID != "" {
+		t.Fatal("idle lease with no reply was not released")
+	}
+	if m.st.Learned["cluster"] != 1600 {
+		t.Fatalf("peak not learned: %v", m.st.Learned)
+	}
+}
+
+func TestActivityKeepsLeaseAlive(t *testing.T) {
+	m, c := newTest(t, 8)
+	now := c.Now()
+	m.st.Leases["L1"] = &model.Lease{ID: "L1", Session: "s1", Kind: "server", TTL: 120, Expires: now.Add(time.Minute),
+		LastUsed: now.Add(-2 * time.Hour)}
+	r := addRes(m, "srv:42", model.RKServer, 100, "L1")
+	r.LastActive = now.Add(-time.Minute)
+	m.checkLeases(now)
+	if m.st.Questions["idle:L1"] != nil || m.st.Leases["L1"].Expires.Before(now.Add(100*time.Minute)) {
+		t.Fatal("activity did not keep the lease alive")
+	}
+}
+
+func TestDeclaredEndTime(t *testing.T) {
+	m, c := newTest(t, 8)
+	out, _, _ := m.acquire(agent("s"), api.Req{Kind: "cluster", Purpose: "demo", UntilMinutes: 20})
+	l := out.(*api.AcquireResp).Lease
+	addRes(m, "kind:demo", model.RKCluster, 1000, l.ID)
+	c.Add(10 * time.Minute)
+	m.st.Touches["kind:demo"] = map[string]time.Time{"s": c.Now()}
+	m.checkLeases(c.Now())
+	if l.IdleAsked != nil {
+		t.Fatal("asked before the declared end")
+	}
+	c.Add(11 * time.Minute)
+	m.st.Touches["kind:demo"]["s"] = c.Now() // still in use: the end time is held anyway
+	m.checkLeases(c.Now())
+	if l.IdleAsked == nil || !strings.Contains(m.st.Questions["idle:"+l.ID].Text, "until") {
+		t.Fatal("the holder was not asked at its declared end")
+	}
+	c.Add(minutes(m.cfg.GraceMinutes) + time.Second)
+	m.checkLeases(c.Now())
+	if m.st.Leases[l.ID] != nil {
+		t.Fatal("the lease outlived its declared end without being extended")
+	}
+}
+
+// ---- attribution ----
+
+func TestAttribution(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.firstDone = true
+	m.agentSessions[100] = "sessA"
+	procs := map[int]*sys.Proc{
+		100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude"},
+		101: {PID: 101, PPID: 100, Exe: "/bin/zsh", Args: "zsh"},
+		102: {PID: 102, PPID: 101, Exe: "node", Args: "node server.js"},
+		10:  {PID: 10, PPID: 1, Exe: "/Applications/Warp.app/Contents/MacOS/stable", Args: "stable"},
+		11:  {PID: 11, PPID: 10, Exe: "-zsh", Args: "-zsh"},
+		12:  {PID: 12, PPID: 11, Exe: "node", Args: "node dev.js"},
+	}
+	now := c.Now()
+	srv := &model.Resource{ID: "srv:102", Kind: model.RKServer, PID: 102}
+	m.attribute(srv, procs, now, true)
+	if l := m.st.Leases[srv.LeaseID]; l == nil || l.Session != "sessA" {
+		t.Fatal("a server was not attributed to the agent that started it")
+	}
+	mine := &model.Resource{ID: "srv:12", Kind: model.RKServer, PID: 12}
+	m.attribute(mine, procs, now, false) // even when found after a restart
+	if l := m.st.Leases[mine.LeaseID]; l == nil || l.Session != "you" {
+		t.Fatal("a server you started in your terminal was not recorded as yours")
+	}
+	// Docker events win over everything for containers.
+	m.dockerOrigin["compose:shop"] = origin{session: "sessB", at: now}
+	shop := &model.Resource{ID: "compose:shop", Kind: model.RKContainers}
+	m.attribute(shop, procs, now, true)
+	if l := m.st.Leases[shop.LeaseID]; l == nil || l.Session != "sessB" {
+		t.Fatal("a container was not attributed from the Docker event")
+	}
+	// Command text, for something just seen.
+	m.recent["sessC"] = []cmdRecord{{Time: now, Cmd: "kind create cluster --name obx"}}
+	cl := &model.Resource{ID: "kind:obx", Kind: model.RKCluster, Containers: []string{"obx-control-plane"}}
+	m.attribute(cl, procs, now, true)
+	if l := m.st.Leases[cl.LeaseID]; l == nil || l.Session != "sessC" {
+		t.Fatal("a cluster was not attributed from the command that named it")
+	}
+	// No evidence and an agent recently active: leave it unbound rather than guess.
+	m.hookSeen = now
+	unk := &model.Resource{ID: "compose:unknown", Kind: model.RKContainers, Containers: []string{"unknown-1"}}
+	m.attribute(unk, procs, now, true)
+	if unk.LeaseID != "" {
+		t.Fatal("bound something with no evidence")
+	}
+}
+
+func TestOriginFromProcs(t *testing.T) {
+	procs := map[int]*sys.Proc{
+		100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude"},
+		101: {PID: 101, PPID: 100, Exe: "/usr/local/bin/docker", Args: "docker compose -p shop up"},
+		200: {PID: 200, PPID: 1, Exe: "codex", Args: "codex"},
+		201: {PID: 201, PPID: 200, Exe: "/usr/local/bin/docker", Args: "docker ps"},
+	}
+	if got := originFromProcs(procs, []string{"shop"}); got != "pid:claude:100" {
+		t.Fatalf("the client naming the project was not chosen: %q", got)
+	}
+	if got := originFromProcs(procs, []string{"other"}); got != "" {
+		t.Fatalf("two sessions ran docker and neither named it: should be ambiguous, got %q", got)
+	}
+}
+
+// ---- learning and declarations ----
+
+func TestEstimatesLearnPerProjectFromRealRuns(t *testing.T) {
+	m, _ := newTest(t, 8)
+	m.dropLease(&model.Lease{ID: "a", Kind: "cluster", PeakMB: 0.4}, "unused")
+	m.dropLease(&model.Lease{ID: "b", Kind: "cluster", PeakMB: 900}, "no resource ever bound")
+	if _, ok := m.st.Learned["cluster"]; ok {
+		t.Fatal("learned from leases that never ran a cluster")
+	}
+	m.dropLease(&model.Lease{ID: "c", Kind: "cargo-build", PeakMB: 6000, Cwd: "/code/bigrepo"}, "done")
+	m.dropLease(&model.Lease{ID: "d", Kind: "cargo-build", PeakMB: 1000, Cwd: "/code/tiny"}, "done")
+	if big, tiny := m.estimateGB("cargo-build", "/code/bigrepo"), m.estimateGB("cargo-build", "/code/tiny"); big < 6 || tiny > 2 {
+		t.Fatalf("per-project estimates not used: big %.1f GB, tiny %.1f GB", big, tiny)
+	}
+	if other := m.estimateGB("cargo-build", "/code/new"); other < 1 {
+		t.Fatalf("an unknown project should use the kind's estimate: %.1f", other)
+	}
+}
+
+func TestUnderDeclaringDoesNotPay(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.touchSession("s", "claude", "")
+	if got := m.effectiveGB("cargo-build", "", 0.5, "s", c.Now()); got != 0.5 {
+		t.Fatalf("no history: %.2f", got)
+	}
+	m.st.Learned["cargo-build"] = 2048
+	if got := m.effectiveGB("cargo-build", "", 0.5, "s", c.Now()); got != 2 {
+		t.Fatalf("declared below the learned mean: %.2f", got)
+	}
+	delete(m.st.Learned, "cargo-build")
+	l := &model.Lease{ID: "L", Session: "s", Kind: "cargo-build", MemGB: 0.5, Declared: true, PeakMB: 2500}
+	m.checkOverrun(l, c.Now())
+	if !l.Overran || m.effectiveGB("cargo-build", "", 0.5, "s", c.Now()) != 2.5 {
+		t.Fatal("a 5x overrun did not cost the right to declare")
+	}
+}
+
+func TestHeavyWorkIsInferredFromTheProcessTree(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.agentSessions[100] = "s"
+	tree := func(mb float64) map[int]*sys.Proc {
+		return map[int]*sys.Proc{
+			100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", RSSMB: 300},
+			101: {PID: 101, PPID: 100, Exe: "make", Args: "make all", RSSMB: mb},
+		}
+	}
+	m.updateFootprints(tree(50), c.Now()) // baseline
+	m.recent["s"] = []cmdRecord{{Time: c.Now(), Cmd: "make all"}}
+	c.Add(3 * time.Second)
+	m.updateFootprints(tree(2500), c.Now())
+	l := m.findLease("s", model.KHeavy)
+	if l == nil || l.Cmd != "make all" {
+		t.Fatalf("2.4 GB of unexplained growth did not become a lease: %+v", l)
+	}
+	if p := m.pendingMB(); p > 100 {
+		t.Fatalf("the inferred lease double-counts its memory: %.0f MB pending", p)
+	}
+	c.Add(3 * time.Second)
+	m.updateFootprints(tree(60), c.Now())
+	if m.findLease("s", model.KHeavy) != nil {
+		t.Fatal("the inferred lease outlived the work")
+	}
+	if m.st.Learned[model.KHeavy] < 2000 {
+		t.Fatalf("the heavy run was not learned: %v", m.st.Learned)
+	}
+}
+
+// ---- permissions and approvals ----
+
+func TestPermissionsAndApprovals(t *testing.T) {
+	m, c := newTest(t, 8)
+	fakeEffects(t, nil)
+	m.cfg.RequireAppApproval = true
+	m.st.Leases["L1"] = &model.Lease{ID: "L1", Session: "owner", Kind: "cluster", Expires: c.At(time.Hour), LastUsed: c.Now()}
+	addRes(m, "kind:x", model.RKCluster, 100, "L1")
+	on := true
+	if _, _, err := m.release(agent("intruder"), api.Req{LeaseID: "L1"}); err == nil {
+		t.Error("an agent released another session's lease")
+	}
+	if _, _, err := m.stopNow(agent("intruder"), api.Req{ResourceID: "kind:x"}); err == nil {
+		t.Error("an agent stopped another session's resource")
+	}
+	if _, _, err := m.pin(agent("intruder"), api.Req{ResourceID: "kind:x", Pinned: &on}); err == nil {
+		t.Error("an agent pinned something")
+	}
+	f := false
+	if _, _, err := m.setConfig(agent("intruder"), api.Req{DryRun: &f}); err == nil {
+		t.Error("an agent changed the settings")
+	}
+	// From a terminal: held for approval in the app.
+	var ea *errApproval
+	if _, _, err := m.setConfig(terminal, api.Req{DryRun: &f}); !errors.As(err, &ea) {
+		t.Fatalf("a terminal changed settings without approval: %v", err)
+	}
+	// Through Handle the approval is created; the app approves it; it runs.
+	m.mu.Lock()
+	a := m.newApproval("/config", api.Req{DryRun: &f}, terminal, ea.what)
+	m.mu.Unlock()
+	if _, _, err := m.approve(terminal, api.Req{ApprovalID: a.ID, Approve: &on}); err == nil {
+		t.Error("a terminal answered an approval")
+	}
+	if _, _, err := m.approve(you, api.Req{ApprovalID: a.ID, Approve: &on}); err != nil || m.cfg.DryRun {
+		t.Fatalf("the approved change did not run: %v, dry_run=%v", err, m.cfg.DryRun)
+	}
+	// Denied, and expired, requests do nothing.
+	b := m.newApproval("/pin", api.Req{ResourceID: "kind:x", Pinned: &on}, terminal, "pin")
+	m.approve(you, api.Req{ApprovalID: b.ID, Approve: &f})
+	cc := m.newApproval("/pin", api.Req{ResourceID: "kind:x", Pinned: &on}, terminal, "pin")
+	c.Add(approvalTTL + time.Second)
+	m.approve(you, api.Req{ApprovalID: cc.ID, Approve: &on})
+	if m.st.Pinned["kind:x"] || b.State != "denied" || cc.State != "expired" {
+		t.Fatalf("denied/expired approvals acted: pinned=%v %s %s", m.st.Pinned["kind:x"], b.State, cc.State)
+	}
+	// The app acts at once.
+	if _, _, err := m.pin(you, api.Req{ResourceID: "kind:x", Pinned: &on}); err != nil || !m.st.Pinned["kind:x"] {
+		t.Fatal("the app could not pin")
+	}
+}
+
+// ---- orphans, pausing and stopping ----
+
+func TestOrphanAskPauseStop(t *testing.T) {
+	m, c := newTest(t, 8)
+	got := fakeEffects(t, nil)
+	m.cfg.DryRun = false
+	r := addRes(m, "srv:7", model.RKServer, 300, "")
+	r.Ports = []string{"3000"}
+	run := func() {
+		effs := m.checkOrphans(c.Now())
+		m.applyEffects(RunEffects(effs))
+	}
+	run()
+	if m.st.Questions["srv:7"] == nil || !strings.Contains(m.st.Questions["srv:7"].Text, "paused") {
+		t.Fatal("not asked, or not told it would be paused first")
+	}
+	c.Add(minutes(m.cfg.GraceMinutes) + time.Second)
+	run()
+	if r.PausedAt == nil || len(*got) != 1 || (*got)[0].Op != "pause" {
+		t.Fatalf("not paused at the grace deadline: %+v", *got)
+	}
+	c.Add(minutes(m.cfg.PauseMinutes) / 2)
+	run()
+	if len(*got) != 1 {
+		t.Fatal("stopped before the pause period was over")
+	}
+	c.Add(minutes(m.cfg.PauseMinutes))
+	run()
+	if len(*got) != 2 || (*got)[1].Op != "stop" || m.st.Resources["srv:7"] != nil {
+		t.Fatalf("not stopped after the pause: %+v", *got)
+	}
+	if len(m.st.Stopped) != 1 || len(m.st.Decisions) != 2 {
+		t.Fatalf("stop not recorded for restore/review: stopped=%d decisions=%d", len(m.st.Stopped), len(m.st.Decisions))
+	}
+}
+
+func TestBlockedRequestSkipsThePauseAndVMsAreNeverStopped(t *testing.T) {
+	m, c := newTest(t, 1.2)
+	got := fakeEffects(t, nil)
+	m.cfg.DryRun = false
+	since := c.Now().Add(-time.Minute)
+	r := addRes(m, "srv:9", model.RKServer, 900, "")
+	r.OrphanSince = &since
+	vm := addRes(m, "vm:lima-dev", model.RKVM, 2000, "")
+	vm.OrphanSince = &since
+	acquire(t, m, agent("waiting"), "server", 0.6)
+	c.Add(minutes(m.cfg.PressureGraceMinutes) + time.Second)
+	m.applyEffects(RunEffects(m.checkOrphans(c.Now())))
+	ops := map[string]string{}
+	for _, e := range *got {
+		ops[e.Res.ID] = e.Op
+	}
+	if ops["srv:9"] != "stop" {
+		t.Fatalf("with a request waiting the orphan should be stopped, not frozen: %v", ops)
+	}
+	if ops["vm:lima-dev"] == "stop" {
+		t.Fatal("a VM was stopped automatically")
+	}
+}
+
+func TestDryRunOnlyRecordsDecisions(t *testing.T) {
+	m, c := newTest(t, 8)
+	got := fakeEffects(t, nil)
+	addRes(m, "srv:7", model.RKServer, 300, "")
+	for i := 0; i < 5; i++ {
+		m.checkOrphans(c.Now())
+		c.Add(minutes(m.cfg.GraceMinutes))
+	}
+	if len(*got) != 0 {
+		t.Fatal("dry run acted")
+	}
+	if len(m.st.Decisions) != 1 || !m.st.Decisions[0].DryRun {
+		t.Fatalf("dry run should record the would-pause decision once: %d", len(m.st.Decisions))
+	}
+	out, _, _ := m.review(you, api.Req{DecisionID: m.st.Decisions[0].ID, Verdict: "wrong"})
+	if r := out.(*api.ReviewResp); r.Reviewed != 1 || r.FalseRate != 1 {
+		t.Fatalf("review not counted: %+v", r)
+	}
+	if _, _, err := m.review(agent("a"), api.Req{DecisionID: m.st.Decisions[0].ID, Verdict: "right"}); err == nil {
+		t.Fatal("an agent marked a decision")
+	}
+}
+
+func TestThawOnUseClaimAndPin(t *testing.T) {
+	m, c := newTest(t, 8)
+	got := fakeEffects(t, nil)
+	paused := c.Now()
+	r := addRes(m, "srv:7", model.RKServer, 300, "")
+	r.Ports, r.PausedAt = []string{"3000"}, &paused
+	out, err := m.Handle("/touch", 0, api.Req{Cmd: "curl -s localhost:3000/health"})
+	_ = out
+	if err == nil {
+		t.Log("detached caller (pid 0) does not touch; checking with a resolved caller instead")
+	}
+	m.mu.Lock()
+	resp, effs, _ := m.touchCmd(agent("s"), api.Req{Cmd: "curl -s localhost:3000/health"})
+	m.mu.Unlock()
+	m.applyEffects(RunEffects(effs))
+	if len(resp.(*api.TouchResp).Thawed) != 1 || r.PausedAt != nil || (*got)[0].Op != "resume" {
+		t.Fatalf("a command using a paused server did not thaw it: %+v", *got)
+	}
+}
+
+func TestRestoreGoesThroughAdmission(t *testing.T) {
+	m, c := newTest(t, 1.5)
+	got := fakeEffects(t, nil)
+	m.st.Stopped = []*model.Stopped{{Resource: model.Resource{ID: "kind:big", Kind: model.RKCluster, MemMB: 3000}, StoppedAt: c.Now()}}
+	out, _, _ := m.restore(agent("s"), api.Req{ResourceID: "kind:big"})
+	if r := out.(*api.AcquireResp); r.Granted || len(*got) != 0 {
+		t.Fatal("restored 3 GB without room")
+	}
+	m.mem.AvailableMB = 8 * 1024
+	m.waiters = nil
+	out, effs, _ := m.restore(agent("s"), api.Req{ResourceID: "kind:big"})
+	m.applyEffects(RunEffects(effs))
+	if r := out.(*api.AcquireResp); !r.Granted || len(*got) != 1 || len(m.st.Stopped) != 0 {
+		t.Fatal("restore did not run when there was room")
+	}
+	if m.dockerOrigin["kind:big"].session != "s" {
+		t.Fatal("the restored cluster will not be bound to whoever restored it")
+	}
+}
+
+// ---- sweep plumbing ----
+
+func TestFailedSourceKeepsItsResources(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.st.Leases["L"] = &model.Lease{ID: "L", Session: "s", Kind: "cluster", Expires: c.At(time.Hour), LastUsed: c.Now()}
+	addRes(m, "kind:obx", model.RKCluster, 1600, "L")
+	m.merge(discover.Result{Failed: map[string]error{"docker": errors.New("docker timed out")}}, nil, nil, c.Now())
+	if m.st.Resources["kind:obx"] == nil || m.st.Resources["kind:obx"].LeaseID != "L" {
+		t.Fatal("a docker timeout dropped the cluster and its lease")
+	}
+	m.merge(discover.Result{Failed: map[string]error{}}, nil, nil, c.Now())
+	if m.st.Resources["kind:obx"] != nil {
+		t.Fatal("a cluster docker says is gone was kept")
+	}
+}
+
+func TestEffectsRunOutsideTheLock(t *testing.T) {
+	m, c := newTest(t, 8)
+	old := Executor
+	defer func() { Executor = old }()
+	locked := false
+	Executor = func(e Effect) error {
+		if m.mu.TryLock() {
+			m.mu.Unlock()
+		} else {
+			locked = true
+		}
+		return nil
+	}
+	paused := c.Now()
+	r := addRes(m, "srv:7", model.RKServer, 300, "")
+	r.PausedAt = &paused
+	if _, err := m.Handle("/resume", 0, api.Req{ResourceID: "srv:7"}); err != nil {
+		t.Fatal(err)
+	}
+	if locked {
+		t.Fatal("an effect ran while the manager lock was held (D1)")
+	}
+}
+
+func TestResolveIdentity(t *testing.T) {
+	m, _ := newTest(t, 8)
+	req := api.Req{Session: "someone-else"}
+	c := m.resolve(facts{pid: 5, agentPID: 100, agent: "claude"}, &req)
+	if c.Session != "claude-100" || req.Session != "claude-100" {
+		t.Fatalf("a claimed session was believed: %+v", c)
+	}
+	// A hook tells us the real session; what was recorded under the placeholder moves to it.
+	m.st.Leases["L"] = &model.Lease{ID: "L", Session: "claude-100"}
+	req = api.Req{Session: "real-id", Via: "hook"}
+	if c = m.resolve(facts{pid: 6, agentPID: 100, agent: "claude"}, &req); c.Session != "real-id" || m.st.Leases["L"].Session != "real-id" {
+		t.Fatalf("hook session not learned: %+v", c)
+	}
+	if c = m.resolve(facts{pid: 7, gui: true, app: "Warp.app"}, &api.Req{}); !c.Human || c.ViaApp {
+		t.Fatalf("a terminal caller: %+v", c)
+	}
+	if c = m.resolve(facts{pid: 8, gui: true, viaApp: true}, &api.Req{}); !c.Human || !c.ViaApp {
+		t.Fatalf("the app: %+v", c)
+	}
+	if c = m.resolve(facts{pid: 9}, &api.Req{Session: "you"}); c.Human || c.Session != "detached" {
+		t.Fatalf("a detached caller got an identity: %+v", c)
+	}
+}
+
+func TestStatusEncodes(t *testing.T) {
+	m, _ := newTest(t, 8)
+	acquire(t, m, agent("a"), "cluster", 1)
+	out, _, _ := m.status(you, api.Req{})
+	b, err := json.Marshal(out)
+	if err != nil || !strings.Contains(string(b), `"headroom_mb"`) || !strings.Contains(string(b), `"free_percent"`) {
+		t.Fatalf("status does not encode as the app expects: %v", err)
+	}
+}
+
+// One test against a real process, to check the effects do what they say.
+func TestPauseAndStopARealProcess(t *testing.T) {
+	cmd := exec.Command("sleep", "120")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	exited := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(exited) }()
+	defer cmd.Process.Kill()
+	r := model.Resource{ID: "srv:test", Kind: model.RKServer, PID: cmd.Process.Pid}
+	state := func() string {
+		out, _ := exec.Command("ps", "-o", "state=", "-p", fmt.Sprint(cmd.Process.Pid)).Output()
+		return strings.TrimSpace(string(out))
+	}
+	if err := Executor(Effect{Op: "pause", Res: r}); err != nil || !strings.HasPrefix(state(), "T") {
+		t.Fatalf("not frozen: %v %q", err, state())
+	}
+	if err := Executor(Effect{Op: "resume", Res: r}); err != nil || strings.HasPrefix(state(), "T") {
+		t.Fatalf("not thawed: %v %q", err, state())
+	}
+	_ = Executor(Effect{Op: "pause", Res: r})
+	now := time.Now()
+	r.PausedAt = &now
+	if err := Executor(Effect{Op: "stop", Res: r}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-exited:
+	case <-time.After(3 * time.Second):
+		t.Fatal("a frozen process was not stopped (TERM must be followed by CONT)")
+	}
+}

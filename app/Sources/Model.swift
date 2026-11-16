@@ -1,5 +1,8 @@
 import Foundation
 
+// Mirrors of the daemon's JSON (internal/api and internal/model). Fields added later are
+// optional so an older daemon still decodes.
+
 struct MemStats: Codable {
     var total_mb: Double
     var available_mb: Double
@@ -22,6 +25,7 @@ struct Config: Codable {
     var dry_run: Bool
     var pause_minutes: Int?
     var never_stop: [String]?
+    var require_app_approval: Bool?
 }
 
 struct Lease: Codable, Identifiable {
@@ -37,6 +41,7 @@ struct Lease: Codable, Identifiable {
     var verified: Bool?
     var evidence: String?
     var last_used: Date?
+    var until: Date?
 }
 
 struct Resource: Codable, Identifiable {
@@ -50,6 +55,8 @@ struct Resource: Codable, Identifiable {
     var pinned: Bool?
     var started_by: String?
     var paused_at: Date?
+    var source: String?
+    var restart: String?
 }
 
 struct AgentSession: Codable, Identifiable {
@@ -58,13 +65,7 @@ struct AgentSession: Codable, Identifiable {
     var cwd: String
     var last_seen: Date
     var footprint_mb: Double?
-}
-
-struct Waiter: Codable {
-    var session: String
-    var kind: String
-    var need_mb: Double
-    var since: Date
+    var priority: Int?
 }
 
 struct AgentEvent: Codable, Identifiable {
@@ -73,6 +74,44 @@ struct AgentEvent: Codable, Identifiable {
     var kind: String
     var text: String
     var id: Int { seq }
+
+    /// The resource or approval an event is about: the word after the kind ("PAUSED srv:42 (...)").
+    var ref: String? {
+        let words = text.split(separator: " ", maxSplits: 2)
+        guard words.count >= 2 else { return nil }
+        return String(words[1]).trimmingCharacters(in: CharacterSet(charactersIn: ",.:;()"))
+    }
+}
+
+struct Waiter: Codable {
+    var session: String
+    var kind: String
+    var need_mb: Double
+    var since: Date
+    var priority: Int?
+}
+
+struct Approval: Codable, Identifiable {
+    var id: String
+    var what: String
+    var created: Date
+    var expires: Date
+    var from: String?
+    var state: String
+}
+
+struct StoppedItem: Codable, Identifiable {
+    var resource: Resource
+    var stopped_at: Date
+    var why: String
+    var by: String?
+    var id: String { resource.id + "@" + String(stopped_at.timeIntervalSince1970) }
+}
+
+struct SelfUsage: Codable {
+    var rss_mb: Double
+    var cpu_percent: Double
+    var sweep_ms: Double
 }
 
 struct Status: Codable {
@@ -87,6 +126,18 @@ struct Status: Codable {
     var sessions: [String: AgentSession]?
     var events: [AgentEvent]?
     var last_sweep: Date
+    var daemon_version: String?
+    var sources: [String: String]?
+    var stopped: [StoppedItem]?
+    var approvals: [String: Approval]?
+    var notes: [String]?
+    var selfUsage: SelfUsage?
+
+    enum CodingKeys: String, CodingKey {
+        case mem, headroom_mb, pending_mb, swap_rate_mb_min, waiters, config, leases, resources, sessions,
+             events, last_sweep, daemon_version, sources, stopped, approvals, notes
+        case selfUsage = "self"
+    }
 }
 
 struct SetupCheck: Codable {
@@ -97,6 +148,27 @@ struct SetupCheck: Codable {
     var cli_link: String
     var cli_link_dir_on_path: Bool
     var daemon_running: Bool
+    var shim: Bool?
+    var problems: [String]?
+}
+
+struct Decision: Codable, Identifiable {
+    var id: String
+    var time: Date
+    var action: String
+    var resource: String
+    var name: String
+    var mem_mb: Double
+    var why: String
+    var dry_run: Bool
+    var verdict: String?
+}
+
+struct ReviewResp: Codable {
+    var decisions: [Decision]?
+    var reviewed: Int
+    var wrong: Int
+    var false_rate: Double
 }
 
 enum CLI {
@@ -111,13 +183,12 @@ enum CLI {
     }
 
     /// Runs the helper off the main thread and returns stdout.
-    static func run(_ args: [String]) async throws -> Data {
+    static func run(_ args: [String], timeout: TimeInterval = 15) async throws -> Data {
         try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 let p = Process()
                 p.executableURL = URL(fileURLWithPath: path)
                 p.arguments = args
-                p.environment = ProcessInfo.processInfo.environment.merging(["AGENTRM_AGENT": "app"]) { $1 }
                 let out = Pipe(), err = Pipe()
                 p.standardOutput = out
                 p.standardError = err
@@ -127,9 +198,12 @@ enum CLI {
                     cont.resume(throwing: error)
                     return
                 }
+                let killer = DispatchWorkItem { if p.isRunning { p.terminate() } }
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
                 let data = out.fileHandleForReading.readDataToEndOfFile()
                 let errData = err.fileHandleForReading.readDataToEndOfFile()
                 p.waitUntilExit()
+                killer.cancel()
                 if p.terminationStatus == 0 {
                     cont.resume(returning: data)
                 } else {
@@ -139,6 +213,11 @@ enum CLI {
                 }
             }
         }
+    }
+
+    static func text(_ args: [String]) async -> String {
+        guard let d = try? await run(args) else { return "" }
+        return String(data: d, encoding: .utf8) ?? ""
     }
 
     static let decoder: JSONDecoder = {

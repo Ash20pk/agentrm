@@ -1,374 +1,81 @@
+// Command agentrm is AgentRM's daemon, command line, Claude Code hook, PATH shim and MCP server.
 package main
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"flag"
+	"errors"
 	"fmt"
-	"net"
-	"net/http"
 	"os"
-	"os/user"
-	"sort"
-	"strings"
-	"time"
+	"os/signal"
+	"path/filepath"
+	"syscall"
+
+	"agentrm/internal/hook"
+	"agentrm/internal/manager"
+	"agentrm/internal/mcp"
+	"agentrm/internal/server"
+	"agentrm/internal/setup"
+	"agentrm/internal/shim"
+	"agentrm/internal/store"
 )
 
 var version = "dev"
 
-var client = &http.Client{
-	Timeout: 5 * time.Second,
-	Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, "unix", sockPath())
-	}},
-}
-
-func call(path string, req any, out any) error {
-	b, _ := json.Marshal(req)
-	resp, err := client.Post("http://agentrm"+path, "application/json", bytes.NewReader(b))
-	if err != nil {
-		return fmt.Errorf("agentrm daemon is not running (%v)", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		var e struct{ Error string }
-		_ = json.NewDecoder(resp.Body).Decode(&e)
-		return fmt.Errorf("%s", e.Error)
-	}
-	if out != nil {
-		return json.NewDecoder(resp.Body).Decode(out)
-	}
-	return nil
-}
-
-func defaultSession() string {
-	if s := os.Getenv("AGENTRM_SESSION"); s != "" {
-		return s
-	}
-	if s := os.Getenv("CLAUDE_SESSION_ID"); s != "" {
-		return s
-	}
-	u, _ := user.Current()
-	return "manual-" + u.Username
-}
-
-func defaultAgent() string {
-	if a := os.Getenv("AGENTRM_AGENT"); a != "" {
-		return a
-	}
-	return "manual"
-}
-
-const usage = `agentrm — a resource manager for coding agents on this Mac
-
-  agentrm acquire --kind K --purpose "why" [--mem GB] [--ttl MIN] [--wait]
-  agentrm release [LEASE_ID] [--all]          release a lease (or all of this session's)
-  agentrm renew                                keep this session's leases alive
-  agentrm claim RESOURCE --purpose "why" [--ttl MIN]   adopt something already running
-  agentrm disown RESOURCE                      answer "not mine" to an orphan question
-  agentrm pin RESOURCE | unpin RESOURCE        never / again auto-stop a resource
-  agentrm inbox                                questions waiting for this session
-  agentrm whoami                               which session the daemon thinks you are
-  agentrm status [--json] | top                what is running, who holds it, memory
-  agentrm stop RESOURCE                        stop something now (reversibly)
-  agentrm resume RESOURCE | --all              thaw something agentrm paused
-  agentrm config [--dry-run=true|false] [--grace MIN] [--headroom GB] [--idle MIN]
-  agentrm setup claude|codex|path [--uninstall]   install the Claude hooks / Codex note / CLI link
-  agentrm setup check                          what is installed (JSON)
-  agentrm daemon                               run the manager (the app or launchd does this)
-  agentrm hook pre|post|prompt|end             Claude Code hook entry point
-
-Kinds: cluster compose docker-build cargo-build gradle xcode-build simulator loadtest server
-Session: --session, or $AGENTRM_SESSION (default manual-<user>); agent: --agent or $AGENTRM_AGENT.
-`
-
 func main() {
+	// Run under a shimmed command's name (docker, cargo, ...): act as the PATH shim.
+	if name := filepath.Base(os.Args[0]); shimmed(name) {
+		os.Exit(shim.Run(name, os.Args[1:]))
+	}
 	if len(os.Args) < 2 {
 		fmt.Print(usage)
 		os.Exit(1)
 	}
-	cmd, args := os.Args[1], os.Args[2:]
-	// Allow a positional argument before the flags (agentrm claim kind:x --purpose y).
-	var pos string
-	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
-		pos, args = args[0], args[1:]
-	}
-	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
-	session := fs.String("session", defaultSession(), "session id")
-	agent := fs.String("agent", defaultAgent(), "agent name (claude, codex, manual)")
-	kind := fs.String("kind", "", "lease kind")
-	purpose := fs.String("purpose", "", "why you need it")
-	mem := fs.Float64("mem", 0, "memory in GB (default: per-kind estimate)")
-	ttl := fs.Int("ttl", 0, "lease lifetime in minutes")
-	wait := fs.Bool("wait", false, "keep retrying until granted (max 30 min)")
-	all := fs.Bool("all", false, "all of this session's leases")
-	asJSON := fs.Bool("json", false, "machine-readable output")
-	uninstall := fs.Bool("uninstall", false, "remove instead of install")
-	dryRun := fs.String("dry-run", "", "true or false")
-	grace := fs.Int("grace", 0, "minutes an orphan may run unclaimed")
-	headroom := fs.Float64("headroom", 0, "GB kept free after any grant")
-	idleMin := fs.Int("idle", 0, "minutes unused before a holder is asked")
-	pauseMin := fs.Int("pause", -1, "minutes frozen before an unclaimed resource is stopped (0 = stop directly)")
-	_ = fs.Parse(args)
-	if pos == "" && fs.NArg() > 0 {
-		pos = fs.Arg(0)
-	}
-	base := map[string]any{"session": *session, "agent": *agent}
-	with := func(kv ...any) map[string]any {
-		m := map[string]any{}
-		for k, v := range base {
-			m[k] = v
-		}
-		for i := 0; i+1 < len(kv); i += 2 {
-			m[kv[i].(string)] = kv[i+1]
-		}
-		return m
-	}
-
-	var err error
-	switch cmd {
-	case "version", "--version":
-		fmt.Println("agentrm", version)
+	switch os.Args[1] {
 	case "daemon":
-		err = runDaemon()
+		if err := runDaemon(); err != nil {
+			fmt.Fprintln(os.Stderr, "agentrm daemon:", err)
+			os.Exit(1)
+		}
 	case "hook":
-		runHook(pos)
-		return
-	case "acquire":
-		if *kind == "" || *purpose == "" {
-			err = fmt.Errorf("--kind and --purpose are required")
-			break
+		event := ""
+		if len(os.Args) > 2 {
+			event = os.Args[2]
 		}
-		deadline := time.Now().Add(30 * time.Minute)
-		for {
-			var resp struct {
-				Granted bool
-				Reason  string
-				Lease   *Lease
-				Reused  bool
-			}
-			if err = call("/acquire", with("kind", *kind, "purpose", *purpose, "mem_gb", *mem, "ttl_minutes", *ttl), &resp); err != nil {
-				break
-			}
-			if resp.Granted {
-				fmt.Printf("granted lease %s: %s, %.1f GB, expires %s%s\n", resp.Lease.ID, resp.Lease.Kind,
-					resp.Lease.MemGB, resp.Lease.Expires.Format("15:04"), map[bool]string{true: " (reused)"}[resp.Reused])
-				fmt.Printf("release it when done: agentrm release %s\n", resp.Lease.ID)
-				break
-			}
-			if !*wait || time.Now().After(deadline) {
-				fmt.Fprintln(os.Stderr, "refused:", resp.Reason)
-				os.Exit(2)
-			}
-			fmt.Fprintln(os.Stderr, "waiting:", trunc(resp.Reason, 160))
-			time.Sleep(20 * time.Second)
-		}
-	case "release":
-		var resp struct{ Released int }
-		if pos != "" {
-			err = call("/release", map[string]any{"lease_id": pos}, &resp)
-		} else if *all {
-			err = call("/release", map[string]any{"session": *session}, &resp)
-		} else {
-			err = fmt.Errorf("give a lease id, or --all for every lease of session %s", *session)
-		}
-		if err == nil {
-			fmt.Printf("released %d lease(s)\n", resp.Released)
-		}
-	case "renew":
-		var resp struct{ Renewed int }
-		if err = call("/renew", base, &resp); err == nil {
-			fmt.Printf("renewed %d lease(s)\n", resp.Renewed)
-		}
-	case "claim":
-		var resp struct {
-			Lease    *Lease
-			Verified bool
-			Evidence string
-		}
-		if err = call("/claim", with("resource_id", pos, "purpose", *purpose, "ttl_minutes", *ttl), &resp); err == nil {
-			v := "verified"
-			if !resp.Verified {
-				v = "UNVERIFIED"
-			}
-			fmt.Printf("%s is held by lease %s until %s (%s: %s)\n", pos, resp.Lease.ID,
-				resp.Lease.Expires.Format("15:04"), v, resp.Evidence)
-			fmt.Println("it stays held while you use it; unused for a while, you will be asked again")
-		}
-	case "whoami":
-		var raw json.RawMessage
-		if err = call("/whoami", base, &raw); err == nil {
-			fmt.Println(string(raw))
-		}
-	case "disown":
-		if err = call("/disown", with("resource_id", pos), nil); err == nil {
-			fmt.Println("noted: not yours")
-		}
-	case "pin", "unpin":
-		err = call("/pin", map[string]any{"resource_id": pos, "pinned": fmt.Sprint(cmd == "pin")}, nil)
-		if err == nil {
-			fmt.Printf("%sned %s\n", cmd, pos)
-		}
-	case "inbox":
-		var resp struct{ Questions []string }
-		if err = call("/inbox", with("all", "true"), &resp); err == nil {
-			if len(resp.Questions) == 0 {
-				fmt.Println("no questions")
-			}
-			for _, q := range resp.Questions {
-				fmt.Println(q)
-			}
-		}
-	case "status":
-		if *asJSON {
-			var raw json.RawMessage
-			if err = call("/status", map[string]any{}, &raw); err == nil {
-				fmt.Println(string(raw))
-			}
-			break
-		}
-		err = printStatus()
-	case "stop":
-		var resp struct{ Restart string }
-		if err = call("/stop", map[string]any{"resource_id": pos}, &resp); err == nil {
-			fmt.Printf("stopped %s. Restart with: %s\n", pos, resp.Restart)
-		}
-	case "resume":
-		if pos == "" && *all {
-			pos = "--all"
-		}
-		var resp struct{ Resumed int }
-		if err = call("/resume", with("resource_id", pos), &resp); err == nil {
-			fmt.Printf("resumed %d\n", resp.Resumed)
-		}
-	case "config":
-		req := map[string]any{"grace_minutes": *grace, "headroom_gb": *headroom, "idle_minutes": *idleMin}
-		if *dryRun != "" {
-			req["dry_run"] = *dryRun == "true"
-		}
-		if *pauseMin >= 0 {
-			req["pause_minutes"] = *pauseMin
-		}
-		var raw json.RawMessage
-		if err = call("/config", req, &raw); err == nil {
-			fmt.Println(string(raw))
-		}
-	case "setup":
-		err = runSetup(pos, *uninstall)
-		if err == nil && pos != "check" {
-			fmt.Printf("setup %s: %s\n", pos, map[bool]string{true: "removed", false: "installed"}[*uninstall])
-		}
-	case "top":
-		for {
-			fmt.Print("\033[H\033[2J")
-			if err = printStatus(); err != nil {
-				break
-			}
-			time.Sleep(2 * time.Second)
+		hook.Run(event)
+	case "mcp":
+		if err := mcp.Serve(os.Stdin, os.Stdout, version); err != nil {
+			fmt.Fprintln(os.Stderr, "agentrm mcp:", err)
+			os.Exit(1)
 		}
 	default:
-		fmt.Print(usage)
-		os.Exit(1)
-	}
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "agentrm:", err)
-		os.Exit(1)
+		os.Exit(runCLI(os.Args[1], os.Args[2:]))
 	}
 }
 
-func printStatus() error {
-	var st struct {
-		Mem        MemStats             `json:"mem"`
-		HeadroomMB float64              `json:"headroom_mb"`
-		PendingMB  float64              `json:"pending_mb"`
-		SwapRate   float64              `json:"swap_rate_mb_min"`
-		Waiters    []*waiter            `json:"waiters"`
-		Leases     map[string]*Lease    `json:"leases"`
-		Resources  map[string]*Resource `json:"resources"`
-		Sessions   map[string]*Session  `json:"sessions"`
-		LastSweep  time.Time            `json:"last_sweep"`
-		Config     Config               `json:"config"`
+func shimmed(name string) bool {
+	for _, c := range setup.ShimmedCommands {
+		if name == c {
+			return true
+		}
 	}
-	if err := call("/status", map[string]any{}, &st); err != nil {
+	return false
+}
+
+func runDaemon() error {
+	dir := store.Dir()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	m := st.Mem
-	fmt.Printf("MEMORY  %.1f GB total · %.1f GB available · %.1f GB compressed · swap %.1f/%.1f GB · %d%% free\n",
-		m.TotalMB/1024, m.AvailableMB/1024, m.CompressedMB/1024, m.SwapUsedMB/1024, m.SwapTotalMB/1024, m.FreePercent)
-	fmt.Printf("SYSTEM  disk %.0f GB free · load %.1f on %d cores\n", m.DiskFreeGB, m.Load1, m.Cores)
-	pressure := map[int]string{1: "normal", 2: "WARNING", 4: "CRITICAL"}[m.PressureLevel]
-	fmt.Printf("PRESSURE %s · swapping out %.0f MB/min\n", pressure, st.SwapRate)
-	fmt.Printf("HEADROOM %.1f GB can be granted now (%.1f GB available - %.1f GB promised to leases - %.1f GB kept free)   swept %s ago%s\n",
-		max(0, st.HeadroomMB)/1024, m.AvailableMB/1024, st.PendingMB/1024, st.Config.HeadroomGB,
-		time.Since(st.LastSweep).Round(time.Second), map[bool]string{true: "   [DRY RUN]"}[st.Config.DryRun])
-	for i, w := range st.Waiters {
-		fmt.Printf("WAITING  %d. %s wants %.1f GB for %s (since %s)\n", i+1, short(w.Session), w.NeedMB/1024, w.Kind, w.Since.Format("15:04:05"))
+	logw := store.NewRotatingFile(filepath.Join(dir, "agentrm.log"), 5<<20, 3)
+	defer logw.Close()
+	m := manager.New(manager.Options{Dir: dir, Version: version, Notify: manager.OSANotify, Log: logw})
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	go m.Run(ctx)
+	err := server.Serve(ctx, m)
+	m.Close()
+	if errors.Is(err, context.Canceled) {
+		return nil
 	}
-	fmt.Println()
-
-	fmt.Println("LEASES")
-	ls := make([]*Lease, 0, len(st.Leases))
-	for _, l := range st.Leases {
-		ls = append(ls, l)
-	}
-	sort.Slice(ls, func(i, j int) bool { return ls[i].Created.Before(ls[j].Created) })
-	if len(ls) == 0 {
-		fmt.Println("  none")
-	}
-	for _, l := range ls {
-		v := "✓"
-		if !l.Verified {
-			v = "?"
-		}
-		fmt.Printf("  %-8s %s %-20s %5.1f GB  %-7s %-14s used %-8s ago  %s\n", l.ID, v, l.Kind, l.MemGB, l.Agent,
-			short(l.Session), time.Since(l.LastUsed).Round(time.Minute), trunc(l.Purpose, 50))
-	}
-
-	fmt.Println("\nRUNNING")
-	rs := make([]*Resource, 0, len(st.Resources))
-	for _, r := range st.Resources {
-		rs = append(rs, r)
-	}
-	sort.Slice(rs, func(i, j int) bool { return rs[i].MemMB > rs[j].MemMB })
-	if len(rs) == 0 {
-		fmt.Println("  nothing tracked")
-	}
-	grace := time.Duration(st.Config.GraceMinutes) * time.Minute
-	for _, r := range rs {
-		owner := "lease " + r.LeaseID
-		switch {
-		case r.Pinned:
-			owner = "pinned"
-		case r.PausedAt != nil:
-			owner = "PAUSED " + time.Since(*r.PausedAt).Round(time.Minute).String()
-		case r.LeaseID == "" && r.OrphanSince != nil:
-			left := time.Until(r.OrphanSince.Add(grace)).Round(time.Second)
-			if left < 0 {
-				left = 0
-			}
-			owner = fmt.Sprintf("ORPHAN, stop in %s", left)
-			if st.Config.DryRun {
-				owner = "ORPHAN (dry run)"
-			}
-		case r.LeaseID == "":
-			owner = "unclaimed"
-		}
-		fmt.Printf("  %-26s %-14s %5.1f GB  %-24s %s\n", trunc(r.ID, 26), r.Kind, r.MemMB/1024, owner, trunc(r.Name, 40))
-	}
-
-	fmt.Println("\nSESSIONS")
-	ss := make([]*Session, 0, len(st.Sessions))
-	for _, s := range st.Sessions {
-		ss = append(ss, s)
-	}
-	sort.Slice(ss, func(i, j int) bool { return ss[i].LastSeen.After(ss[j].LastSeen) })
-	if len(ss) == 0 {
-		fmt.Println("  none yet")
-	}
-	for _, s := range ss {
-		fmt.Printf("  %-14s %-7s using %5.1f GB  seen %-8s ago  %s\n", short(s.ID), s.Agent, s.FootprintMB/1024,
-			time.Since(s.LastSeen).Round(time.Second), s.Cwd)
-	}
-	return nil
+	return err
 }
