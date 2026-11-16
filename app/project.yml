@@ -1,0 +1,67 @@
+name: AgentRM
+options:
+  bundleIdPrefix: dev.agentrm
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+configFiles:
+  Debug: Config/Signing.xcconfig
+  Release: Config/Signing.xcconfig
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    ENABLE_HARDENED_RUNTIME: YES
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    CODE_SIGN_ENTITLEMENTS: Resources/AgentRM.entitlements
+targets:
+  AgentRM:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources
+      - path: Resources/Assets.xcassets
+      - path: Resources/LaunchAgents/dev.agentrm.daemon.plist
+        buildPhase:
+          copyFiles:
+            destination: wrapper
+            subpath: Contents/Library/LaunchAgents
+    info:
+      path: Resources/Info.plist
+      properties:
+        CFBundleDisplayName: AgentRM
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSUIElement: true
+        LSApplicationCategoryType: public.app-category.developer-tools
+        NSHumanReadableCopyright: "MIT License"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.agentrm.AgentRM
+        PRODUCT_NAME: AgentRM
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        COMBINE_HIDPI_IMAGES: YES
+    postBuildScripts:
+      - name: Build and sign the agentrm helper
+        basedOnDependencyAnalysis: false
+        shell: /bin/bash
+        script: |
+          set -euo pipefail
+          export PATH="/opt/homebrew/bin:/usr/local/go/bin:/usr/local/bin:$PATH"
+          SRC="${PROJECT_DIR}/.."
+          OUT="${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Helpers"
+          mkdir -p "$OUT" "${DERIVED_FILE_DIR}/go"
+          cd "$SRC"
+          VERSION="${MARKETING_VERSION}"
+          for arch in arm64 amd64; do
+            CGO_ENABLED=0 GOOS=darwin GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=${VERSION}" -o "${DERIVED_FILE_DIR}/go/agentrm-$arch" .
+          done
+          lipo -create -output "$OUT/agentrm" "${DERIVED_FILE_DIR}/go/agentrm-arm64" "${DERIVED_FILE_DIR}/go/agentrm-amd64"
+          if [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ] && [ "${EXPANDED_CODE_SIGN_IDENTITY}" != "-" ]; then
+            codesign --force --options runtime --timestamp --identifier dev.agentrm.cli \
+              --sign "${EXPANDED_CODE_SIGN_IDENTITY}" "$OUT/agentrm"
+          else
+            codesign --force --sign - --identifier dev.agentrm.cli "$OUT/agentrm"
+          fi

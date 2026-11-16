@@ -1,0 +1,11 @@
+// Signing for local and release builds.
+// Put your own team in Config/Local.xcconfig (git-ignored), for example:
+//   DEVELOPMENT_TEAM = ABCDE12345
+// Release builds for distribution use a Developer ID Application certificate.
+CODE_SIGN_STYLE = Automatic
+CODE_SIGN_IDENTITY = Apple Development
+CODE_SIGN_IDENTITY[config=Release] = Developer ID Application
+CODE_SIGN_STYLE[config=Release] = Manual
+OTHER_CODE_SIGN_FLAGS[config=Release] = --timestamp
+
+#include? "Local.xcconfig"

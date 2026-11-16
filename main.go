@@ -15,6 +15,8 @@ import (
 	"time"
 )
 
+var version = "dev"
+
 var client = &http.Client{
 	Timeout: 5 * time.Second,
 	Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
@@ -123,6 +125,8 @@ func main() {
 
 	var err error
 	switch cmd {
+	case "version", "--version":
+		fmt.Println("agentrm", version)
 	case "daemon":
 		err = runDaemon()
 	case "hook":
@@ -301,6 +305,9 @@ func printStatus() error {
 				left = 0
 			}
 			owner = fmt.Sprintf("ORPHAN, stop in %s", left)
+			if st.Config.DryRun {
+				owner = "ORPHAN (dry run)"
+			}
 		case r.LeaseID == "":
 			owner = "unclaimed"
 		}
