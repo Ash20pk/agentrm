@@ -69,6 +69,7 @@ const usage = `agentrm — a resource manager for coding agents on this Mac
   agentrm disown RESOURCE                      answer "not mine" to an orphan question
   agentrm pin RESOURCE | unpin RESOURCE        never / again auto-stop a resource
   agentrm inbox                                questions waiting for this session
+  agentrm whoami                               which session the daemon thinks you are
   agentrm status [--json] | top                what is running, who holds it, memory
   agentrm stop RESOURCE                        stop something now (reversibly)
   agentrm config [--dry-run=true|false] [--grace MIN] [--reserve GB] [--min-free PCT]
@@ -179,10 +180,24 @@ func main() {
 			fmt.Printf("renewed %d lease(s)\n", resp.Renewed)
 		}
 	case "claim":
-		var resp struct{ Lease *Lease }
+		var resp struct {
+			Lease    *Lease
+			Verified bool
+			Evidence string
+		}
 		if err = call("/claim", with("resource_id", pos, "purpose", *purpose, "ttl_minutes", *ttl), &resp); err == nil {
-			fmt.Printf("%s is now held by lease %s until %s (renewed while this session is active)\n",
-				pos, resp.Lease.ID, resp.Lease.Expires.Format("15:04"))
+			v := "verified"
+			if !resp.Verified {
+				v = "UNVERIFIED"
+			}
+			fmt.Printf("%s is held by lease %s until %s (%s: %s)\n", pos, resp.Lease.ID,
+				resp.Lease.Expires.Format("15:04"), v, resp.Evidence)
+			fmt.Println("it stays held while you use it; unused for a while, you will be asked again")
+		}
+	case "whoami":
+		var raw json.RawMessage
+		if err = call("/whoami", base, &raw); err == nil {
+			fmt.Println(string(raw))
 		}
 	case "disown":
 		if err = call("/disown", with("resource_id", pos), nil); err == nil {
@@ -266,6 +281,7 @@ func printStatus() error {
 	m := st.Mem
 	fmt.Printf("MEMORY  %.1f GB total · %.1f GB available · %.1f GB compressed · swap %.1f/%.1f GB · %d%% free\n",
 		m.TotalMB/1024, m.AvailableMB/1024, m.CompressedMB/1024, m.SwapUsedMB/1024, m.SwapTotalMB/1024, m.FreePercent)
+	fmt.Printf("SYSTEM  disk %.0f GB free · load %.1f on %d cores\n", m.DiskFreeGB, m.Load1, m.Cores)
 	fmt.Printf("BUDGET  %.1f of %.1f GB committed (%.0f GB reserved for macOS)   swept %s ago%s\n\n",
 		st.CommittedMB/1024, st.BudgetMB/1024, st.Config.ReserveGB, time.Since(st.LastSweep).Round(time.Second),
 		map[bool]string{true: "   [DRY RUN]"}[st.Config.DryRun])
@@ -280,8 +296,12 @@ func printStatus() error {
 		fmt.Println("  none")
 	}
 	for _, l := range ls {
-		fmt.Printf("  %-8s %-20s %5.1f GB  %-7s %-14s expires %s  %s\n", l.ID, l.Kind, l.MemGB, l.Agent,
-			short(l.Session), l.Expires.Format("15:04"), trunc(l.Purpose, 60))
+		v := "✓"
+		if !l.Verified {
+			v = "?"
+		}
+		fmt.Printf("  %-8s %s %-20s %5.1f GB  %-7s %-14s used %-8s ago  %s\n", l.ID, v, l.Kind, l.MemGB, l.Agent,
+			short(l.Session), time.Since(l.LastUsed).Round(time.Minute), trunc(l.Purpose, 50))
 	}
 
 	fmt.Println("\nRUNNING")

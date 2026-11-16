@@ -68,6 +68,33 @@ Kinds and their default memory estimates: `cluster` 3 GB, `compose` 2, `docker-b
 Apps under `/Applications` and `/System`, MCP servers, language servers and the agents
 themselves are never treated as dev servers.
 
+## How it decides
+
+AgentRM trusts what the machine shows, not what an agent says.
+
+- **Who is asking.** The daemon reads the process ID on the other end of every request and walks
+  up the process tree to the Claude Code or Codex process it belongs to. A command run inside an
+  agent's shell is attributed to that agent's session, whatever `--session` it passes. A caller
+  with no agent above it is you. An agent can release only its own leases and stop only what it
+  holds or what nobody holds; only you can pin things or change settings.
+- **What each session uses.** The Claude Code hook reports every command before it runs, and the
+  daemon matches it against running resources: kube contexts (including the current one, for a
+  bare `kubectl`), container and Compose project names, ports (`localhost:3000`), simulator IDs.
+- **Who started what.** A new dev server or Gradle daemon is attributed by process ancestry. A
+  new cluster, container or simulator is attributed to the session whose recent command named
+  it. Something started without a lease still gets one, recorded against the session that
+  started it. With no evidence, AgentRM binds only when exactly one lease could own it.
+- **Claims need evidence.** A claim is *verified* if the session started the resource or used it
+  in the last hour, or if you make it. Otherwise it is *unverified* and lasts 30 minutes unless
+  the session starts using it.
+- **Leases live on use.** A lease that holds resources renews when its session uses them, or
+  when they show activity (open connections on their ports, CPU for Gradle), not on unrelated
+  tool calls. Unused for 30 minutes, its holder is asked; no answer within the grace period
+  releases it, and the resource goes through the orphan process.
+- **Admission.** Memory estimates start from per-kind defaults and then follow what leases of
+  that kind really used (moving average of the peak, plus 15%). Disk-heavy work is refused below
+  10 GB free on `/`, and builds when the load is above 1.5 per core.
+
 ## Configuration
 
 `~/.agentrm/config.json` (created on first run):
@@ -80,6 +107,11 @@ themselves are never treated as dev servers.
 | `dry_run` | true | Ask and notify, never stop |
 | `never_stop` | [] | Resource IDs or name substrings to leave alone |
 | `extra_patterns` | {} | More commands per lease kind, e.g. `{"compose": ["my-stack\\.sh\\s+start"]}` |
+| `idle_minutes` | 30 | A held resource unused this long gets its holder asked |
+| `claim_window_minutes` | 60 | A claim is verified if the session used the resource this recently |
+| `unverified_ttl_minutes` | 30 | How long a claim without evidence lasts |
+| `min_disk_gb` | 10 | Refuse disk-heavy leases below this free space |
+| `max_load_per_core` | 1.5 | Refuse builds above this load |
 | `server_names`, `server_exclude` | see file | Which listening processes count as dev servers |
 
 State is in `~/.agentrm/state.json` and every decision is logged to `~/.agentrm/events.log`.

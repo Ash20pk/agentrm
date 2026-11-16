@@ -34,6 +34,10 @@ type Resource struct {
 	LeaseID     string     `json:"lease_id,omitempty"`
 	OrphanSince *time.Time `json:"orphan_since,omitempty"`
 	Pinned      bool       `json:"pinned,omitempty"`
+	Ports       []string   `json:"ports,omitempty"`       // host TCP ports it listens on or publishes
+	CPU         float64    `json:"cpu,omitempty"`         // percent, where measured
+	LastActive  time.Time  `json:"last_active,omitempty"` // last sign of use seen by the sweeper
+	StartedBy   string     `json:"started_by,omitempty"`  // session that started it, when known
 }
 
 func run(name string, args ...string) (string, error) {
@@ -60,6 +64,9 @@ func discover(cfg Config) []*Resource {
 	return res
 }
 
+// hostPortRe pulls the host side out of docker's "0.0.0.0:5432->5432/tcp".
+var hostPortRe = regexp.MustCompile(`:(\d+)->`)
+
 var memUsageRe = regexp.MustCompile(`^([\d.]+)\s*([KMG]i?B|B)`)
 
 func parseMem(s string) float64 {
@@ -81,7 +88,7 @@ func parseMem(s string) float64 {
 
 func discoverDocker() []*Resource {
 	out, err := run("docker", "ps", "--format",
-		`{{.Names}}	{{.Label "io.x-k8s.kind.cluster"}}	{{.Label "com.docker.compose.project"}}	{{.Label "com.supabase.cli.project"}}	{{.Image}}`)
+		`{{.Names}}	{{.Label "io.x-k8s.kind.cluster"}}	{{.Label "com.docker.compose.project"}}	{{.Label "com.supabase.cli.project"}}	{{.Image}}	{{.Ports}}`)
 	if err != nil {
 		return nil
 	}
@@ -101,6 +108,10 @@ func discoverDocker() []*Resource {
 			continue
 		}
 		name, kindCluster, compose, supa, image := f[0], f[1], f[2], f[3], f[4]
+		ports := ""
+		if len(f) > 5 {
+			ports = f[5]
+		}
 		var id, kind, gname string
 		switch {
 		case kindCluster != "":
@@ -119,6 +130,11 @@ func discoverDocker() []*Resource {
 		}
 		g.Containers = append(g.Containers, name)
 		g.MemMB += mem[name]
+		for _, hp := range hostPortRe.FindAllStringSubmatch(ports, -1) {
+			if !contains(g.Ports, hp[1]) {
+				g.Ports = append(g.Ports, hp[1])
+			}
+		}
 	}
 	var res []*Resource
 	for _, g := range groups {
@@ -160,39 +176,41 @@ func discoverSimulators(cfg Config) []*Resource {
 type proc struct {
 	pid, ppid int
 	rssMB     float64
+	cpu       float64
 	exe, args string
 }
 
 func listProcs() map[int]*proc {
-	out, err := run("ps", "-axww", "-o", "pid=,ppid=,rss=,args=")
+	out, err := run("ps", "-axww", "-o", "pid=,ppid=,rss=,%cpu=,args=")
 	if err != nil {
 		return nil
 	}
 	procs := map[int]*proc{}
 	for _, l := range strings.Split(out, "\n") {
 		f := strings.Fields(l)
-		if len(f) < 4 {
+		if len(f) < 5 {
 			continue
 		}
 		pid, _ := strconv.Atoi(f[0])
 		ppid, _ := strconv.Atoi(f[1])
 		rss, _ := strconv.ParseFloat(f[2], 64)
-		args := strings.Join(f[3:], " ")
-		procs[pid] = &proc{pid: pid, ppid: ppid, rssMB: rss / 1024, exe: f[3], args: args}
+		cpu, _ := strconv.ParseFloat(f[3], 64)
+		args := strings.Join(f[4:], " ")
+		procs[pid] = &proc{pid: pid, ppid: ppid, rssMB: rss / 1024, cpu: cpu, exe: f[4], args: args}
 	}
 	return procs
 }
 
 func discoverProcesses(cfg Config) []*Resource {
-	procs := listProcs()
+	procs := procCache.get()
 	var res []*Resource
 	for _, p := range procs {
 		if strings.Contains(p.args, "org.gradle.launcher.daemon") || strings.Contains(p.args, "GradleDaemon") {
 			res = append(res, &Resource{ID: fmt.Sprintf("gradle:%d", p.pid), Kind: RKGradle,
-				Name: "Gradle daemon", Detail: maxHeap(p.args), PID: p.pid, MemMB: p.rssMB})
+				Name: "Gradle daemon", Detail: maxHeap(p.args), PID: p.pid, MemMB: p.rssMB, CPU: p.cpu})
 		} else if strings.Contains(p.args, "KotlinCompileDaemon") {
 			res = append(res, &Resource{ID: fmt.Sprintf("gradle:%d", p.pid), Kind: RKGradle,
-				Name: "Kotlin daemon", Detail: maxHeap(p.args), PID: p.pid, MemMB: p.rssMB})
+				Name: "Kotlin daemon", Detail: maxHeap(p.args), PID: p.pid, MemMB: p.rssMB, CPU: p.cpu})
 		}
 	}
 	// Listening dev servers.
@@ -220,7 +238,7 @@ func discoverProcesses(cfg Config) []*Resource {
 		}
 		res = append(res, &Resource{ID: fmt.Sprintf("srv:%d", pid), Kind: RKServer,
 			Name: filepath.Base(p.exe) + " :" + strings.Join(ps, ","), Detail: trunc(p.args, 90),
-			PID: pid, MemMB: p.rssMB})
+			PID: pid, MemMB: p.rssMB, CPU: p.cpu, Ports: ps})
 	}
 	return res
 }

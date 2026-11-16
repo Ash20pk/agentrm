@@ -56,6 +56,14 @@ struct MenuView: View {
                   warn: store.underPressure)
             gauge("Swap", value: s.mem.swap_used_mb, total: max(s.mem.swap_total_mb, 1),
                   detail: "\(s.mem.swap_used_mb.gb) of \(s.mem.swap_total_mb.gb)", warn: false)
+            if let disk = s.mem.disk_free_gb, let load = s.mem.load1, let cores = s.mem.cores {
+                HStack {
+                    Text("Disk \(Int(disk)) GB free").foregroundStyle(disk < 10 ? .red : .secondary)
+                    Text("·").foregroundStyle(.secondary)
+                    Text(String(format: "Load %.1f on %d cores", load, cores))
+                        .foregroundStyle(load > Double(cores) * 1.5 ? .red : .secondary)
+                }.font(.caption)
+            }
             gauge("Committed", value: s.committed_mb, total: s.budget_mb,
                   detail: "\(s.committed_mb.gb) of \(s.budget_mb.gb) budget (\(Int(s.config.reserve_gb)) GB kept for macOS)",
                   warn: s.committed_mb > s.budget_mb)
@@ -83,10 +91,15 @@ struct MenuView: View {
             ForEach(store.leases) { l in
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 1) {
-                        Text("\(l.kind) · \(String(format: "%.1f GB", l.mem_gb))").font(.callout)
+                        HStack(spacing: 4) {
+                            Image(systemName: l.verified == false ? "questionmark.circle" : "checkmark.seal")
+                                .foregroundStyle(l.verified == false ? .orange : .green)
+                                .help(l.evidence ?? "")
+                            Text("\(l.kind) · \(String(format: "%.1f GB", l.mem_gb))").font(.callout)
+                        }
                         Text(l.purpose).font(.caption).foregroundStyle(.secondary).lineLimit(2)
-                        Text("\(l.agent) · \(l.session.prefix(12)) · expires \(l.expires, style: .time)")
-                            .font(.caption2).foregroundStyle(.tertiary)
+                        Text("\(l.agent) · \(l.session.prefix(12)) · \(l.evidence ?? "")")
+                            .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
                     }
                     Spacer()
                     Button("Release") { store.release(l) }.controlSize(.small)

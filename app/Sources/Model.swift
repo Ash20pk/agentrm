@@ -8,6 +8,9 @@ struct MemStats: Codable {
     var swap_total_mb: Double
     var swap_used_mb: Double
     var free_percent: Int
+    var disk_free_gb: Double?
+    var load1: Double?
+    var cores: Int?
 }
 
 struct Config: Codable {
@@ -29,6 +32,9 @@ struct Lease: Codable, Identifiable {
     var created: Date
     var expires: Date
     var resources: [String]?
+    var verified: Bool?
+    var evidence: String?
+    var last_used: Date?
 }
 
 struct Resource: Codable, Identifiable {
@@ -40,6 +46,7 @@ struct Resource: Codable, Identifiable {
     var lease_id: String?
     var orphan_since: Date?
     var pinned: Bool?
+    var started_by: String?
 }
 
 struct AgentSession: Codable, Identifiable {

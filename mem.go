@@ -16,6 +16,9 @@ type MemStats struct {
 	SwapTotalMB  float64 `json:"swap_total_mb"`
 	SwapUsedMB   float64 `json:"swap_used_mb"`
 	FreePercent  int     `json:"free_percent"` // from memory_pressure
+	DiskFreeGB   float64 `json:"disk_free_gb"` // on /
+	Load1        float64 `json:"load1"`
+	Cores        int     `json:"cores"`
 }
 
 var vmStatLine = regexp.MustCompile(`^(.+?):\s+(\d+)\.?$`)
@@ -60,5 +63,7 @@ func readMem() MemStats {
 			m.FreePercent, _ = strconv.Atoi(mm[1])
 		}
 	}
+	m.DiskFreeGB = diskFreeGB("/")
+	m.Load1, m.Cores = loadAvg()
 	return m
 }
