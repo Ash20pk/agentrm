@@ -4,12 +4,17 @@ options:
   deploymentTarget:
     macOS: "14.0"
   createIntermediateGroups: true
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: 2.7.1
 configFiles:
   Debug: Config/Signing.xcconfig
   Release: Config/Signing.xcconfig
 settings:
   base:
     MARKETING_VERSION: "0.1.0"
+    SPARKLE_PUBLIC_KEY: "pqtVj+5kJKOZOudbQdRwtZz2UfY900t64n7VyyoLxTg="
     CURRENT_PROJECT_VERSION: "1"
     SWIFT_VERSION: "5.0"
     ENABLE_HARDENED_RUNTIME: YES
@@ -19,6 +24,8 @@ targets:
   AgentRM:
     type: application
     platform: macOS
+    dependencies:
+      - package: Sparkle
     sources:
       - path: Sources
       - path: Resources/Assets.xcassets
@@ -36,6 +43,9 @@ targets:
         LSUIElement: true
         LSApplicationCategoryType: public.app-category.developer-tools
         NSHumanReadableCopyright: "MIT License"
+        SUFeedURL: https://github.com/Ash20pk/agentrm/releases/latest/download/appcast.xml
+        SUPublicEDKey: $(SPARKLE_PUBLIC_KEY)
+        SUEnableAutomaticChecks: true
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.agentrm.AgentRM
@@ -58,6 +68,8 @@ targets:
             CGO_ENABLED=0 GOOS=darwin GOARCH=$arch go build -trimpath \
               -ldflags "-s -w -X main.version=${VERSION}" -o "${DERIVED_FILE_DIR}/go/agentrm-$arch" .
           done
+          # A new file, not an overwrite: macOS kills a running signed binary whose file changes in place.
+          rm -f "$OUT/agentrm"
           lipo -create -output "$OUT/agentrm" "${DERIVED_FILE_DIR}/go/agentrm-arm64" "${DERIVED_FILE_DIR}/go/agentrm-amd64"
           if [ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ] && [ "${EXPANDED_CODE_SIGN_IDENTITY}" != "-" ]; then
             codesign --force --options runtime --timestamp --identifier dev.agentrm.cli \

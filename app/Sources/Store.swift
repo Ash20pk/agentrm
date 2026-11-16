@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import ServiceManagement
 import UserNotifications
@@ -9,41 +10,61 @@ let log = Logger(subsystem: "dev.agentrm", category: "app")
 final class Store: ObservableObject {
     @Published var status: Status?
     @Published var setup: SetupCheck?
+    @Published var review: ReviewResp?
     @Published var daemonError: String?
     @Published var lastActionError: String?
     @Published var registrationError: String?
     @Published var loginItemStatus: SMAppService.Status = .notRegistered
+    @Published var hookPreview = ""
 
     private var timer: Timer?
     private var lastEventSeq = -1
     let service = SMAppService.agent(plistName: "dev.agentrm.daemon.plist")
+    let notifications = NotificationHandler()
+
+    var onboarded: Bool {
+        get { UserDefaults.standard.bool(forKey: "onboarded") }
+        set { UserDefaults.standard.set(newValue, forKey: "onboarded"); objectWillChange.send() }
+    }
+
+    /// When dry run started, for the auto-stop gate.
+    var dryRunSince: Date {
+        if let d = UserDefaults.standard.object(forKey: "dryRunSince") as? Date { return d }
+        let now = Date()
+        UserDefaults.standard.set(now, forKey: "dryRunSince")
+        return now
+    }
 
     init() {
         loginItemStatus = service.status
-        log.notice("daemon service status at launch: \(String(describing: self.service.status.rawValue), privacy: .public)")
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+        notifications.store = self
+        notifications.install()
         if service.status != .enabled && service.status != .requiresApproval {
             registerDaemon()
         }
         timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.refresh() }
         }
-        Task { await refresh(); await refreshSetup() }
+        Task {
+            await refresh()
+            await refreshSetup()
+            await repairIfMoved()
+        }
     }
 
-    var leases: [Lease] {
-        (status?.leases ?? [:]).values.sorted { $0.created < $1.created }
-    }
-
-    var resources: [Resource] {
-        (status?.resources ?? [:]).values.sorted { $0.mem_mb > $1.mem_mb }
-    }
-
+    var leases: [Lease] { (status?.leases ?? [:]).values.sorted { $0.created < $1.created } }
+    var resources: [Resource] { (status?.resources ?? [:]).values.sorted { $0.mem_mb > $1.mem_mb } }
     var orphans: [Resource] { resources.filter { $0.lease_id == nil && $0.pinned != true && $0.orphan_since != nil } }
+    var pendingApprovals: [Approval] {
+        (status?.approvals ?? [:]).values.filter { $0.state == "pending" && $0.expires > Date() }.sorted { $0.created < $1.created }
+    }
+    var failingSources: [(String, String)] {
+        (status?.sources ?? [:]).filter { !$0.value.isEmpty }.sorted { $0.key < $1.key }.map { ($0.key, $0.value) }
+    }
 
     var underPressure: Bool {
         guard let s = status else { return false }
-        return (s.mem.pressure_level ?? 1) >= 2 || (s.swap_rate_mb_min ?? 0) > 300
+        return (s.mem.pressure_level ?? 1) >= 4 || (s.swap_rate_mb_min ?? 0) > 300
     }
 
     func refresh() async {
@@ -52,7 +73,7 @@ final class Store: ObservableObject {
             let s = try CLI.decoder.decode(Status.self, from: data)
             status = s
             daemonError = nil
-            notifyNewEvents(s.events ?? [])
+            notifications.post(newEvents(s.events ?? []))
         } catch {
             status = nil
             daemonError = error.localizedDescription
@@ -61,8 +82,32 @@ final class Store: ObservableObject {
     }
 
     func refreshSetup() async {
-        if let data = try? await CLI.run(["setup", "check"]) {
+        if let data = try? await CLI.run(["setup", "check", "--json"]) {
             setup = try? CLI.decoder.decode(SetupCheck.self, from: data)
+        }
+    }
+
+    func refreshReview() async {
+        if let data = try? await CLI.run(["review", "--all", "--json"]) {
+            review = try? CLI.decoder.decode(ReviewResp.self, from: data)
+        }
+    }
+
+    func loadHookPreview() async {
+        hookPreview = await CLI.text(["setup", "preview", "claude"])
+    }
+
+    /// If AgentRM was moved or updated, the hooks and the CLI link still point at the old copy.
+    /// Re-point what is already installed (nothing new is installed). Only for an installed app.
+    func repairIfMoved() async {
+        guard let s = setup, !(s.problems ?? []).isEmpty,
+              Bundle.main.bundlePath.hasPrefix("/Applications/") else { return }
+        do {
+            _ = try await CLI.run(["setup", "repair"])
+            log.notice("repaired hooks and links after a move or update")
+            await refreshSetup()
+        } catch {
+            lastActionError = "Could not repair the hooks: \(error.localizedDescription)"
         }
     }
 
@@ -80,24 +125,49 @@ final class Store: ObservableObject {
     }
 
     func release(_ l: Lease) { act(["release", l.id]) }
-    func stop(_ r: Resource) { act(["stop", r.id]) }
-    func resume(_ r: Resource) { act(["resume", r.id]) }
+    func stop(_ id: String) { act(["stop", id]) }
+    func resume(_ id: String) { act(["resume", id]) }
+    func restore(_ id: String) { act(["restore", id]) }
     func pin(_ r: Resource) { act([r.pinned == true ? "unpin" : "pin", r.id]) }
-    func claim(_ r: Resource, purpose: String, hours: Int) {
-        act(["claim", r.id, "--purpose", purpose, "--ttl", String(hours * 60), "--agent", "you", "--session", "you"])
+    func claim(_ id: String, purpose: String, hours: Int) {
+        act(["claim", id, "--purpose", purpose, "--ttl", String(hours * 60)])
     }
-    func setAutoStop(_ on: Bool) { act(["config", "--dry-run=\(on ? "false" : "true")"]) }
-    func setLimits(headroom: Double, grace: Int, idle: Int) {
-        act(["config", "--headroom", String(headroom), "--grace", String(grace), "--idle", String(idle)])
+    func answer(_ approvalID: String, approve: Bool) { act([approve ? "approve" : "deny", approvalID]) }
+    func mark(_ d: Decision, right: Bool) {
+        Task {
+            _ = try? await CLI.run(["review", "mark", d.id, right ? "right" : "wrong"])
+            await refreshReview()
+        }
+    }
+    func setAutoStop(_ on: Bool) {
+        if !on { UserDefaults.standard.set(Date(), forKey: "dryRunSince") }
+        act(["config", "--dry-run=\(on ? "false" : "true")"])
+    }
+    func setLimits(headroom: Double, grace: Int, idle: Int, pause: Int) {
+        act(["config", "--headroom", String(headroom), "--grace", String(grace), "--idle", String(idle), "--pause", String(pause)])
     }
     func setup(_ what: String, install: Bool) { act(install ? ["setup", what] : ["setup", what, "--uninstall"]) }
+
+    /// Removes everything AgentRM installed into other tools, stops the daemon, and quits.
+    func uninstall() {
+        Task {
+            _ = try? await CLI.run(["setup", "uninstall"], timeout: 60)
+            unregisterDaemon()
+            UserDefaults.standard.removeObject(forKey: "onboarded")
+            let alert = NSAlert()
+            alert.messageText = "AgentRM is uninstalled"
+            alert.informativeText = "The Claude Code hooks, the Codex note, the command-line link and the PATH shim were removed, anything paused was resumed, and the background daemon is off. Move AgentRM to the Bin to finish. Its data is in ~/.agentrm."
+            alert.runModal()
+            NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+            NSApp.terminate(nil)
+        }
+    }
 
     func registerDaemon() {
         do {
             try service.register()
-            log.notice("registered daemon, status now \(String(describing: self.service.status.rawValue), privacy: .public)")
         } catch {
-            log.error("register failed: \(error.localizedDescription, privacy: .public) \(String(describing: error), privacy: .public)")
+            log.error("register failed: \(error.localizedDescription, privacy: .public)")
             registrationError = "Could not register the background daemon: \(error.localizedDescription)"
         }
         loginItemStatus = service.status
@@ -108,19 +178,39 @@ final class Store: ObservableObject {
         loginItemStatus = service.status
     }
 
-    private func notifyNewEvents(_ events: [AgentEvent]) {
+    private func newEvents(_ events: [AgentEvent]) -> [AgentEvent] {
         let maxSeq = events.map(\.seq).max() ?? 0
         defer { lastEventSeq = max(lastEventSeq, maxSeq) }
-        // First load, or the daemon restarted: don't replay history.
-        if lastEventSeq < 0 || maxSeq < lastEventSeq { return }
-        for e in events where e.seq > lastEventSeq && ["ORPHAN", "STOPPED", "STOP", "PAUSED", "ASKYOU", "OVERRIDE", "UNLEASED-USE"].contains(e.kind) {
-            let content = UNMutableNotificationContent()
-            content.title = ["ORPHAN": "Unclaimed resource", "ASKYOU": "Still using this?", "PAUSED": "Paused (nothing lost)",
-                             "OVERRIDE": "Settings or leases changed from a terminal",
-                             "UNLEASED-USE": "Heavy use without a lease"][e.kind] ?? "Stopped"
-            content.body = e.text
-            UNUserNotificationCenter.current().add(
-                UNNotificationRequest(identifier: "agentrm-\(e.seq)", content: content, trigger: nil))
+        if lastEventSeq < 0 || maxSeq < lastEventSeq { return [] } // first load, or a daemon restart
+        return events.filter { $0.seq > lastEventSeq }
+    }
+
+    // ---- the auto-stop gate ----
+
+    struct Readiness {
+        var days: Int
+        var wouldAct: Int
+        var reviewed: Int
+        var wrong: Int
+        var ready: Bool
+        var summary: String
+    }
+
+    /// Whether dry run has shown enough to recommend auto-stop: a week of it, at least five
+    /// reviewed decisions, and under 2% of them wrong.
+    var readiness: Readiness {
+        let days = Calendar.current.dateComponents([.day], from: dryRunSince, to: Date()).day ?? 0
+        let ds = (review?.decisions ?? []).filter { $0.dry_run && $0.action != "reclaim" }
+        let reviewed = review?.reviewed ?? 0
+        let wrong = review?.wrong ?? 0
+        let rate = reviewed > 0 ? Double(wrong) / Double(reviewed) : 1
+        let ready = days >= 7 && reviewed >= 5 && rate < 0.02
+        var s = "In \(days) day\(days == 1 ? "" : "s") of dry run, AgentRM would have paused or stopped \(ds.count) thing\(ds.count == 1 ? "" : "s"). "
+        if reviewed == 0 {
+            s += "You have not reviewed any of those decisions yet."
+        } else {
+            s += "You reviewed \(reviewed); \(wrong) \(wrong == 1 ? "was" : "were") wrong."
         }
+        return Readiness(days: days, wouldAct: ds.count, reviewed: reviewed, wrong: wrong, ready: ready, summary: s)
     }
 }
