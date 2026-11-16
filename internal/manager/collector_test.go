@@ -220,3 +220,30 @@ func TestSessionEndHookEndsTheSession(t *testing.T) {
 		t.Fatal("a session that talks again is still treated as ended")
 	}
 }
+
+func TestAgentStartIsRecordedForExistingSessions(t *testing.T) {
+	m, c := newTest(t, 8)
+	start := c.Now().Add(-time.Hour)
+	// A session from before start times were recorded: PID known, start unknown.
+	m.agentSessions[500] = "s"
+	m.st.Sessions["s"] = &model.Session{ID: "s", Agent: "claude", AgentPID: 500, LastSeen: c.Now()}
+	m.updateFootprints(agentTree(start), c.Now())
+	if got := m.st.Sessions["s"].AgentStart; !got.Equal(start) {
+		t.Fatalf("agent start not recorded: %v", got)
+	}
+}
+
+func TestCompressedLeftoverIsStillFound(t *testing.T) {
+	m, c := newTest(t, 8)
+	start := c.Now().Add(-time.Hour)
+	liveSession(m, "s", start)
+	procs := agentTree(start)
+	m.checkLiveness(procs, c.Now()) // seen at full size while the agent ran
+	gone := afterExit(procs)
+	gone[600].RSSMB, gone[601].RSSMB = 3, 4 // idle, and macOS compressed it
+	m.checkLiveness(gone, c.Now())
+	m.checkLiveness(gone, c.Now())
+	if m.st.Leftovers["600"] == nil {
+		t.Fatal("an idle leftover whose memory was compressed was missed")
+	}
+}

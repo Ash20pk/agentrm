@@ -270,7 +270,7 @@ func (m *Manager) updateFootprints(procs map[int]*sys.Proc, now time.Time) {
 			s = &model.Session{ID: id, Agent: kind, LastSeen: now}
 			m.st.Sessions[id] = s
 		}
-		if p := procs[apid]; p != nil && (s.AgentPID != apid || !sys.SameProcess(p, s.AgentStart)) {
+		if p := procs[apid]; p != nil && (s.AgentPID != apid || s.AgentStart.IsZero() || !sys.SameProcess(p, s.AgentStart)) {
 			if s.EndedAt != nil && s.AgentPID == apid {
 				// Same ID, new process (a PID reused by the same kind of agent): a new session.
 				s.EndedAt, s.EndReason = nil, ""

@@ -43,7 +43,7 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 			case !discover.CanAutoStop(r):
 				next = "paused (VMs are never stopped automatically)"
 			case m.cfg.PauseMinutes > 0 && discover.CanPause(r):
-				next = fmt.Sprintf("paused, and stopped %d min later,", m.cfg.PauseMinutes)
+				next = fmt.Sprintf("paused, and stopped %d min later,", int(hold.Minutes()))
 			}
 			m.st.Questions[r.ID] = &model.Question{ResourceID: r.ID, Created: now,
 				Delivered: map[string]bool{}, Answers: map[string]string{},

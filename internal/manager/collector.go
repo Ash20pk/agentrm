@@ -35,6 +35,14 @@ import (
 // maxTree bounds how many processes are remembered per session.
 const maxTree = 4000
 
+// treeProc is one process an agent started: which process (PID and start) and the most memory
+// it was seen using. The peak matters because macOS compresses an idle process's memory, so a
+// leftover that sits idle soon shows a fraction of what it holds.
+type treeProc struct {
+	Start  time.Time
+	PeakMB float64
+}
+
 // checkLiveness finds sessions whose agent process has exited, ends them, and remembers each
 // live agent's process tree for when it does. Must hold mu; procs must be a full table.
 func (m *Manager) checkLiveness(procs map[int]*sys.Proc, now time.Time) {
@@ -89,10 +97,11 @@ func (m *Manager) checkLiveness(procs map[int]*sys.Proc, now time.Time) {
 // recordTree adds the agent's current descendants to what its session started, keeping any
 // earlier ones still running even if they have since detached from it.
 func (m *Manager) recordTree(id string, agentPID int, procs map[int]*sys.Proc, children map[int][]int) {
-	tree := map[int]time.Time{}
-	for pid, start := range m.trees[id] {
-		if p := procs[pid]; p != nil && sys.SameProcess(p, start) {
-			tree[pid] = start
+	tree := map[int]treeProc{}
+	for pid, tp := range m.trees[id] {
+		if p := procs[pid]; p != nil && sys.SameProcess(p, tp.Start) {
+			tp.PeakMB = max(tp.PeakMB, p.RSSMB)
+			tree[pid] = tp
 		}
 	}
 	stack := append([]int(nil), children[agentPID]...)
@@ -103,7 +112,7 @@ func (m *Manager) recordTree(id string, agentPID int, procs map[int]*sys.Proc, c
 			continue
 		}
 		if p := procs[pid]; p != nil {
-			tree[pid] = p.Start
+			tree[pid] = treeProc{Start: p.Start, PeakMB: p.RSSMB}
 			stack = append(stack, children[pid]...)
 		}
 	}
@@ -156,10 +165,11 @@ func (m *Manager) endSession(s *model.Session, why string, now time.Time) {
 // longer under any agent. Only the top of each leftover tree is recorded, sized with what is
 // under it. Must hold mu.
 func (m *Manager) findLeftovers(s *model.Session, procs map[int]*sys.Proc, now time.Time) {
+	tree := m.trees[s.ID]
 	cands := map[int]*sys.Proc{}
-	for pid, start := range m.trees[s.ID] {
+	for pid, tp := range tree {
 		p := procs[pid]
-		if p == nil || pid == s.AgentPID || !sys.SameProcess(p, start) {
+		if p == nil || pid == s.AgentPID || !sys.SameProcess(p, tp.Start) {
 			continue
 		}
 		if apid, _ := sys.AgentAncestor(procs, pid); apid > 0 {
@@ -170,10 +180,13 @@ func (m *Manager) findLeftovers(s *model.Session, procs map[int]*sys.Proc, now t
 	if len(cands) == 0 {
 		return
 	}
+	// What each leftover holds: itself and everything under it, each at the most it was seen
+	// using while the agent ran (or now, if more).
+	peak := func(p *sys.Proc) float64 { return max(p.RSSMB, tree[p.PID].PeakMB) }
 	under := map[int]float64{}
 	for _, p := range procs {
 		for q, i := procs[p.PPID], 0; q != nil && q.PID > 1 && i < 64; q, i = procs[q.PPID], i+1 {
-			under[q.PID] += p.RSSMB
+			under[q.PID] += peak(p)
 		}
 	}
 	if m.st.Leftovers == nil {
@@ -184,7 +197,7 @@ func (m *Manager) findLeftovers(s *model.Session, procs map[int]*sys.Proc, now t
 		if cands[p.PPID] != nil {
 			continue
 		}
-		mb := p.RSSMB + under[pid]
+		mb := peak(p) + under[pid]
 		if mb < m.cfg.LeftoverMinMB && p.CPU < 2 {
 			continue
 		}
