@@ -15,7 +15,7 @@ var classifiers = []struct {
 	re   *regexp.Regexp
 }{
 	{"cluster", regexp.MustCompile(`\bkind\s+create\s+cluster\b|\bminikube\s+start\b|\bk3d\s+cluster\s+create\b`)},
-	{"compose", regexp.MustCompile(`\bdocker[- ]compose\b[^|;&]*\bup\b|\bsupabase\s+start\b|openbox-local\.sh\s+start\b`)},
+	{"compose", regexp.MustCompile(`\bdocker[- ]compose\b[^|;&]*\bup\b|\bsupabase\s+start\b`)},
 	{"docker-build", regexp.MustCompile(`\bdocker\s+(buildx\s+)?build\b`)},
 	{"cargo-build", regexp.MustCompile(`\bcargo\s+(build|test|clippy|run|nextest|bench|install)\b`)},
 	{"gradle", regexp.MustCompile(`\bgradlew\b|(^|[\s;&|])gradle\s+\w`)},
@@ -25,7 +25,39 @@ var classifiers = []struct {
 	{"server", regexp.MustCompile(`\b(npm|pnpm|yarn|bun)\s+(run\s+)?(dev|start|start:dev|serve)\b|\bnext\s+dev\b|\bvite(\s+dev)?\s*$|\buvicorn\s|\bflask\s+run\b|\brails\s+s(erver)?\b|\bgo\s+run\b`)},
 }
 
+var extraClassifiers []struct {
+	kind string
+	re   *regexp.Regexp
+}
+
+// loadExtraPatterns reads extra_patterns from config.json so hooks see user additions.
+func loadExtraPatterns() {
+	b, err := os.ReadFile(homeDir() + "/config.json")
+	if err != nil {
+		return
+	}
+	var cfg Config
+	if json.Unmarshal(b, &cfg) != nil {
+		return
+	}
+	for kind, pats := range cfg.ExtraPatterns {
+		for _, p := range pats {
+			if re, err := regexp.Compile(p); err == nil {
+				extraClassifiers = append(extraClassifiers, struct {
+					kind string
+					re   *regexp.Regexp
+				}{kind, re})
+			}
+		}
+	}
+}
+
 func classify(cmd string) string {
+	for _, c := range extraClassifiers {
+		if c.re.MatchString(cmd) {
+			return c.kind
+		}
+	}
 	for _, c := range classifiers {
 		if c.re.MatchString(cmd) {
 			return c.kind
@@ -70,6 +102,7 @@ func runHook(event string) {
 	if json.Unmarshal(raw, &in) != nil || in.SessionID == "" {
 		return
 	}
+	loadExtraPatterns()
 	base := map[string]any{"session": in.SessionID, "agent": "claude", "cwd": in.Cwd}
 
 	switch event {

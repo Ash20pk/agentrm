@@ -67,8 +67,12 @@ const usage = `agentrm — a resource manager for coding agents on this Mac
   agentrm disown RESOURCE                      answer "not mine" to an orphan question
   agentrm pin RESOURCE | unpin RESOURCE        never / again auto-stop a resource
   agentrm inbox                                questions waiting for this session
-  agentrm status | top                         what is running, who holds it, memory
-  agentrm daemon                               run the manager (launchd does this)
+  agentrm status [--json] | top                what is running, who holds it, memory
+  agentrm stop RESOURCE                        stop something now (reversibly)
+  agentrm config [--dry-run=true|false] [--grace MIN] [--reserve GB] [--min-free PCT]
+  agentrm setup claude|codex|path [--uninstall]   install the Claude hooks / Codex note / CLI link
+  agentrm setup check                          what is installed (JSON)
+  agentrm daemon                               run the manager (the app or launchd does this)
   agentrm hook pre|post|prompt|end             Claude Code hook entry point
 
 Kinds: cluster compose docker-build cargo-build gradle xcode-build simulator loadtest server
@@ -95,6 +99,12 @@ func main() {
 	ttl := fs.Int("ttl", 0, "lease lifetime in minutes")
 	wait := fs.Bool("wait", false, "keep retrying until granted (max 30 min)")
 	all := fs.Bool("all", false, "all of this session's leases")
+	asJSON := fs.Bool("json", false, "machine-readable output")
+	uninstall := fs.Bool("uninstall", false, "remove instead of install")
+	dryRun := fs.String("dry-run", "", "true or false")
+	grace := fs.Int("grace", 0, "minutes an orphan may run unclaimed")
+	reserve := fs.Float64("reserve", 0, "GB kept back for macOS and apps")
+	minFree := fs.Int("min-free", 0, "refuse leases below this free %")
 	_ = fs.Parse(args)
 	if pos == "" && fs.NArg() > 0 {
 		pos = fs.Arg(0)
@@ -190,7 +200,33 @@ func main() {
 			}
 		}
 	case "status":
+		if *asJSON {
+			var raw json.RawMessage
+			if err = call("/status", map[string]any{}, &raw); err == nil {
+				fmt.Println(string(raw))
+			}
+			break
+		}
 		err = printStatus()
+	case "stop":
+		var resp struct{ Restart string }
+		if err = call("/stop", map[string]any{"resource_id": pos}, &resp); err == nil {
+			fmt.Printf("stopped %s. Restart with: %s\n", pos, resp.Restart)
+		}
+	case "config":
+		req := map[string]any{"grace_minutes": *grace, "reserve_gb": *reserve, "min_free_percent": *minFree}
+		if *dryRun != "" {
+			req["dry_run"] = *dryRun == "true"
+		}
+		var raw json.RawMessage
+		if err = call("/config", req, &raw); err == nil {
+			fmt.Println(string(raw))
+		}
+	case "setup":
+		err = runSetup(pos, *uninstall)
+		if err == nil && pos != "check" {
+			fmt.Printf("setup %s: %s\n", pos, map[bool]string{true: "removed", false: "installed"}[*uninstall])
+		}
 	case "top":
 		for {
 			fmt.Print("\033[H\033[2J")

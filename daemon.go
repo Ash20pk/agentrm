@@ -29,17 +29,19 @@ type Config struct {
 	ServerNames       []string           `json:"server_names"`   // listening processes treated as dev servers
 	ServerExclude     []string           `json:"server_exclude"` // substrings of args that are never dev servers
 	NeverStop         []string           `json:"never_stop"`     // resource IDs or name substrings left alone
+	// ExtraPatterns adds command regexes per lease kind, e.g. {"compose": ["my-stack\\.sh\\s+start"]}.
+	ExtraPatterns map[string][]string `json:"extra_patterns"`
 }
 
 func defaultConfig() Config {
 	return Config{
 		ReserveGB: 4, MinFreePercent: 10, GraceMinutes: 10, DefaultTTLMinutes: 120,
-		BuildTTLMinutes: 30, SweepSeconds: 30,
+		BuildTTLMinutes: 30, SweepSeconds: 30, DryRun: true, ExtraPatterns: map[string][]string{},
 		KindMemGB: map[string]float64{
 			"cluster": 3, "compose": 2, "docker-build": 3, "cargo-build": 2.5, "gradle": 3,
 			"xcode-build": 3, "simulator": 1.5, "loadtest": 2, "server": 0.5,
 		},
-		ServerNames:   []string{"node", "python", "python3*", "ruby", "deno", "bun", "php", "uvicorn", "gunicorn", "java", "air", "main", "core"},
+		ServerNames:   []string{"node", "python", "python3*", "ruby", "deno", "bun", "php", "uvicorn", "gunicorn", "java", "air", "main"},
 		ServerExclude: []string{"mcp", "claude", "codex", "copilot", "language-server", "langserver", "tsserver", "gopls", "rust-analyzer"},
 	}
 }
@@ -97,6 +99,15 @@ type Daemon struct {
 	dir       string
 	lastSweep time.Time
 	firstDone bool
+	events    []Event
+	eventSeq  int
+}
+
+type Event struct {
+	Seq  int       `json:"seq"`
+	Time time.Time `json:"time"`
+	Kind string    `json:"kind"` // first word: GRANT, ORPHAN, STOPPED, ...
+	Text string    `json:"text"`
 }
 
 func homeDir() string {
@@ -144,7 +155,14 @@ func (d *Daemon) save() {
 }
 
 func (d *Daemon) event(format string, a ...any) {
-	line := time.Now().Format("2006-01-02 15:04:05 ") + fmt.Sprintf(format, a...)
+	text := fmt.Sprintf(format, a...)
+	d.eventSeq++
+	kind, _, _ := strings.Cut(text, " ")
+	d.events = append(d.events, Event{Seq: d.eventSeq, Time: time.Now(), Kind: kind, Text: text})
+	if len(d.events) > 100 {
+		d.events = d.events[len(d.events)-100:]
+	}
+	line := time.Now().Format("2006-01-02 15:04:05 ") + text
 	log.Print(line)
 	f, err := os.OpenFile(filepath.Join(d.dir, "events.log"), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
 	if err == nil {
@@ -153,7 +171,12 @@ func (d *Daemon) event(format string, a ...any) {
 	}
 }
 
+// notify shows a macOS notification. When the menu-bar app runs the daemon it sets
+// AGENTRM_NOTIFY=app and posts notifications itself from the event feed.
 func notify(title, msg string) {
+	if os.Getenv("AGENTRM_NOTIFY") == "app" {
+		return
+	}
 	esc := func(s string) string { return strings.ReplaceAll(strings.ReplaceAll(s, `\`, `\\`), `"`, `\"`) }
 	_ = exec.Command("osascript", "-e",
 		fmt.Sprintf(`display notification "%s" with title "agentrm" subtitle "%s"`, esc(msg), esc(title))).Start()
@@ -232,6 +255,8 @@ func runDaemon() error {
 	handle("/inbox", d.inbox)
 	handle("/session", func(req map[string]any) (any, error) { d.touch(req); return map[string]bool{"ok": true}, nil })
 	handle("/status", d.status)
+	handle("/stop", d.stopNow)
+	handle("/config", d.setConfig)
 	return http.Serve(ln, mux)
 }
 
@@ -480,8 +505,57 @@ func (d *Daemon) status(req map[string]any) (any, error) {
 	return map[string]any{
 		"mem": d.mem, "committed_mb": d.committedMB(), "budget_mb": d.budgetMB(), "config": d.cfg,
 		"leases": d.st.Leases, "resources": d.st.Resources, "sessions": d.st.Sessions,
-		"questions": d.st.Questions, "last_sweep": d.lastSweep,
+		"questions": d.st.Questions, "last_sweep": d.lastSweep, "events": d.events,
 	}, nil
+}
+
+// stopNow stops a resource immediately, at the user's request.
+func (d *Daemon) stopNow(req map[string]any) (any, error) {
+	rid := str(req, "resource_id")
+	r := d.st.Resources[rid]
+	if r == nil {
+		return nil, fmt.Errorf("no running resource %q", rid)
+	}
+	if err := stop(r); err != nil {
+		return nil, err
+	}
+	if l := d.st.Leases[r.LeaseID]; l != nil {
+		l.Resources = remove(l.Resources, rid)
+	}
+	delete(d.st.Resources, rid)
+	delete(d.st.Questions, rid)
+	d.event("STOPPED %s (%s, %.1f GB) by hand. Restart: %s", rid, r.Name, r.MemMB/1024, howToRestart(r))
+	return map[string]string{"restart": howToRestart(r)}, nil
+}
+
+// setConfig changes settings live and writes them to config.json.
+func (d *Daemon) setConfig(req map[string]any) (any, error) {
+	if v, ok := req["dry_run"].(bool); ok {
+		d.cfg.DryRun = v
+	}
+	if v := num(req, "grace_minutes"); v >= 1 {
+		d.cfg.GraceMinutes = int(v)
+	}
+	if v := num(req, "reserve_gb"); v >= 1 {
+		d.cfg.ReserveGB = v
+	}
+	if v := num(req, "min_free_percent"); v >= 1 {
+		d.cfg.MinFreePercent = int(v)
+	}
+	if v, ok := req["never_stop"].([]any); ok {
+		d.cfg.NeverStop = nil
+		for _, x := range v {
+			if s, ok := x.(string); ok && s != "" {
+				d.cfg.NeverStop = append(d.cfg.NeverStop, s)
+			}
+		}
+	}
+	b, _ := json.MarshalIndent(d.cfg, "", "  ")
+	if err := os.WriteFile(filepath.Join(d.dir, "config.json"), b, 0o644); err != nil {
+		return nil, err
+	}
+	d.event("CONFIG dry_run=%v grace=%dm reserve=%.0fGB min_free=%d%%", d.cfg.DryRun, d.cfg.GraceMinutes, d.cfg.ReserveGB, d.cfg.MinFreePercent)
+	return d.cfg, nil
 }
 
 func (d *Daemon) neverStop(r *Resource) bool {
