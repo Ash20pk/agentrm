@@ -30,6 +30,12 @@ type Config struct {
 	RequireAppApproval   bool    `json:"require_app_approval"`   // privileged actions from a terminal need a click in the app
 	AutoThawOnConnect    bool    `json:"auto_thaw_on_connect"`   // resume a paused server when something tries to connect to it
 	LogLevel             string  `json:"log_level"`              // debug, info, warn, error
+
+	// The collector (see docs/how-it-works.md, "Garbage collection").
+	OwnerGoneGraceMinutes int     `json:"owner_gone_grace_minutes"` // unclaimed, and the agent that started or held it has exited
+	OwnerGonePauseMinutes int     `json:"owner_gone_pause_minutes"` // how long such a thing stays paused before it is stopped
+	OldGenerationHours    int     `json:"old_generation_hours"`     // running this long with no known owner: slower, and always asked first
+	LeftoverMinMB         float64 `json:"leftover_min_mb"`          // a process an exited agent left running is tracked from this size
 }
 
 // DefaultConfig is sized for a 16 GB Mac; ScaleToMachine adjusts it to the real one.
@@ -40,6 +46,7 @@ func DefaultConfig() Config {
 		SweepSeconds: 30, FastSweepSeconds: 3, DryRun: true, ExtraPatterns: map[string][]string{},
 		IdleMinutes: 30, ClaimWindowMinutes: 60, UnverifiedTTLMinutes: 30, MinDiskGB: 10, MaxLoadPerCore: 1.5,
 		MaxSessionShare: 0.6, RequireAppApproval: true, AutoThawOnConnect: true, LogLevel: "info",
+		OwnerGoneGraceMinutes: 2, OwnerGonePauseMinutes: 10, OldGenerationHours: 24, LeftoverMinMB: 40,
 		KindMemGB: map[string]float64{
 			KCluster: 3, KCompose: 2, KDockerBuild: 3, KCargoBuild: 2.5, KGradle: 3, KXcodeBuild: 3,
 			KSimulator: 1.5, KEmulator: 2.5, KVM: 4, KModel: 5, KLoadtest: 2, KServer: 0.5, KBrowser: 0.8,

@@ -187,6 +187,8 @@ func (m *Manager) Sweep() {
 	m.lastSweep = now
 	if procs != nil {
 		m.updateFootprints(procs, now)
+		m.checkLiveness(procs, now)
+		found.Resources = m.withLeftovers(found.Resources, procs)
 	}
 	m.merge(found, procs, est, now)
 	m.checkLeases(now)
@@ -196,6 +198,8 @@ func (m *Manager) Sweep() {
 			delete(m.st.Sessions, id)
 			delete(m.footBase, id)
 			delete(m.recent, id)
+			delete(m.trees, id)
+			delete(m.missing, id)
 		}
 	}
 	for id, o := range m.origins() {
@@ -228,7 +232,13 @@ func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[
 		old := m.st.Resources[r.ID]
 		if old != nil {
 			r.FirstSeen, r.LeaseID, r.OrphanSince = old.FirstSeen, old.LeaseID, old.OrphanSince
-			r.LastActive, r.StartedBy = old.LastActive, old.StartedBy
+			r.LastActive = old.LastActive
+			if r.StartedBy == "" {
+				r.StartedBy = old.StartedBy
+			}
+			if r.Owner == "" {
+				r.Owner, r.OwnerGoneAt = old.Owner, old.OwnerGoneAt
+			}
 			r.PausedAt, r.Urgent = old.PausedAt, old.Urgent
 			if r.Cwd == "" {
 				r.Cwd = old.Cwd
@@ -269,6 +279,16 @@ func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[
 // attribute binds a resource that has no lease to the session that started it.
 func (m *Manager) attribute(r *model.Resource, procs map[int]*sys.Proc, now time.Time, isNew bool) {
 	s := m.startedBy(r, procs, now, isNew)
+	if ended := m.sessionEnded(s); ended != nil {
+		// Its starter is gone: it is not a root, so it keeps nothing alive. Credit it and let
+		// the collector have it.
+		r.StartedBy = s
+		if r.Owner == "" {
+			t := *ended
+			r.Owner, r.OwnerGoneAt = s, &t
+		}
+		return
+	}
 	if s != "" {
 		r.StartedBy = s
 		var best *model.Lease
@@ -310,6 +330,9 @@ func (m *Manager) attribute(r *model.Resource, procs map[int]*sys.Proc, now time
 	}
 	if len(cands) == 1 {
 		r.LeaseID = cands[0].ID
+		if r.StartedBy == "" {
+			r.StartedBy = cands[0].Session
+		}
 		cands[0].Resources = append(cands[0].Resources, r.ID)
 		m.event("BIND %s to lease %s (%s; only candidate)", r.ID, cands[0].ID, short(cands[0].Session))
 	}

@@ -14,27 +14,73 @@ type Proc struct {
 	RSSMB     float64
 	CPU       float64
 	Exe, Args string
+	// Start is when the process started (to the second). A PID is reused after a process
+	// exits; the pair (PID, Start) is what identifies one process over time.
+	Start time.Time
 }
 
 // ListProcs reads the whole process table.
 func ListProcs() map[int]*Proc {
-	out, err := Run(5*time.Second, "ps", "-axww", "-o", "pid=,ppid=,rss=,%cpu=,args=")
+	out, err := Run(5*time.Second, "ps", "-axww", "-o", "pid=,ppid=,rss=,%cpu=,etime=,args=")
 	if err != nil && out == "" {
 		return nil
 	}
+	now := time.Now().Truncate(time.Second)
 	procs := map[int]*Proc{}
 	for _, l := range strings.Split(out, "\n") {
 		f := strings.Fields(l)
-		if len(f) < 5 {
+		if len(f) < 6 {
 			continue
 		}
 		pid, _ := strconv.Atoi(f[0])
 		ppid, _ := strconv.Atoi(f[1])
 		rss, _ := strconv.ParseFloat(f[2], 64)
 		cpu, _ := strconv.ParseFloat(f[3], 64)
-		procs[pid] = &Proc{PID: pid, PPID: ppid, RSSMB: rss / 1024, CPU: cpu, Exe: f[4], Args: strings.Join(f[4:], " ")}
+		p := &Proc{PID: pid, PPID: ppid, RSSMB: rss / 1024, CPU: cpu, Exe: f[5], Args: strings.Join(f[5:], " ")}
+		if el, ok := ParseElapsed(f[4]); ok {
+			p.Start = now.Add(-el)
+		}
+		procs[pid] = p
 	}
 	return procs
+}
+
+// ParseElapsed reads ps's etime column: [[dd-]hh:]mm:ss.
+func ParseElapsed(s string) (time.Duration, bool) {
+	days := 0
+	if i := strings.IndexByte(s, '-'); i >= 0 {
+		d, err := strconv.Atoi(s[:i])
+		if err != nil {
+			return 0, false
+		}
+		days, s = d, s[i+1:]
+	}
+	parts := strings.Split(s, ":")
+	if len(parts) < 2 || len(parts) > 3 {
+		return 0, false
+	}
+	total := 0
+	for _, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return 0, false
+		}
+		total = total*60 + n
+	}
+	return time.Duration(days)*24*time.Hour + time.Duration(total)*time.Second, true
+}
+
+// SameProcess reports whether a live process is the one that started at want, allowing for
+// ps's one-second resolution. An unknown start on either side counts as the same.
+func SameProcess(p *Proc, want time.Time) bool {
+	if p == nil {
+		return false
+	}
+	if p.Start.IsZero() || want.IsZero() {
+		return true
+	}
+	d := p.Start.Sub(want)
+	return d > -3*time.Second && d < 3*time.Second
 }
 
 // ProcTable caches the process table briefly, because every request may walk it.

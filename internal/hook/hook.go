@@ -90,6 +90,9 @@ func Run(event string) {
 		}
 
 	case "end":
-		_ = api.CallTimeout(budget, "/release", base, nil)
+		// /end tells the collector the session is over; a daemon from before it has only /release.
+		if err := api.CallTimeout(budget, "/end", base, nil); err != nil {
+			_ = api.CallTimeout(budget, "/release", base, nil)
+		}
 	}
 }

@@ -79,6 +79,43 @@ paused where possible and you are asked.
 Every pause and stop decision, taken or (in dry run) not, is kept for `agentrm review`, where you
 mark it right or wrong. That is the evidence for turning auto-stop on.
 
+## Garbage collection: what an agent leaves behind
+
+The orphan rules above apply to anything nobody claims. The collector adds what AgentRM knows
+about who started things, so that what an agent leaves behind goes quickly and safely.
+
+It is a mark and sweep over ownership. **Roots** keep things running: a live agent session, you
+(anything started from a GUI app, pinned, or on the never-stop list), and leases with recent use.
+**Edges** are recorded as things start: session → lease → resource, and session → every process
+in the agent's tree, including the ones that detach and re-parent to launchd (daemons, `nohup`,
+`&`), and the containers Docker's event stream credits to it.
+
+A session stops being a root when it says so (Claude Code's SessionEnd hook) or when its agent
+process is gone. That is checked every sweep by PID *and* start time, so a reused PID never keeps
+a dead session alive, and only after two sweeps in a row, so a failed `ps` ends nothing. Then:
+
+- its leases are released at once (not after the idle question or the TTL);
+- everything it started or held, and nobody else holds, is marked owner-gone;
+- processes from its tree that are still running and under no agent are tracked as
+  **leftovers**, even when they are of no kind AgentRM knows (`tsc --watch`, `esbuild`, a Python
+  worker): the top of each leftover tree, sized with what is under it, from `leftover_min_mb`.
+  A leftover discovery already knows (a Gradle daemon, a dev server) is credited to its
+  session instead of being listed twice.
+
+Sweeping is the usual staged, reversible path, timed by the evidence:
+
+| Evidence | Paused after | Stopped after |
+|---|---|---|
+| Its owner ended and nothing has used it since | `owner_gone_grace_minutes` (2) | `owner_gone_pause_minutes` (10) |
+| No known owner | `grace_minutes` (10), halved under memory pressure | `pause_minutes` (30) |
+| No known owner, running for `old_generation_hours` (24) or more | three times `grace_minutes` | `pause_minutes` |
+
+Use after the owner left (network traffic, CPU, another session's command naming it) takes a
+resource off the fast path: someone may have taken it over, so it waits like anything else.
+A session that talks again (resumed) is a root once more. What is never collected automatically
+is unchanged: VMs, things you started, pinned and never-stop items. The Activity window's
+Collected tab lists each ended session with what it left and what happened to it.
+
 ## Sampling
 
 A full sweep (discovery, attribution, leases, orphans) runs every `sweep_seconds` (30), and at

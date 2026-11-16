@@ -283,6 +283,7 @@ enum Kind {
         case "headless-browser", "browser": return "Headless browser"
         case "loadtest": return "Load test"
         case "heavy": return "Heavy process"
+        case "leftover-process": return "Left behind"
         default: return kind.capitalized
         }
     }

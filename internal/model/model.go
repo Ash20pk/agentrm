@@ -16,6 +16,9 @@ const (
 	RKModel      = "model-server"
 	RKDatabase   = "database"
 	RKBrowser    = "headless-browser"
+	// RKLeftover is a process an agent started that kept running after the agent exited:
+	// re-parented to launchd, with no known kind. Found by the collector, not by discovery.
+	RKLeftover = "leftover-process"
 )
 
 // Lease kinds.
@@ -85,6 +88,10 @@ type Resource struct {
 	PausedAt    *time.Time `json:"paused_at,omitempty"`   // frozen since then, not yet stopped
 	Urgent      bool       `json:"urgent,omitempty"`      // a blocked request needs its memory: stop, do not freeze
 	Restart     string     `json:"restart,omitempty"`     // how to bring it back after a stop
+	// Owner is the session that started or last held it, once that session is gone, and
+	// OwnerGoneAt when it went: the collector's strongest evidence that nobody needs it.
+	Owner       string     `json:"owner,omitempty"`
+	OwnerGoneAt *time.Time `json:"owner_gone_at,omitempty"`
 }
 
 type Lease struct {
@@ -129,6 +136,22 @@ type Session struct {
 	DistrustUntil time.Time `json:"distrust_until,omitempty"`
 	// Priority: 0 normal, 1 urgent (set by the user). Urgent sessions go ahead in the queue.
 	Priority int `json:"priority,omitempty"`
+	// AgentStart is when the agent process started: with AgentPID it tells a live agent from
+	// a reused PID.
+	AgentStart time.Time `json:"agent_start,omitempty"`
+	// EndedAt is when the session ended: it said so (SessionEnd), or its agent process exited.
+	// An ended session is no longer a root: nothing it held or started is kept alive by it.
+	EndedAt   *time.Time `json:"ended_at,omitempty"`
+	EndReason string     `json:"end_reason,omitempty"`
+}
+
+// Leftover is a process from an ended session's tree that is still running.
+type Leftover struct {
+	PID     int       `json:"pid"`
+	Start   time.Time `json:"start"`
+	Session string    `json:"session"`
+	Agent   string    `json:"agent"`
+	Found   time.Time `json:"found"`
 }
 
 type Question struct {
@@ -184,6 +207,8 @@ type State struct {
 	Approvals map[string]*Approval `json:"approvals"`
 	// Decisions records each would-pause/would-stop decision for review.
 	Decisions []*Decision `json:"decisions"`
+	// Leftovers are processes ended sessions left running, keyed by PID.
+	Leftovers map[string]*Leftover `json:"leftovers,omitempty"`
 }
 
 // Decision is one pause or stop decision (taken, or that would have been taken in dry run),
@@ -205,7 +230,7 @@ func NewState() State {
 	return State{Version: StateVersion, Leases: map[string]*Lease{}, Sessions: map[string]*Session{},
 		Resources: map[string]*Resource{}, Questions: map[string]*Question{}, Pinned: map[string]bool{},
 		Touches: map[string]map[string]time.Time{}, Learned: map[string]float64{}, LearnedDev: map[string]float64{},
-		AgentSessions: map[string]string{}, Approvals: map[string]*Approval{}}
+		AgentSessions: map[string]string{}, Approvals: map[string]*Approval{}, Leftovers: map[string]*Leftover{}}
 }
 
 type Event struct {

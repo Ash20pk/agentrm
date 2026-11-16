@@ -5,7 +5,9 @@ import SwiftUI
 /// The Activity window: the rack unit behind the menu. Now (the waterfall and everything running),
 /// the decisions to review, what was stopped, setup and limits.
 struct ActivityView: View {
-    enum Tab: String, CaseIterable { case now = "Now", decisions = "Decisions", stopped = "Stopped", setup = "Setup", limits = "Limits" }
+    enum Tab: String, CaseIterable {
+        case now = "Now", collected = "Collected", decisions = "Decisions", stopped = "Stopped", setup = "Setup", limits = "Limits"
+    }
 
     let updater: SPUUpdater
     @EnvironmentObject var store: Store
@@ -42,6 +44,7 @@ struct ActivityView: View {
             Group {
                 switch tab {
                 case .now: NowTab()
+                case .collected: CollectedTab()
                 case .decisions: DecisionsTab()
                 case .stopped: StoppedTab()
                 case .setup: SetupTab(updater: updater)
@@ -149,6 +152,78 @@ struct NowTab: View {
         case .kept: return Color(hex: 0x30343A)
         case .off: return Ink.off
         }
+    }
+}
+
+// MARK: - Collected
+
+/// What exited agents left behind, session by session, and what the collector did with it.
+struct CollectedTab: View {
+    @EnvironmentObject var store: Store
+    @State private var keeping: Resource?
+
+    var body: some View {
+        let s = store.status
+        let ended = (s?.sessions ?? [:]).values.filter { $0.ended_at != nil }.sorted { $0.ended_at! > $1.ended_at! }
+        let waiting = (s?.resources ?? [:]).values.filter { $0.owner_gone_at != nil && $0.lease_id == nil }
+        let collected = (s?.stopped ?? []).filter { $0.resource.owner != nil && $0.stopped_at > Date().addingTimeInterval(-86400) }
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 10) {
+                    Readout(label: "Sessions ended", value: "\(ended.count)", unit: "24 h")
+                    Readout(label: "Left running", value: Fmt.gb(waiting.reduce(0) { $0 + $1.mem_mb }), unit: "GB",
+                            color: waiting.isEmpty ? Ink.text : Lamp.nobody.color)
+                    Readout(label: "Collected", value: Fmt.gb(collected.reduce(0) { $0 + $1.resource.mem_mb }), unit: "GB 24 h",
+                            color: Lamp.inUse.color)
+                }
+                Text("When an agent exits, or its process dies without saying so, its leases are released and everything it started or held is collected: asked about, paused within minutes (nothing lost), then stopped. Processes it left running are found even when AgentRM knows nothing else about them. Anything used after the agent left is treated as someone else's and waits the normal time.")
+                    .font(Face.body(13)).foregroundStyle(Ink.dim).fixedSize(horizontal: false, vertical: true)
+                if ended.isEmpty {
+                    Text("No agent has ended in the last 24 hours.").font(Face.body(13)).foregroundStyle(Ink.dim)
+                        .frame(maxWidth: .infinity).padding(20).panel()
+                }
+                ForEach(ended) { sess in session(sess, s) }
+            }
+            .padding(22)
+        }
+        .sheet(item: $keeping) { r in KeepSheet(resource: r) { keeping = nil }.environmentObject(store) }
+    }
+
+    private func session(_ sess: AgentSession, _ s: Status?) -> some View {
+        let items = (store.reading?.items ?? []).filter { $0.resource?.owner == sess.id }
+        let stopped = (s?.stopped ?? []).filter { $0.resource.owner == sess.id }.reversed()
+        return VStack(spacing: 0) {
+            HStack(spacing: 10) {
+                LampDot(color: Ink.scale, glow: false)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(store.agentTitle(sess.agent)) in \((sess.cwd as NSString).lastPathComponent.isEmpty ? sess.id.prefix(8).description : (sess.cwd as NSString).lastPathComponent)")
+                        .font(Face.body(15, .semibold))
+                    Text("Ended \(Fmt.rel(sess.ended_at ?? Date())): \(sess.end_reason ?? "")")
+                        .font(Face.body(12)).foregroundStyle(Ink.dim)
+                }
+                Spacer()
+                Silk(items.isEmpty && stopped.isEmpty ? "Left nothing" : "\(items.count) running, \(stopped.count) stopped")
+            }
+            .padding(.horizontal, 12).padding(.vertical, 10)
+            ForEach(items) { item in
+                ItemRow(item: item, dryRun: s?.config.dry_run ?? true, first: false, onKeep: { keeping = $0 })
+            }
+            ForEach(Array(stopped)) { st in
+                HStack(spacing: 10) {
+                    LampDot(color: Color(hex: 0x3A3F46), glow: false)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(st.resource.name).font(Face.body(14, .semibold))
+                        Text("Stopped \(Fmt.rel(st.stopped_at)), \(st.why)").font(Face.body(12)).foregroundStyle(Ink.dim).lineLimit(2)
+                    }
+                    Spacer()
+                    Text(Fmt.gb(st.resource.mem_mb)).font(Face.mono(13))
+                    Button("Restore") { store.restore(st.resource.id) }.buttonStyle(.key)
+                }
+                .padding(.horizontal, 12).padding(.vertical, 9)
+                .overlay(alignment: .top) { Rectangle().fill(Ink.hair).frame(height: 1) }
+            }
+        }
+        .panel()
     }
 }
 

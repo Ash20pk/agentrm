@@ -64,11 +64,13 @@ type Manager struct {
 	lastSwapAt      time.Time
 	activity        *evidence.Activity
 	classifier      *shell.Classifier
-	dockerOrigin    map[string]origin          // resource ID -> who started it
-	pending         map[string]string          // resource ID -> effect in flight (pause, stop, ...)
-	connSeen        map[string]map[string]bool // paused resource -> connections already seen
-	footBase        map[string]float64         // session -> idle footprint baseline (MB)
-	wouldDecided    map[string]bool            // dry-run decisions already recorded
+	dockerOrigin    map[string]origin            // resource ID -> who started it
+	pending         map[string]string            // resource ID -> effect in flight (pause, stop, ...)
+	connSeen        map[string]map[string]bool   // paused resource -> connections already seen
+	footBase        map[string]float64           // session -> idle footprint baseline (MB)
+	wouldDecided    map[string]bool              // dry-run decisions already recorded
+	trees           map[string]map[int]time.Time // session -> processes its agent started (PID -> start)
+	missing         map[string]int               // session -> sweeps its agent process has been missing
 	self            sys.SelfUsage
 	tamper          tamperState
 	dockerEventsErr string
@@ -104,6 +106,7 @@ func New(o Options) *Manager {
 		agentSessions: map[int]string{}, recent: map[string][]cmdRecord{}, failed: map[string]error{},
 		activity: evidence.NewActivity(), dockerOrigin: map[string]origin{}, pending: map[string]string{},
 		connSeen: map[string]map[string]bool{}, footBase: map[string]float64{}, wouldDecided: map[string]bool{},
+		trees: map[string]map[int]time.Time{}, missing: map[string]int{},
 		kick: make(chan struct{}, 1), readFast: sys.ReadFast,
 	}
 	m.notify = o.Notify
@@ -249,6 +252,7 @@ func (m *Manager) routes() map[string]handler {
 	return map[string]handler{
 		"/acquire":  m.acquire,
 		"/release":  m.release,
+		"/end":      m.end,
 		"/renew":    m.renew,
 		"/claim":    m.claim,
 		"/disown":   m.disown,

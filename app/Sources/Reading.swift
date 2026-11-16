@@ -86,7 +86,13 @@ extension Store {
         case .nobody:
             var detail = "\(Kind.name(r.kind)), nobody claims it"
             var deadline: Date?
-            if let since = r.orphan_since {
+            if let gone = r.owner_gone_at, let owner = r.owner {
+                // The collector's fast path: what an exited agent left behind.
+                let who = agentTitle(status?.sessions?[owner]?.agent)
+                let at = (r.orphan_since ?? gone).addingTimeInterval(Double(s.config.owner_gone_grace_minutes ?? 2) * 60)
+                detail = "\(who) exited \(Fmt.rel(gone)), left this running"
+                deadline = at
+            } else if let since = r.orphan_since {
                 let at = since.addingTimeInterval(grace)
                 deadline = at
                 if s.config.dry_run {
@@ -106,6 +112,18 @@ extension Store {
             let evidence = lamp == .waiting ? "no use seen yet" : (l?.evidence ?? l?.purpose ?? "in use")
             return Item(id: r.id, name: r.name, detail: "\(who), \(evidence)", mb: r.mem_mb, lamp: lamp, resource: r,
                         actions: r.lease_id.map { [.release($0)] } ?? [])
+        }
+    }
+
+    func agentTitle(_ agent: String?) -> String {
+        switch agent {
+        case "claude": return "Claude Code"
+        case "codex": return "Codex"
+        case "gemini": return "Gemini CLI"
+        case "aider": return "Aider"
+        case "opencode": return "OpenCode"
+        case "cursor": return "Cursor"
+        default: return "Its agent"
         }
     }
 

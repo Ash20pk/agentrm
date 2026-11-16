@@ -35,41 +35,71 @@ struct AgentRMApp: App {
     }
 }
 
-/// The menu-bar icon. It also opens the welcome window on first launch.
+/// The menu-bar item: a miniature of the LED meter, one bar per GB lit in its state colour, and
+/// the memory a new lease could get. It also opens the welcome window on first launch.
 struct MenuIcon: View {
     @EnvironmentObject var store: Store
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        HStack(spacing: 3) {
-            Image(systemName: icon)
-            // A count only when something needs a decision; a quiet icon otherwise.
-            if attention > 0 { Text("\(attention)").monospacedDigit() }
+        HStack(spacing: 4) {
+            Image(nsImage: MiniMeter.image(store.reading?.segments ?? Array(repeating: .off, count: 16),
+                                           alert: store.underPressure || !store.pendingApprovals.isEmpty))
+            Text(text).monospacedDigit()
         }
-            .accessibilityElement(children: .ignore)
-            .accessibilityLabel(label)
-            .task {
-                if !store.onboarded {
-                    NSApp.activate(ignoringOtherApps: true)
-                    openWindow(id: "welcome")
-                }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(label)
+        .task {
+            if !store.onboarded {
+                NSApp.activate(ignoringOtherApps: true)
+                openWindow(id: "welcome")
             }
+        }
     }
 
-    private var attention: Int { store.pendingApprovals.count + store.orphans.count }
-
-    private var icon: String {
-        if store.status == nil { return "memorychip.fill" }
-        if !store.pendingApprovals.isEmpty || store.underPressure { return "exclamationmark.triangle.fill" }
-        if !store.orphans.isEmpty { return "memorychip.fill" }
-        return "memorychip"
+    /// The reading next to the meter: what a lease could get now, or why there is nothing.
+    private var text: String {
+        guard let s = store.status else { return "off" }
+        if !store.pendingApprovals.isEmpty { return "approve?" }
+        if store.underPressure { return "swap \(Int(s.swap_rate_mb_min ?? 0))" }
+        return "\(Fmt.gb(max(0, s.headroom_mb)))G"
     }
 
     private var label: String {
-        if store.status == nil { return "AgentRM: daemon not running" }
-        if !store.pendingApprovals.isEmpty { return "AgentRM: approval waiting" }
-        if store.underPressure { return "AgentRM: memory pressure" }
-        if !store.orphans.isEmpty { return "AgentRM: \(store.orphans.count) unclaimed" }
-        return "AgentRM"
+        guard let s = store.status, let r = store.reading else { return "AgentRM: daemon not running" }
+        var parts = ["AgentRM", "\(Fmt.gb(max(0, s.headroom_mb))) GB free to grant"]
+        if !store.pendingApprovals.isEmpty { parts.append("approval waiting") }
+        if store.underPressure { parts.append("memory pressure") }
+        if r.nobodyMB > 0 { parts.append("\(Fmt.gb(r.nobodyMB)) GB owned by nobody") }
+        return parts.joined(separator: ", ")
+    }
+}
+
+/// Draws the meter small enough for the menu bar. Colours are kept (not a template image) because
+/// the colour is the information; unlit bars are a grey that shows on light and dark menu bars.
+enum MiniMeter {
+    static func image(_ segments: [Segment], alert: Bool) -> NSImage {
+        let bar: CGFloat = 2.5, gap: CGFloat = 1, h: CGFloat = 14
+        let w = CGFloat(segments.count) * bar + CGFloat(max(0, segments.count - 1)) * gap
+        let img = NSImage(size: NSSize(width: w + (alert ? 6 : 0), height: h), flipped: false) { _ in
+            for (i, seg) in segments.enumerated() {
+                let rect = NSRect(x: CGFloat(i) * (bar + gap), y: 1, width: bar, height: h - 2)
+                let color: NSColor
+                switch seg {
+                case .lit(let l): color = NSColor(l == .system ? Color(hex: 0x8E949C) : l.color)
+                case .kept: color = NSColor(white: 0.55, alpha: 0.45)
+                case .off: color = NSColor(white: 0.55, alpha: 0.28)
+                }
+                color.setFill()
+                NSBezierPath(roundedRect: rect, xRadius: 0.8, yRadius: 0.8).fill()
+            }
+            if alert {
+                NSColor(Lamp.nobody.color).setFill()
+                NSBezierPath(ovalIn: NSRect(x: w + 2, y: h - 5, width: 4, height: 4)).fill()
+            }
+            return true
+        }
+        img.isTemplate = false
+        return img
     }
 }

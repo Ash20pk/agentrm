@@ -26,6 +26,7 @@ struct Config: Codable {
     var pause_minutes: Int?
     var never_stop: [String]?
     var require_app_approval: Bool?
+    var owner_gone_grace_minutes: Int?
 }
 
 struct Lease: Codable, Identifiable {
@@ -57,6 +58,9 @@ struct Resource: Codable, Identifiable {
     var paused_at: Date?
     var source: String?
     var restart: String?
+    var owner: String?
+    var owner_gone_at: Date?
+    var first_seen: Date?
 }
 
 struct AgentSession: Codable, Identifiable {
@@ -66,6 +70,8 @@ struct AgentSession: Codable, Identifiable {
     var last_seen: Date
     var footprint_mb: Double?
     var priority: Int?
+    var ended_at: Date?
+    var end_reason: String?
 }
 
 struct AgentEvent: Codable, Identifiable {

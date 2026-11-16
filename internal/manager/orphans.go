@@ -20,8 +20,6 @@ import (
 // checkOrphans asks about, pauses and stops unclaimed resources. Must hold mu; the returned
 // effects are run by the caller after unlocking.
 func (m *Manager) checkOrphans(now time.Time) []Effect {
-	grace := minutes(m.cfg.GraceMinutes)
-	hold := minutes(m.cfg.PauseMinutes)
 	blocked := len(m.liveWaiters(now)) > 0
 	var effects []Effect
 	for _, r := range m.st.Resources {
@@ -36,6 +34,7 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 			delete(m.st.Questions, r.ID)
 			continue
 		}
+		grace, hold, reason, ownerGone := m.collectTiming(r, now, blocked)
 		if r.OrphanSince == nil {
 			t := now
 			r.OrphanSince = &t
@@ -52,6 +51,11 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 					"agentrm claim %s --purpose \"<why>\"   — if not, run: agentrm disown %s. "+
 					"Unclaimed, it is %s at %s.", r.ID, r.Name, r.Detail, r.MemMB/1024, r.ID, r.ID, next,
 					now.Add(grace).Format("15:04"))}
+			if ownerGone {
+				// The session's end already told the user, once for everything it left.
+				m.event("ORPHAN %s (%s, %.1f GB): %s; %s at %s", r.ID, r.Name, r.MemMB/1024, reason, next, now.Add(grace).Format("15:04"))
+				continue
+			}
 			m.event("ORPHAN %s (%s, %.1f GB): asking active sessions; %s at %s",
 				r.ID, r.Name, r.MemMB/1024, next, now.Add(grace).Format("15:04"))
 			m.notify("Unclaimed: "+r.Name, fmt.Sprintf("%.1f GB. It is %s at %s unless someone claims it.",
@@ -63,6 +67,9 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 		}
 		direct := r.Urgent || blocked || m.cfg.PauseMinutes <= 0 || !discover.CanPause(r)
 		why := fmt.Sprintf("unclaimed for %s", now.Sub(*r.OrphanSince).Round(time.Minute))
+		if reason != "" {
+			why = reason
+		}
 		if r.Urgent || blocked {
 			why += ", and a request was waiting for memory"
 		}

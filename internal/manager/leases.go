@@ -26,6 +26,11 @@ func (m *Manager) touchSession(id, agent, cwd string) *model.Session {
 		s.Cwd = cwd
 	}
 	s.LastSeen = m.now()
+	if s.EndedAt != nil {
+		// It is talking again (resumed, or its end was a false alarm): a root once more.
+		s.EndedAt, s.EndReason = nil, ""
+		m.event("SESSION %s is active again", short(id))
+	}
 	return s
 }
 
@@ -264,6 +269,17 @@ func (m *Manager) updateFootprints(procs map[int]*sys.Proc, now time.Time) {
 		if s == nil {
 			s = &model.Session{ID: id, Agent: kind, LastSeen: now}
 			m.st.Sessions[id] = s
+		}
+		if p := procs[apid]; p != nil && (s.AgentPID != apid || !sys.SameProcess(p, s.AgentStart)) {
+			if s.EndedAt != nil && s.AgentPID == apid {
+				// Same ID, new process (a PID reused by the same kind of agent): a new session.
+				s.EndedAt, s.EndReason = nil, ""
+				m.event("SESSION %s is a new %s process (pid %d)", short(id), kind, apid)
+			}
+			s.AgentStart = p.Start
+		}
+		if s.EndedAt != nil {
+			continue // it said it ended; its process is on its way out
 		}
 		s.FootprintMB, s.AgentPID = mb, apid
 		live[id] = true

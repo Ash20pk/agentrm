@@ -38,6 +38,10 @@ The Limits tab of the Activity window changes the common ones. Keys not listed a
 | `pause_minutes` | 30 | How long it stays paused before it is stopped; 0 stops directly |
 | `auto_thaw_on_connect` | true | Resume a paused server when something connects to it |
 | `never_stop` | [] | Resource IDs or name substrings never paused or stopped (pinning does the same per resource) |
+| `owner_gone_grace_minutes` | 2 | Unclaimed, and the agent that started or held it has exited: paused after this |
+| `owner_gone_pause_minutes` | 10 | How long such a thing stays paused before it is stopped |
+| `old_generation_hours` | 24 | Running this long with no known owner: three times the grace |
+| `leftover_min_mb` | 40 | A process an exited agent left running is tracked from this size (or 2% CPU) |
 
 ## Recognising things
 

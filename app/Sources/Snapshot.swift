@@ -56,6 +56,10 @@ enum Snapshot {
         let dark = true
         let suffix = "dark"
         shoot(MenuView(updater: updater), store: store, dark: dark, size: nil, to: out.appendingPathComponent("\(name)-menu-\(suffix).png"))
+        for d in [false, true] {
+            shoot(MenuIcon().padding(.horizontal, 10).frame(height: 24), store: store, dark: d, size: nil,
+                  to: out.appendingPathComponent("\(name)-menubar-\(d ? "dark" : "light").png"))
+        }
         guard all else { return }
         for tab in ActivityView.Tab.allCases {
             shoot(ActivityView(updater: updater, tab: tab), store: store, dark: dark, size: CGSize(width: 1060, height: 720),
