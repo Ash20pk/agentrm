@@ -23,11 +23,11 @@ xcodebuild -exportArchive -archivePath "$OUT/AgentRM.xcarchive" -exportOptionsPl
   -exportPath "$OUT/upload" -allowProvisioningUpdates
 
 echo "Waiting for Apple's notary service…"
-for i in $(seq 1 60); do
+for i in $(seq 1 ${NOTARY_TRIES:-60}); do
   if xcodebuild -exportNotarizedApp -archivePath "$OUT/AgentRM.xcarchive" -exportPath "$OUT/app" >/dev/null 2>&1; then
     break
   fi
-  [ "$i" = 60 ] && { echo "Notarization did not finish in 30 minutes." >&2; exit 1; }
+  [ "$i" = "${NOTARY_TRIES:-60}" ] && { echo "Notarization did not finish in time; run: xcodebuild -exportNotarizedApp -archivePath $OUT/AgentRM.xcarchive -exportPath $OUT/app" >&2; exit 1; }
   sleep 30
 done
 APP="$OUT/app/AgentRM.app"
