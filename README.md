@@ -27,7 +27,7 @@ Mark its decisions right or wrong in the app, and turn on auto-stop when they lo
 ## Install
 
 Download `AgentRM-<version>.dmg` from [Releases](https://github.com/Ash20pk/agentrm/releases)
-(or `brew install --cask Ash20pk/tap/agentrm`), drag AgentRM to Applications and open it. The
+(or `brew trust ash20pk/tap && brew install --cask ash20pk/tap/agentrm`), drag AgentRM to Applications and open it. The
 welcome window shows what is running and what connecting your agents would change, before it
 changes anything. It updates itself (Sparkle, signed updates). Requires macOS 14 or later.
 
