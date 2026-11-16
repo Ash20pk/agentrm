@@ -141,7 +141,7 @@ struct AboutTab: View {
                 .foregroundStyle(.secondary)
             Text("A resource manager for coding agents: leases for heavy work, questions for whatever is left running, and a reversible stop for what nobody claims.")
                 .multilineTextAlignment(.center).font(.callout).padding(.horizontal, 30)
-            Link("Source code", destination: URL(string: "https://github.com/agentrm/agentrm")!)
+            Link("Source code", destination: URL(string: "https://github.com/Ash20pk/agentrm")!)
         }
         .padding()
     }

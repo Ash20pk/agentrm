@@ -26,7 +26,7 @@ can see what it would do before you turn auto-stop on.
 
 ## Install
 
-Download `AgentRM-<version>.dmg` from Releases, drag AgentRM to Applications and open it. It
+Download `AgentRM-<version>.dmg` from [Releases](https://github.com/Ash20pk/agentrm/releases), drag AgentRM to Applications and open it. It
 lives in the menu bar. Open **Settings → Setup** and turn on what you want:
 
 | Item | What it does |
