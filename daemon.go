@@ -228,6 +228,15 @@ func runDaemon() error {
 		for _, r := range d.st.Resources {
 			r.OrphanSince = nil
 		}
+		// Leases from before use tracking have no LastUsed: start their idle clock now.
+		for _, l := range d.st.Leases {
+			if l.LastUsed.IsZero() {
+				l.LastUsed, l.IdleAsked = time.Now(), nil
+				if l.Evidence == "" {
+					l.Evidence = "held before evidence tracking"
+				}
+			}
+		}
 		d.st.Questions = map[string]*Question{}
 	}
 	for _, m := range []*map[string]*Lease{&d.st.Leases} {
@@ -528,10 +537,16 @@ func (d *Daemon) claim(req map[string]any) (any, error) {
 		if l := d.st.Leases[r.LeaseID]; l != nil {
 			if l.Session == session {
 				// The holder confirming it still needs it.
+				if !l.Verified {
+					if ok, ev := d.claimEvidence(r, session, req["_human"] == true); ok {
+						l.Verified, l.Evidence = true, ev
+						l.TTL = max(l.TTL, d.cfg.DefaultTTLMinutes)
+					}
+				}
 				l.LastUsed, l.IdleAsked = now, nil
 				l.Expires = now.Add(time.Duration(l.TTL) * time.Minute)
 				delete(d.st.Questions, "idle:"+l.ID)
-				d.event("CONFIRM %s by %s (lease %s)", rid, session, l.ID)
+				d.event("CONFIRM %s by %s (lease %s, verified=%v)", rid, session, l.ID, l.Verified)
 				return map[string]any{"lease": l, "verified": l.Verified, "evidence": l.Evidence}, nil
 			}
 			return nil, fmt.Errorf("%s is already held by lease %s (%s: %s)", rid, l.ID, l.Session, l.Purpose)
