@@ -87,7 +87,7 @@ func addContext(event, text string) {
 
 func inboxText(session, cwd string) string {
 	var resp struct{ Questions []string }
-	if call("/inbox", map[string]any{"session": session, "agent": "claude", "cwd": cwd}, &resp) != nil {
+	if call("/inbox", map[string]any{"session": session, "agent": "claude", "cwd": cwd, "via": "hook"}, &resp) != nil {
 		return ""
 	}
 	return strings.Join(resp.Questions, "\n")
@@ -103,13 +103,18 @@ func runHook(event string) {
 		return
 	}
 	loadExtraPatterns()
-	base := map[string]any{"session": in.SessionID, "agent": "claude", "cwd": in.Cwd}
+	base := map[string]any{"session": in.SessionID, "agent": "claude", "cwd": in.Cwd, "via": "hook"}
 
 	switch event {
 	case "pre":
 		if in.ToolName != "Bash" {
 			return
 		}
+		touch := map[string]any{"cmd": in.ToolInput.Command}
+		for k, v := range base {
+			touch[k] = v
+		}
+		_ = call("/touch", touch, nil)
 		kind := classify(in.ToolInput.Command)
 		if kind == "" {
 			return
@@ -138,7 +143,7 @@ func runHook(event string) {
 		_ = call("/renew", base, nil)
 		if in.ToolName == "Bash" && !in.ToolInput.RunInBackground {
 			if kind := classify(in.ToolInput.Command); buildKinds[kind] {
-				_ = call("/release", map[string]any{"session": in.SessionID, "kind": kind}, nil)
+				_ = call("/release", map[string]any{"session": in.SessionID, "kind": kind, "via": "hook"}, nil)
 			}
 		}
 		if q := inboxText(in.SessionID, in.Cwd); q != "" {
@@ -152,6 +157,6 @@ func runHook(event string) {
 		}
 
 	case "end":
-		_ = call("/release", map[string]any{"session": in.SessionID}, nil)
+		_ = call("/release", map[string]any{"session": in.SessionID, "via": "hook"}, nil)
 	}
 }
