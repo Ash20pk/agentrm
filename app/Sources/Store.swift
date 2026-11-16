@@ -16,8 +16,14 @@ final class Store: ObservableObject {
     @Published var registrationError: String?
     @Published var loginItemStatus: SMAppService.Status = .notRegistered
     @Published var hookPreview = ""
+    /// The meter once a minute for the last hour, oldest first: the Activity window's waterfall.
+    /// Kept in memory only, so it starts empty when the app starts.
+    @Published var waterfall: [[Segment]] = []
+    private var waterfallMinute = -1
 
     private var timer: Timer?
+    /// A preview store shows fixed data and never calls the daemon.
+    private var frozen = false
     private var lastEventSeq = -1
     let service = SMAppService.agent(plistName: "dev.agentrm.daemon.plist")
     let notifications = NotificationHandler()
@@ -48,9 +54,23 @@ final class Store: ObservableObject {
         Task {
             await refresh()
             await refreshSetup()
+            await refreshReview()
             await repairIfMoved()
         }
     }
+
+    #if DEBUG
+    /// For snapshots: fixed data, no daemon registration, no timers, no notifications.
+    init(preview status: Status?, setup: SetupCheck?, review: ReviewResp?) {
+        frozen = true
+        self.status = status
+        self.setup = setup
+        self.review = review
+        loginItemStatus = status == nil ? .notRegistered : .enabled
+    }
+
+    func setPreviewWaterfall(_ w: [[Segment]]) { waterfall = w }
+    #endif
 
     var leases: [Lease] { (status?.leases ?? [:]).values.sorted { $0.created < $1.created } }
     var resources: [Resource] { (status?.resources ?? [:]).values.sorted { $0.mem_mb > $1.mem_mb } }
@@ -68,12 +88,14 @@ final class Store: ObservableObject {
     }
 
     func refresh() async {
+        if frozen { return }
         do {
             let data = try await CLI.run(["status", "--json"])
             let s = try CLI.decoder.decode(Status.self, from: data)
             status = s
             daemonError = nil
             notifications.post(newEvents(s.events ?? []))
+            record()
         } catch {
             status = nil
             daemonError = error.localizedDescription
@@ -81,19 +103,34 @@ final class Store: ObservableObject {
         loginItemStatus = service.status
     }
 
+    private func record() {
+        guard let r = reading else { return }
+        let minute = Int(Date().timeIntervalSince1970 / 60)
+        if minute == waterfallMinute, !waterfall.isEmpty {
+            waterfall[waterfall.count - 1] = r.segments
+        } else {
+            waterfall.append(r.segments)
+            waterfallMinute = minute
+            if waterfall.count > 60 { waterfall.removeFirst(waterfall.count - 60) }
+        }
+    }
+
     func refreshSetup() async {
+        if frozen { return }
         if let data = try? await CLI.run(["setup", "check", "--json"]) {
             setup = try? CLI.decoder.decode(SetupCheck.self, from: data)
         }
     }
 
     func refreshReview() async {
+        if frozen { return }
         if let data = try? await CLI.run(["review", "--all", "--json"]) {
             review = try? CLI.decoder.decode(ReviewResp.self, from: data)
         }
     }
 
     func loadHookPreview() async {
+        if frozen { hookPreview = "{ \"hooks\": { \"PreToolUse\": [ … agentrm hook pre --proto 2 … ] } }"; return }
         hookPreview = await CLI.text(["setup", "preview", "claude"])
     }
 

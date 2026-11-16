@@ -20,7 +20,7 @@ connection to its port, or `agentrm resume ID`. Claim it (`agentrm claim ID --pu
 pin it so it is left alone. Your browser holding a connection open counts as use.
 
 **Something was stopped** — `agentrm status --stopped`, then `agentrm restore ID`. Mark the
-decision wrong in Settings → History, so you know whether auto-stop is safe for you.
+decision wrong in Decisions in the Activity window (Open in the menu), so you know whether auto-stop is safe for you.
 
 **A command was not recognised as heavy** — AgentRM still sees it if the agent's process tree
 grows (an inferred "heavy" lease). To have it gated before it starts, add a pattern to
@@ -29,7 +29,7 @@ grows (an inferred "heavy" lease). To have it gated before it starts, add a patt
 **A Docker or simulator source shows "unavailable"** — Docker or `xcrun` timed out. AgentRM keeps
 the last view of their resources and backs off. Check that Docker Desktop is responsive.
 
-**"The Claude Code hooks point at …"** — AgentRM was moved or updated. Settings → Setup → Repair,
+**"The Claude Code hooks point at …"** — AgentRM was moved or updated. Activity window → Setup → Repair,
 or `agentrm setup repair`. An installed app in /Applications repairs itself at launch.
 
 **An approval appeared that I did not ask for** — deny it. Something ran `agentrm` from a terminal
@@ -38,5 +38,5 @@ app, possibly an agent driving it. `~/.agentrm/events.log` shows what and when.
 **A "tampered" notification** — the daemon was killed, a file was edited behind its back, or the
 hooks were removed. If it was not you, check what your agents ran around that time.
 
-**Removing AgentRM** — Settings → Setup → Uninstall AgentRM, or `agentrm setup uninstall`, then
+**Removing AgentRM** — Activity window → Setup → Uninstall, or `agentrm setup uninstall`, then
 move the app to the Bin. Data stays in `~/.agentrm`.
