@@ -408,12 +408,13 @@ struct AutoStopGate: View {
                 Text("We recommend 7 days of dry run and 5 reviewed decisions with under 2% wrong before AgentRM pauses and stops things itself. Review them under Decisions in the Activity window.")
                     .font(Face.body(13)).foregroundStyle(Ink.dim).fixedSize(horizontal: false, vertical: true)
             }
-            Text("With auto-stop on, unclaimed things are paused after \(store.status?.config.grace_minutes ?? 10) min, nothing lost, and stopped \(store.status?.config.pause_minutes ?? 30) min later. Everything stopped can be restored.")
+            TrustLevelsView()
+            Text("Or all at once: with auto-stop on, unclaimed things are paused after \(store.status?.config.grace_minutes ?? 10) min, nothing lost, and stopped \(store.status?.config.pause_minutes ?? 30) min later. Everything stopped can be restored.")
                 .font(Face.body(13)).foregroundStyle(Ink.dim).fixedSize(horizontal: false, vertical: true)
             HStack {
                 Spacer()
                 Button("Keep dry run") { isPresented = false }.buttonStyle(.key).keyboardShortcut(.cancelAction)
-                Button(r.ready ? "Turn on" : "Turn on anyway") {
+                Button(r.ready ? "Turn on all" : "Turn on all anyway") {
                     store.setAutoStop(true)
                     isPresented = false
                 }
@@ -421,7 +422,7 @@ struct AutoStopGate: View {
                 .keyboardShortcut(r.ready ? .defaultAction : .init("t"))
             }
         }
-        .padding(18).frame(width: 420)
+        .padding(18).frame(width: 560)
         .background(Ink.bg).foregroundStyle(Ink.text).environment(\.colorScheme, .dark)
         .task { await store.refreshReview() }
     }

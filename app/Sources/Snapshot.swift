@@ -39,6 +39,10 @@ enum Snapshot {
             }
         }
         let store = Store(preview: status, setup: sampleSetup, review: sampleReview)
+        store.receipt = Receipt(since: Date().addingTimeInterval(-7 * 86400), until: Date(), sessions_ended: 23, leftovers: 9,
+                                paused: 14, stopped: 11, freed_gb: 18.4, would_stop: 0, would_free_gb: 0, wrong: 1, restored: 2,
+                                queued: 6, wait_mean: 74_000_000_000, wait_max: 310_000_000_000, misreports: 1,
+                                text: "Stopped 11 things, freeing 18.4 GB; found 9 processes that ended sessions left running; 6 requests waited for memory, 1 min 14 s on average; 2 were restored afterwards; 1 decision you marked wrong.")
         let updater = SPUStandardUpdaterController(startingUpdater: false, updaterDelegate: nil, userDriverDelegate: nil).updater
 
         // A plausible hour for the waterfall: agents busy, then one walks away and its memory turns red.

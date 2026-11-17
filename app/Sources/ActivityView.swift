@@ -6,7 +6,7 @@ import SwiftUI
 /// the decisions to review, what was stopped, setup and limits.
 struct ActivityView: View {
     enum Tab: String, CaseIterable {
-        case now = "Now", collected = "Collected", decisions = "Decisions", stopped = "Stopped", setup = "Setup", limits = "Limits"
+        case now = "Now", collected = "Collected", week = "Week", decisions = "Decisions", stopped = "Stopped", setup = "Setup", limits = "Limits"
     }
 
     let updater: SPUUpdater
@@ -45,6 +45,7 @@ struct ActivityView: View {
                 switch tab {
                 case .now: NowTab()
                 case .collected: CollectedTab()
+                case .week: WeekTab()
                 case .decisions: DecisionsTab()
                 case .stopped: StoppedTab()
                 case .setup: SetupTab(updater: updater)
@@ -454,6 +455,7 @@ struct LimitsTab: View {
                         "\(idle) min") { Stepper("", value: $idle, in: 5...240, step: 5) }
                 }
                 .panel()
+                TrustLevelsView()
                 HStack(spacing: 8) {
                     LampDot(Lamp.paused)
                     Text("Unclaimed, then asked, then paused after \(grace) min, then \(pause == 0 ? "stopped at once" : "stopped \(pause) min later"), then restorable.")

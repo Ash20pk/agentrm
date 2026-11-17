@@ -27,6 +27,7 @@ struct Config: Codable {
     var never_stop: [String]?
     var require_app_approval: Bool?
     var owner_gone_grace_minutes: Int?
+    var auto_stop: [String: Bool]?
 }
 
 struct Lease: Codable, Identifiable {
@@ -43,6 +44,11 @@ struct Lease: Codable, Identifiable {
     var evidence: String?
     var last_used: Date?
     var until: Date?
+    var expected_end: Date?
+    var likely_done: Bool?
+    var branch: String?
+    var task_done_why: String?
+    var backfill: Bool?
 }
 
 struct Resource: Codable, Identifiable {
@@ -61,6 +67,8 @@ struct Resource: Codable, Identifiable {
     var owner: String?
     var owner_gone_at: Date?
     var first_seen: Date?
+    var ask_only: Bool?
+    var pid: Int?
 }
 
 struct AgentSession: Codable, Identifiable {
@@ -138,12 +146,50 @@ struct Status: Codable {
     var approvals: [String: Approval]?
     var notes: [String]?
     var selfUsage: SelfUsage?
+    var prediction: String?
+    var trust_levels: [TrustLevel]?
 
     enum CodingKeys: String, CodingKey {
         case mem, headroom_mb, pending_mb, swap_rate_mb_min, waiters, config, leases, resources, sessions,
-             events, last_sweep, daemon_version, sources, stopped, approvals, notes
+             events, last_sweep, daemon_version, sources, stopped, approvals, notes, prediction, trust_levels
         case selfUsage = "self"
     }
+}
+
+/// One auto-stop level and the evidence for turning it on.
+struct TrustLevel: Codable, Identifiable {
+    var category: String
+    var title: String
+    var detail: String
+    var on: Bool
+    var decided: Int
+    var reviewed: Int
+    var wrong: Int
+    var days: Int
+    var eligible: Bool
+    var blocked: String?
+    var evidence: String
+    var id: String { category }
+}
+
+/// What AgentRM did over a period (agentrm receipt --json). Durations are nanoseconds.
+struct Receipt: Codable {
+    var since: Date
+    var until: Date
+    var sessions_ended: Int
+    var leftovers: Int
+    var paused: Int
+    var stopped: Int
+    var freed_gb: Double
+    var would_stop: Int
+    var would_free_gb: Double
+    var wrong: Int
+    var restored: Int
+    var queued: Int
+    var wait_mean: Int64
+    var wait_max: Int64
+    var misreports: Int
+    var text: String
 }
 
 struct SetupCheck: Codable {

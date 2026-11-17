@@ -16,6 +16,7 @@ final class Store: ObservableObject {
     @Published var registrationError: String?
     @Published var loginItemStatus: SMAppService.Status = .notRegistered
     @Published var hookPreview = ""
+    @Published var receipt: Receipt?
     /// The meter once a minute for the last hour, oldest first: the Activity window's waterfall.
     /// Kept in memory only, so it starts empty when the app starts.
     @Published var waterfall: [[Segment]] = []
@@ -182,6 +183,22 @@ final class Store: ObservableObject {
     }
     func setLimits(headroom: Double, grace: Int, idle: Int, pause: Int) {
         act(["config", "--headroom", String(headroom), "--grace", String(grace), "--idle", String(idle), "--pause", String(pause)])
+    }
+    /// Stops now what ended sessions left: your one click, so it is yours to make.
+    func collect() { act(["collect"]) }
+    func setLevel(_ category: String, on: Bool) { act(["config", "--auto-stop", "\(category)=\(on ? "on" : "off")"]) }
+    func refreshReceipt(days: Int = 7) async {
+        if frozen { return }
+        if let data = try? await CLI.run(["receipt", "--days", String(days), "--json"]) {
+            receipt = try? CLI.decoder.decode(Receipt.self, from: data)
+        }
+    }
+    /// What ended sessions left running, collectable now: the first-minute view.
+    var leftBehind: [Resource] {
+        resources.filter { $0.owner_gone_at != nil && $0.lease_id == nil && $0.ask_only != true && $0.pinned != true }
+    }
+    var askOnlyLeftBehind: [Resource] {
+        resources.filter { $0.owner_gone_at != nil && $0.lease_id == nil && $0.ask_only == true }
     }
     func setup(_ what: String, install: Bool) { act(install ? ["setup", what] : ["setup", what, "--uninstall"]) }
 
