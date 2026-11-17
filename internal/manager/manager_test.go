@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -153,10 +154,10 @@ func TestQueueOrder(t *testing.T) {
 	if r := acquire(t, m, agent("big"), "cluster", 3); !r.Granted {
 		t.Fatalf("the head of the queue was refused: %s", r.Reason)
 	}
-	// A waiter that stops retrying loses its place.
+	// A waiter whose session goes quiet loses its place.
 	m.mem.AvailableMB = 3 * 1024
 	acquire(t, m, agent("ghost"), "cluster", 3)
-	c.Add(2 * waiterTimeout)
+	c.Add(m.queueKeep() + time.Second)
 	m.st.Leases = map[string]*model.Lease{}
 	if r := acquire(t, m, agent("small"), "server", 1); !r.Granted {
 		t.Fatalf("an abandoned request still blocks the queue: %s", r.Reason)
@@ -379,7 +380,7 @@ func TestAttribution(t *testing.T) {
 		t.Fatal("a cluster was not attributed from the command that named it")
 	}
 	// No evidence and an agent recently active: leave it unbound rather than guess.
-	m.hookSeen = now
+	m.hookSeen["claude"] = now
 	unk := &model.Resource{ID: "compose:unknown", Kind: model.RKContainers, Containers: []string{"unknown-1"}}
 	m.attribute(unk, procs, now, true)
 	if unk.LeaseID != "" {
@@ -748,5 +749,205 @@ func TestPauseAndStopARealProcess(t *testing.T) {
 	case <-exited:
 	case <-time.After(3 * time.Second):
 		t.Fatal("a frozen process was not stopped (TERM must be followed by CONT)")
+	}
+}
+
+// ---- the queue grants by itself ----
+
+func TestQueuedRequestIsGrantedWhenItFits(t *testing.T) {
+	m, c := newTest(t, 3) // 2 GB headroom
+	m.touchSession("big", "claude", "")
+	out, _, _ := m.acquire(agent("big"), api.Req{Kind: "cluster", MemGB: 3, Purpose: "e2e", Via: "hook"})
+	if r := out.(*api.AcquireResp); r.Granted || r.Queue != 1 || !strings.Contains(r.Reason, "Do not retry in a loop") {
+		t.Fatalf("not queued with instructions: %+v", r)
+	}
+	c.Add(time.Second)
+	if r := acquire(t, m, agent("small"), "server", 1); r.Granted {
+		t.Fatal("a later request jumped the queue")
+	}
+	// Nothing fits yet: nothing is granted.
+	m.grantWaiters(c.Now(), false)
+	if len(m.st.Leases) != 0 {
+		t.Fatalf("granted without room: %+v", m.st.Leases)
+	}
+	// Memory frees up. Nobody asks again: both are granted, in order, and told.
+	m.mem.AvailableMB = 6 * 1024
+	c.Add(time.Minute)
+	m.grantWaiters(c.Now(), false)
+	l := m.findLease("big", "cluster")
+	if l == nil || l.Offered == nil || l.Purpose != "e2e" || l.MemGB != 3 {
+		t.Fatalf("the head of the queue was not granted what it asked for: %+v", l)
+	}
+	if m.findLease("small", "server") == nil || len(m.waiters) != 0 {
+		t.Fatalf("the next in line was not granted: leases=%d waiters=%d", len(m.st.Leases), len(m.waiters))
+	}
+	in, _, _ := m.inbox(agent("big"), api.Req{})
+	if q := in.(*api.InboxResp).Questions; len(q) != 1 || !strings.Contains(q[0], l.ID) {
+		t.Fatalf("the session was not told about its lease: %v", q)
+	}
+	if in, _, _ := m.inbox(agent("small"), api.Req{}); len(in.(*api.InboxResp).Questions) != 1 {
+		t.Fatal("a session is told only about its own lease, once")
+	}
+	// Running the command again takes the lease up; it is then an ordinary lease.
+	r := acquire(t, m, agent("big"), "cluster", 3)
+	if !r.Granted || !r.Reused || r.Lease.ID != l.ID || l.Offered != nil || m.st.Questions["grant:"+l.ID] != nil {
+		t.Fatalf("the granted lease was not taken up: %+v", r)
+	}
+	c.Add(m.grantHold() + time.Minute)
+	m.checkLeases(c.Now())
+	if m.st.Leases[l.ID] == nil {
+		t.Fatal("a lease that was taken up was dropped as unclaimed")
+	}
+	// The one nobody took up goes back.
+	if m.findLease("small", "server") != nil {
+		t.Fatal("a granted lease nobody took up was kept past its hold")
+	}
+}
+
+func TestUnusedGrantGoesToTheNextInLine(t *testing.T) {
+	m, c := newTest(t, 2) // 1 GB headroom
+	acquire(t, m, agent("first"), "cluster", 3)
+	c.Add(time.Second)
+	acquire(t, m, agent("second"), "cluster", 3)
+	m.mem.AvailableMB = 4.5 * 1024 // room for one of them
+	m.grantWaiters(c.Now(), false)
+	if m.findLease("first", "cluster") == nil || m.findLease("second", "cluster") != nil {
+		t.Fatalf("exactly the first should hold a lease: %+v", m.st.Leases)
+	}
+	// "first" never shows up. Its hold runs out and the memory goes to "second".
+	m.touchSession("second", "claude", "")
+	c.Add(m.grantHold() + time.Second)
+	m.st.Sessions["second"].LastSeen = c.Now()
+	m.checkLeases(c.Now())
+	m.grantWaiters(c.Now(), false)
+	if m.findLease("first", "cluster") != nil || m.findLease("second", "cluster") == nil {
+		t.Fatalf("the unused grant did not pass to the next in line: %+v", m.st.Leases)
+	}
+}
+
+func TestStartingUnderAGrantTakesItUp(t *testing.T) {
+	m, c := newTest(t, 2)
+	acquire(t, m, agent("a"), "cluster", 3)
+	m.mem.AvailableMB = 6 * 1024
+	m.grantWaiters(c.Now(), false)
+	l := m.findLease("a", "cluster")
+	addRes(m, "kind:dev", model.RKCluster, 2000, l.ID)
+	c.Add(m.grantHold() + time.Minute)
+	m.checkLeases(c.Now())
+	if m.st.Leases[l.ID] == nil || l.Offered != nil {
+		t.Fatalf("a lease with something running under it was not taken up: %+v", l)
+	}
+}
+
+func TestQueuePlaceFollowsTheSession(t *testing.T) {
+	m, c := newTest(t, 2)
+	m.touchSession("busy", "claude", "")
+	acquire(t, m, agent("busy"), "cluster", 3)
+	acquire(t, m, agent("quiet"), "cluster", 3)
+	// "busy" keeps making tool calls and never asks again; "quiet" is not heard from.
+	for i := 0; i < 3; i++ {
+		c.Add(m.queueKeep() / 2)
+		m.touchSession("busy", "claude", "")
+	}
+	ws := m.liveWaiters(c.Now())
+	if len(ws) != 1 || ws[0].Session != "busy" {
+		t.Fatalf("want only the session still talking in the queue: %+v", ws)
+	}
+	// A session that ends leaves the queue at once.
+	m.endSession(m.st.Sessions["busy"], "it ended", c.Now())
+	if len(m.liveWaiters(c.Now())) != 0 {
+		t.Fatal("an ended session kept its place")
+	}
+}
+
+func TestRestoreIsNotGrantedFromTheQueue(t *testing.T) {
+	m, c := newTest(t, 2)
+	m.admit(model.Waiter{Session: "a", Kind: "cluster", NeedMB: 3000, Retry: true}, c.Now())
+	m.mem.AvailableMB = 8 * 1024
+	m.grantWaiters(c.Now(), false)
+	if len(m.st.Leases) != 0 || len(m.waiters) != 1 {
+		t.Fatalf("a restore got a lease without being restored: leases=%d waiters=%d", len(m.st.Leases), len(m.waiters))
+	}
+}
+
+func TestConnectedClientIsAnsweredOnGrant(t *testing.T) {
+	m, _ := newTest(t, 2)
+	c, req := agent("a"), api.Req{Kind: "cluster", MemGB: 3, Purpose: "e2e", WaitSeconds: 30}
+	wait := func() (chan *api.AcquireResp, *api.AcquireResp) {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		out, _, _ := m.acquire(c, req)
+		return m.park(c.Session, req.Kind), out.(*api.AcquireResp)
+	}
+	ch, first := wait()
+	if first.Granted || ch == nil {
+		t.Fatalf("not queued: %+v", first)
+	}
+	type answer struct {
+		out any
+		err error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		out, err := m.awaitGrant(context.Background(), ch, c, req)
+		done <- answer{out, err}
+	}()
+	// A connected client keeps its place however long it waits, without the lock being held.
+	m.mu.Lock()
+	if ws := m.liveWaiters(m.now().Add(time.Hour)); len(ws) != 1 {
+		t.Fatalf("a connected client lost its place: %+v", ws)
+	}
+	m.mem.AvailableMB = 6 * 1024
+	m.grantWaiters(m.now(), false)
+	m.mu.Unlock()
+	select {
+	case a := <-done:
+		r, _ := a.out.(*api.AcquireResp)
+		if a.err != nil || r == nil || !r.Granted || r.Lease == nil {
+			t.Fatalf("the connected client was not given its lease: %+v %v", a.out, a.err)
+		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if l := m.st.Leases[r.Lease.ID]; l == nil || l.Offered != nil || len(m.st.Questions) != 0 || len(m.parked) != 0 {
+			t.Fatalf("a delivered lease should be taken up, with nothing left over: %+v", l)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the connected client was never answered")
+	}
+}
+
+func TestClientThatGoesAwayStopsWaiting(t *testing.T) {
+	m, _ := newTest(t, 2)
+	c, req := agent("a"), api.Req{Kind: "cluster", MemGB: 3, Purpose: "e2e", WaitSeconds: 30}
+	m.mu.Lock()
+	m.acquire(c, req)
+	ch := m.park(c.Session, req.Kind)
+	m.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := m.awaitGrant(ctx, ch, c, req); err == nil {
+		t.Fatal("a client that went away was answered")
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.parked) != 0 {
+		t.Fatal("a client that went away is still counted as connected")
+	}
+	// Its place is then kept only as long as anyone's.
+	if ws := m.liveWaiters(m.now().Add(m.queueKeep() + time.Second)); len(ws) != 0 {
+		t.Fatalf("an abandoned request still holds a place: %+v", ws)
+	}
+}
+
+func TestWaitTimesOutWithTheCurrentAnswer(t *testing.T) {
+	m, _ := newTest(t, 2)
+	c, req := agent("a"), api.Req{Kind: "cluster", MemGB: 3, Purpose: "e2e", WaitSeconds: 1}
+	m.mu.Lock()
+	m.acquire(c, req)
+	ch := m.park(c.Session, req.Kind)
+	m.mu.Unlock()
+	out, err := m.awaitGrant(context.Background(), ch, c, req)
+	if r, _ := out.(*api.AcquireResp); err != nil || r == nil || r.Granted || r.Queue != 1 {
+		t.Fatalf("want the refusal as of now, still queued: %+v %v", out, err)
 	}
 }

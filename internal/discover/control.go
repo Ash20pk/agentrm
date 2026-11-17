@@ -15,6 +15,9 @@ import (
 
 // CanPause says whether a resource can be frozen in place.
 func CanPause(r *model.Resource) bool {
+	if r.AskOnly {
+		return false
+	}
 	switch r.Kind {
 	case model.RKSimulator, model.RKDatabase: // simctl has no freeze; freezing a DB master alone leaves its workers
 		return false
@@ -26,7 +29,20 @@ func CanPause(r *model.Resource) bool {
 
 // CanAutoStop says whether AgentRM may stop a resource without the user. A VM is never
 // stopped automatically: for QEMU that is a hard power-off of a disk image.
-func CanAutoStop(r *model.Resource) bool { return r.Kind != model.RKVM }
+func CanAutoStop(r *model.Resource) bool { return r.Kind != model.RKVM && !r.AskOnly }
+
+// NoAutoStopWhy says why AgentRM leaves a resource to you.
+func NoAutoStopWhy(r *model.Resource) string {
+	switch {
+	case r.Kind == model.RKVM:
+		return "AgentRM never stops a VM on its own"
+	case r.Kind == model.RKStaleAgent:
+		return "AgentRM never stops an agent"
+	case r.AskOnly:
+		return "it is an app, and AgentRM never stops an app on its own"
+	}
+	return ""
+}
 
 func Pause(r *model.Resource) error {
 	switch r.Kind {
@@ -127,6 +143,8 @@ func stopOllama() error {
 // Restore brings back something AgentRM stopped, where a command can do it.
 func Restore(r *model.Resource) error {
 	switch r.Kind {
+	case model.RKLeftover:
+		return restartLeftover(r)
 	case model.RKCluster, model.RKContainers:
 		_, err := sys.Run(60*time.Second, "docker", append([]string{"start"}, r.Containers...)...)
 		return err

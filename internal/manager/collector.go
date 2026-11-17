@@ -25,30 +25,150 @@ import (
 	"fmt"
 	"path/filepath"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"agentrm/internal/api"
 	"agentrm/internal/model"
 	"agentrm/internal/sys"
+	"agentrm/internal/trace"
 )
 
 // maxTree bounds how many processes are remembered per session.
 const maxTree = 4000
 
-// treeProc is one process an agent started: which process (PID and start) and the most memory
-// it was seen using. The peak matters because macOS compresses an idle process's memory, so a
-// leftover that sits idle soon shows a fraction of what it holds.
-type treeProc struct {
-	Start  time.Time
-	PeakMB float64
+// ---- who started a process ----
+
+// procKey identifies one process over time: a PID is reused, a PID and its start are not.
+type procKey struct {
+	pid   int
+	start int64
 }
+
+func keyOf(p *sys.Proc) procKey { return procKey{p.PID, p.Start.Unix()} }
+
+// infoCache remembers what each process was started with (argv, environment, which agent
+// session), read once per process from the kernel. It has its own lock so it can be filled
+// outside mu.
+type infoCache struct {
+	mu   sync.Mutex
+	m    map[procKey]sys.ProcInfo
+	read func(pid int) (sys.ProcInfo, bool)
+	// direct: no caching, every lookup reads (replay, where the trace is the cache and an
+	// owner may be recorded a frame after the process first appears).
+	direct bool
+}
+
+func newInfoCache(read func(int) (sys.ProcInfo, bool)) *infoCache {
+	return &infoCache{m: map[procKey]sys.ProcInfo{}, read: read}
+}
+
+// systemBinary says whether a process is one of Apple's, whose environment the kernel withholds
+// and which no agent leaves behind worth collecting.
+func systemBinary(exe string) bool {
+	for _, p := range []string{"/System/", "/usr/bin/", "/usr/sbin/", "/usr/libexec/", "/bin/", "/sbin/", "/Library/Apple/"} {
+		if strings.HasPrefix(exe, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// refresh reads every process not seen before and forgets those that are gone.
+func (c *infoCache) refresh(procs map[int]*sys.Proc) {
+	if procs == nil || c.read == nil || c.direct {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	seen := make(map[procKey]bool, len(procs))
+	for _, p := range procs {
+		k := keyOf(p)
+		seen[k] = true
+		if _, ok := c.m[k]; ok || p.PID <= 1 || systemBinary(p.Exe) {
+			continue
+		}
+		info, _ := c.read(p.PID)
+		c.m[k] = info
+	}
+	for k := range c.m {
+		if !seen[k] {
+			delete(c.m, k)
+		}
+	}
+}
+
+func (c *infoCache) get(p *sys.Proc) sys.ProcInfo {
+	if p == nil {
+		return sys.ProcInfo{}
+	}
+	if c.direct {
+		info, _ := c.read(p.PID)
+		return info
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.m[keyOf(p)]
+}
+
+// envOwner is the agent session an agent's environment says started p, and whether that
+// agent is still running. ok is false when nothing says.
+func (m *Manager) envOwner(p *sys.Proc, procs map[int]*sys.Proc) (session string, agentPID int, alive, ok bool) {
+	info := m.infos.get(p)
+	if !info.Owned() {
+		return "", 0, false, false
+	}
+	session = info.Session
+	switch {
+	case session == "" && info.AgentPID > 0:
+		session = m.sessionOf(info.AgentPID, info.Agent)
+	case session == "":
+		// Only the agent's kind is known (an MCP server inherits the agent's own environment,
+		// which names no session). Its agent is certainly gone if no agent of that kind that
+		// was already running when it started is running now.
+		session = info.Agent + "-unknown"
+		for _, ap := range procs {
+			if sys.AgentKind(ap) == info.Agent && (ap.Start.IsZero() || p.Start.IsZero() || !ap.Start.After(p.Start.Add(3*time.Second))) {
+				alive = true
+				break
+			}
+		}
+		return session, 0, alive, true
+	}
+	if info.AgentPID > 0 {
+		// The agent is alive if that PID is still an agent, and was already running when p
+		// started (a reused PID is younger than the processes it is named in).
+		ap := procs[info.AgentPID]
+		alive = ap != nil && sys.AgentKind(ap) != "" &&
+			(ap.Start.IsZero() || p.Start.IsZero() || !ap.Start.After(p.Start.Add(3*time.Second)))
+	} else if s := m.st.Sessions[session]; s != nil {
+		alive = s.EndedAt == nil && s.AgentPID > 0 && procs[s.AgentPID] != nil
+	}
+	return session, info.AgentPID, alive, true
+}
+
+// ---- liveness ----
 
 // checkLiveness finds sessions whose agent process has exited, ends them, and remembers each
 // live agent's process tree for when it does. Must hold mu; procs must be a full table.
 func (m *Manager) checkLiveness(procs map[int]*sys.Proc, now time.Time) {
+	m.infos.refresh(procs)
 	children := map[int][]int{}
 	for _, p := range procs {
 		children[p.PPID] = append(children[p.PPID], p.PID)
+	}
+	// What each agent started that has detached, by the agent PID in its environment.
+	byAgent := map[int][]*sys.Proc{}
+	for _, p := range procs {
+		if _, apid, alive, ok := m.envOwner(p, procs); ok && alive && apid > 0 {
+			byAgent[apid] = append(byAgent[apid], p)
+			// The environment names the agent's real session, which is what the hooks would
+			// say: learn it, so a session is one session however it was first seen.
+			if info := m.infos.get(p); info.Session != "" && m.agentSessions[apid] == "" && sys.AgentKind(procs[apid]) == "claude" {
+				m.learnSession(apid, info.Session)
+			}
+		}
 	}
 	// Two sessions can share one agent process (Claude Code's /clear starts a new session):
 	// only the newest one that has not ended owns the tree.
@@ -66,45 +186,85 @@ func (m *Manager) checkLiveness(procs map[int]*sys.Proc, now time.Time) {
 		alive := p != nil && sys.SameProcess(p, s.AgentStart)
 		if alive {
 			delete(m.missing, id)
+			m.watchAgent(s.AgentPID)
 			if o := owner[s.AgentPID]; o != "" && o != id {
-				delete(m.trees, id) // its process now belongs to a newer session
+				delete(m.st.Trees, id) // its process now belongs to a newer session
 				continue
 			}
-			m.recordTree(id, s.AgentPID, procs, children)
+			m.recordTree(id, s.AgentPID, procs, children, byAgent[s.AgentPID])
 			continue
 		}
-		if _, tracked := m.trees[id]; !tracked && s.EndedAt != nil {
+		if _, tracked := m.st.Trees[id]; !tracked && s.EndedAt != nil {
 			continue
 		}
-		// Gone from one table could be a ps hiccup; gone from two is gone.
+		// Gone from one table could be a ps hiccup; gone from two is gone. (The kernel's exit
+		// notice, AgentExited, does not wait for a second table.)
 		m.missing[id]++
 		if m.missing[id] < 2 {
 			continue
 		}
-		delete(m.missing, id)
-		if s.EndedAt == nil {
-			m.endSession(s, fmt.Sprintf("its %s process (pid %d) exited", s.Agent, s.AgentPID), now)
-		}
-		m.findLeftovers(s, procs, now)
-		delete(m.trees, id)
-		if m.agentSessions[s.AgentPID] == id {
-			delete(m.agentSessions, s.AgentPID)
-			delete(m.st.AgentSessions, strconv.Itoa(s.AgentPID))
-		}
+		m.sessionGone(s, procs, now, fmt.Sprintf("its %s process (pid %d) exited", s.Agent, s.AgentPID))
+	}
+	m.findEnvLeftovers(procs, now)
+	m.findStaleAgents(procs, now)
+}
+
+// sessionGone ends a session whose agent process is gone and collects what it left. Must hold mu.
+func (m *Manager) sessionGone(s *model.Session, procs map[int]*sys.Proc, now time.Time, why string) {
+	delete(m.missing, s.ID)
+	if s.EndedAt == nil {
+		m.endSession(s, why, now)
+	}
+	m.findLeftovers(s, procs, now)
+	delete(m.st.Trees, s.ID)
+	if m.agentSessions[s.AgentPID] == s.ID {
+		delete(m.agentSessions, s.AgentPID)
+		delete(m.st.AgentSessions, strconv.Itoa(s.AgentPID))
 	}
 }
 
-// recordTree adds the agent's current descendants to what its session started, keeping any
-// earlier ones still running even if they have since detached from it.
-func (m *Manager) recordTree(id string, agentPID int, procs map[int]*sys.Proc, children map[int][]int) {
-	tree := map[int]treeProc{}
-	for pid, tp := range m.trees[id] {
+// AgentExited is the kernel telling us an agent process exited: its sessions end now, not on
+// the next sweep. procs is a table read after the exit, outside mu.
+func (m *Manager) AgentExited(pid int, procs map[int]*sys.Proc) {
+	if procs == nil {
+		return // no table: the sweep will see it
+	}
+	m.infos.refresh(procs)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.now()
+	for _, s := range m.st.Sessions {
+		if s.AgentPID != pid || (procs[pid] != nil && sys.SameProcess(procs[pid], s.AgentStart)) {
+			continue
+		}
+		if s.EndedAt == nil || m.st.Trees[s.ID] != nil {
+			m.sessionGone(s, procs, now, fmt.Sprintf("its %s process (pid %d) exited", s.Agent, pid))
+		}
+	}
+	m.dirty = true
+}
+
+// watchAgent asks the kernel to say when an agent process exits.
+func (m *Manager) watchAgent(pid int) {
+	if m.exits != nil {
+		m.exits.Watch(pid)
+	}
+}
+
+// recordTree adds the agent's current descendants to what its session started, and what its
+// environment says it started that has already detached; earlier ones still running are kept.
+func (m *Manager) recordTree(id string, agentPID int, procs map[int]*sys.Proc, children map[int][]int, detached []*sys.Proc) {
+	tree := map[int]model.TreeProc{}
+	for pid, tp := range m.st.Trees[id] {
 		if p := procs[pid]; p != nil && sys.SameProcess(p, tp.Start) {
 			tp.PeakMB = max(tp.PeakMB, p.RSSMB)
 			tree[pid] = tp
 		}
 	}
 	stack := append([]int(nil), children[agentPID]...)
+	for _, p := range detached {
+		stack = append(stack, p.PID)
+	}
 	for len(stack) > 0 && len(tree) < maxTree {
 		pid := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
@@ -112,11 +272,77 @@ func (m *Manager) recordTree(id string, agentPID int, procs map[int]*sys.Proc, c
 			continue
 		}
 		if p := procs[pid]; p != nil {
-			tree[pid] = treeProc{Start: p.Start, PeakMB: p.RSSMB}
+			tree[pid] = model.TreeProc{Start: p.Start, PeakMB: p.RSSMB}
 			stack = append(stack, children[pid]...)
 		}
 	}
-	m.trees[id] = tree
+	m.st.Trees[id] = tree
+}
+
+// reviveSession is a session that ended talking again (resumed, or its end was a false
+// alarm). It is a root once more: what it started or held is no longer collected as left
+// behind. Its leases were released; it claims back what it still uses when asked, and the
+// claim is verified because it started or used them. Must hold mu.
+func (m *Manager) reviveSession(s *model.Session) {
+	s.EndedAt, s.EndReason = nil, ""
+	n := 0
+	for _, r := range m.st.Resources {
+		if r.Owner != s.ID {
+			continue
+		}
+		r.Owner, r.OwnerGoneAt = "", nil
+		if r.PausedAt == nil {
+			r.OrphanSince = nil // its question starts again, at the normal pace
+			delete(m.st.Questions, r.ID)
+		}
+		n++
+	}
+	m.event("SESSION %s is active again; %d thing(s) it started or held are no longer collected as left behind", short(s.ID), n)
+}
+
+// handOver moves what one session has to its successor in the same agent process (Claude
+// Code's /clear starts a new session there). Must hold mu.
+func (m *Manager) handOver(from, to string) {
+	if from == to || from == "" {
+		return
+	}
+	n := 0
+	for _, l := range m.st.Leases {
+		if l.Session == from {
+			l.Session = to
+			n++
+		}
+	}
+	for _, r := range m.st.Resources {
+		if r.StartedBy == from {
+			r.StartedBy = to
+		}
+		if r.Owner == from {
+			r.Owner, r.OwnerGoneAt = "", nil
+		}
+	}
+	for _, w := range m.waiters {
+		if w.Session == from {
+			w.Session = to
+		}
+	}
+	for _, q := range m.st.Questions {
+		if q.For == from {
+			q.For = to
+		}
+	}
+	if t := m.st.Trees[from]; t != nil {
+		m.st.Trees[to] = t
+		delete(m.st.Trees, from)
+	}
+	if old := m.st.Sessions[from]; old != nil {
+		now := m.now()
+		old.EndedAt, old.EndReason = &now, "cleared: continued as "+short(to)
+		if nw := m.st.Sessions[to]; nw != nil {
+			nw.AgentStart, nw.Priority = old.AgentStart, max(nw.Priority, old.Priority)
+		}
+	}
+	m.event("SESSION %s continues as %s in the same agent process; %d lease(s) handed over", short(from), short(to), n)
 }
 
 // endSession stops treating a session as a root: its leases are released and what it started
@@ -146,26 +372,95 @@ func (m *Manager) endSession(s *model.Session, why string, now time.Time) {
 		mb += r.MemMB
 	}
 	// A session that ended waits for nothing.
-	kept := m.waiters[:0]
-	for _, w := range m.waiters {
-		if w.Session != s.ID {
-			kept = append(kept, w)
-		}
-	}
-	m.waiters = kept
+	m.dropWaitersOf(s.ID)
 	m.event("ENDED session %s (%s): %s. Released %d lease(s); %d thing(s) it started or held (%.1f GB) are now collected.",
 		short(s.ID), s.Agent, why, n, marked, mb/1024)
 	if marked > 0 {
 		m.notify(agentTitle(s.Agent)+" finished", fmt.Sprintf("It left %d thing(s) running (%.1f GB). Collecting them unless someone claims them.",
 			marked, mb/1024))
 	}
+	if n > 0 {
+		m.grantWaiters(now, false) // what it held can go to the queue at once
+	}
+}
+
+// dropWaitersOf takes every queued request of a session out of the queue.
+func (m *Manager) dropWaitersOf(session string) {
+	for _, w := range append([]*model.Waiter(nil), m.waiters...) {
+		if w.Session == session {
+			m.dropWaiter(w.Session, w.Kind)
+		}
+	}
+}
+
+// peakOf is the most memory a process was seen using: now, or while its agent ran.
+func peakOf(p *sys.Proc, tree map[int]model.TreeProc) float64 {
+	return max(p.RSSMB, tree[p.PID].PeakMB)
+}
+
+// held is what a process holds now: its footprint (compressed memory included) where that can
+// be read, its resident size otherwise.
+func (m *Manager) held(p *sys.Proc) float64 {
+	if m.footprint != nil {
+		if fp, ok := m.footprint(p.PID); ok {
+			return max(p.RSSMB, fp)
+		}
+	}
+	return p.RSSMB
+}
+
+// treeSize is what a process and everything under it hold.
+func (m *Manager) treeSize(root *sys.Proc, children map[int][]int, procs map[int]*sys.Proc, size func(*sys.Proc) float64) float64 {
+	total, stack, seen := 0.0, []int{root.PID}, map[int]bool{}
+	for len(stack) > 0 && len(seen) < maxTree {
+		pid := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if seen[pid] {
+			continue
+		}
+		seen[pid] = true
+		if p := procs[pid]; p != nil {
+			total += size(p)
+			stack = append(stack, children[pid]...)
+		}
+	}
+	return total
+}
+
+func childrenOf(procs map[int]*sys.Proc) map[int][]int {
+	children := map[int][]int{}
+	for _, p := range procs {
+		children[p.PPID] = append(children[p.PPID], p.PID)
+	}
+	return children
+}
+
+// track records one leftover, with what it needs to be started again.
+func (m *Manager) track(p *sys.Proc, session, agent, via string, mb float64, now time.Time) {
+	if m.st.Leftovers == nil {
+		m.st.Leftovers = map[string]*model.Leftover{}
+	}
+	key := strconv.Itoa(p.PID)
+	if lo := m.st.Leftovers[key]; lo != nil && sys.SameProcess(p, lo.Start) {
+		return
+	}
+	info := m.infos.get(p)
+	lo := &model.Leftover{PID: p.PID, Start: p.Start, Session: session, Agent: agent, Found: now, Via: via,
+		AskOnly: strings.Contains(p.Exe, ".app/Contents/"), Argv: info.Argv, Env: info.EnvList()}
+	m.st.Leftovers[key] = lo
+	what := "kept running after it ended"
+	if via == "env" {
+		what = "is still running, and that session's agent has exited"
+	}
+	m.event("LEFTOVER %s (pid %d, %.1f GB) was started by session %s (%s) and %s",
+		filepath.Base(p.Exe), p.PID, mb/1024, short(session), agent, what)
 }
 
 // findLeftovers records processes from an ended session's tree that are still running and no
 // longer under any agent. Only the top of each leftover tree is recorded, sized with what is
 // under it. Must hold mu.
 func (m *Manager) findLeftovers(s *model.Session, procs map[int]*sys.Proc, now time.Time) {
-	tree := m.trees[s.ID]
+	tree := m.st.Trees[s.ID]
 	cands := map[int]*sys.Proc{}
 	for pid, tp := range tree {
 		p := procs[pid]
@@ -180,30 +475,18 @@ func (m *Manager) findLeftovers(s *model.Session, procs map[int]*sys.Proc, now t
 	if len(cands) == 0 {
 		return
 	}
-	// What each leftover holds: itself and everything under it, each at the most it was seen
-	// using while the agent ran (or now, if more).
-	peak := func(p *sys.Proc) float64 { return max(p.RSSMB, tree[p.PID].PeakMB) }
-	under := map[int]float64{}
-	for _, p := range procs {
-		for q, i := procs[p.PPID], 0; q != nil && q.PID > 1 && i < 64; q, i = procs[q.PPID], i+1 {
-			under[q.PID] += peak(p)
-		}
-	}
-	if m.st.Leftovers == nil {
-		m.st.Leftovers = map[string]*model.Leftover{}
-	}
+	children := childrenOf(procs)
+	size := func(p *sys.Proc) float64 { return max(m.held(p), tree[p.PID].PeakMB) }
 	found := 0
-	for pid, p := range cands {
+	for _, p := range cands {
 		if cands[p.PPID] != nil {
 			continue
 		}
-		mb := peak(p) + under[pid]
+		mb := m.treeSize(p, children, procs, size)
 		if mb < m.cfg.LeftoverMinMB && p.CPU < 2 {
 			continue
 		}
-		m.st.Leftovers[strconv.Itoa(pid)] = &model.Leftover{PID: pid, Start: p.Start, Session: s.ID, Agent: s.Agent, Found: now}
-		m.event("LEFTOVER %s (pid %d, %.1f GB) was started by session %s (%s) and kept running after it ended",
-			filepath.Base(p.Exe), pid, mb/1024, short(s.ID), s.Agent)
+		m.track(p, s.ID, s.Agent, "tree", mb, now)
 		found++
 	}
 	if found > 0 {
@@ -211,9 +494,85 @@ func (m *Manager) findLeftovers(s *model.Session, procs map[int]*sys.Proc, now t
 	}
 }
 
-// withLeftovers adds the tracked leftovers that are still running to a discovery result. A
-// leftover discovery already knows (a Gradle daemon, a dev server) is not added again; it is
-// credited to the session that started it instead. Must hold mu.
+// findEnvLeftovers finds what agents left that the process tree cannot show: processes whose
+// environment names an agent session that is no longer running. That covers what detached
+// before a sample saw it, and what sessions left before AgentRM was running at all. Must hold mu.
+func (m *Manager) findEnvLeftovers(procs map[int]*sys.Proc, now time.Time) {
+	type cand struct {
+		p       *sys.Proc
+		session string
+		agent   string
+	}
+	cands := map[int]cand{}
+	for _, p := range procs {
+		if p.PID == m.selfPID || sys.AgentKind(p) != "" {
+			continue
+		}
+		session, _, alive, ok := m.envOwner(p, procs)
+		if !ok || alive {
+			continue
+		}
+		if apid, _ := sys.AgentAncestor(procs, p.PID); apid > 0 {
+			continue // under a live agent: its tree, not a leftover
+		}
+		if gui, _, _ := sys.GUIAncestor(procs, p.PPID); gui {
+			continue // under your terminal or an app now
+		}
+		cands[p.PID] = cand{p, session, m.infos.get(p).Agent}
+	}
+	if len(cands) == 0 {
+		return
+	}
+	children := childrenOf(procs)
+	for pid, c := range cands {
+		if _, parentToo := cands[c.p.PPID]; parentToo {
+			continue
+		}
+		if lo := m.st.Leftovers[strconv.Itoa(pid)]; lo != nil && sys.SameProcess(c.p, lo.Start) {
+			continue
+		}
+		mb := m.treeSize(c.p, children, procs, m.held)
+		if mb < m.cfg.LeftoverMinMB && c.p.CPU < 2 {
+			continue
+		}
+		m.track(c.p, c.session, c.agent, "env", mb, now)
+	}
+}
+
+// staleAgentHours is how long an agent with no terminal above it must have been silent before
+// it is mentioned.
+const staleAgentHours = 2
+
+// findStaleAgents notes agent processes with no terminal or app above them that have not been
+// heard from in hours: a closed window's agent that kept running. They are listed and asked
+// about, never paused or stopped. Must hold mu.
+func (m *Manager) findStaleAgents(procs map[int]*sys.Proc, now time.Time) {
+	m.stale = map[int]bool{}
+	for _, p := range procs {
+		kind := sys.AgentKind(p)
+		if kind == "" || p.CPU >= 1 {
+			continue
+		}
+		if parent := procs[p.PPID]; parent != nil && sys.AgentKind(parent) != "" {
+			continue // a subagent
+		}
+		if gui, _, _ := sys.GUIAncestor(procs, p.PPID); gui {
+			continue
+		}
+		s := m.st.Sessions[m.sessionOf(p.PID, kind)]
+		if s != nil && now.Sub(s.LastSeen) < staleAgentHours*time.Hour {
+			continue
+		}
+		if !p.Start.IsZero() && now.Sub(p.Start) < staleAgentHours*time.Hour {
+			continue
+		}
+		m.stale[p.PID] = true
+	}
+}
+
+// withLeftovers adds the tracked leftovers that are still running, and stale agents, to a
+// discovery result. A leftover discovery already knows (a Gradle daemon, a dev server) is not
+// added again; it is credited to the session that started it instead. Must hold mu.
 func (m *Manager) withLeftovers(found []*model.Resource, procs map[int]*sys.Proc) []*model.Resource {
 	byPID := map[int]*model.Resource{}
 	for _, r := range found {
@@ -221,13 +580,9 @@ func (m *Manager) withLeftovers(found []*model.Resource, procs map[int]*sys.Proc
 			byPID[r.PID] = r
 		}
 	}
-	under := map[int]float64{}
-	if len(m.st.Leftovers) > 0 {
-		for _, p := range procs {
-			for q, i := procs[p.PPID], 0; q != nil && q.PID > 1 && i < 64; q, i = procs[q.PPID], i+1 {
-				under[q.PID] += p.RSSMB
-			}
-		}
+	var children map[int][]int
+	if len(m.st.Leftovers) > 0 || len(m.stale) > 0 {
+		children = childrenOf(procs)
 	}
 	for key, lo := range m.st.Leftovers {
 		p := procs[lo.PID]
@@ -235,27 +590,71 @@ func (m *Manager) withLeftovers(found []*model.Resource, procs map[int]*sys.Proc
 			delete(m.st.Leftovers, key)
 			continue
 		}
-		gone := lo.Found
-		if s := m.st.Sessions[lo.Session]; s != nil && s.EndedAt != nil {
-			gone = *s.EndedAt
+		// Its session may be running again (resumed): then it is started-by, not left behind.
+		var gone *time.Time
+		if s := m.st.Sessions[lo.Session]; s == nil || s.EndedAt != nil || s.AgentPID <= 0 || procs[s.AgentPID] == nil {
+			g := lo.Found
+			if s != nil && s.EndedAt != nil {
+				g = *s.EndedAt
+			}
+			gone = &g
 		}
 		if r := byPID[lo.PID]; r != nil {
 			if r.StartedBy == "" {
 				r.StartedBy = lo.Session
 			}
-			if r.Owner == "" {
-				g := gone
-				r.Owner, r.OwnerGoneAt = lo.Session, &g
+			if r.Owner == "" && gone != nil {
+				r.Owner, r.OwnerGoneAt = lo.Session, gone
 			}
+			if r.Cwd == "" {
+				r.Cwd = lo.Cwd
+			}
+			r.AskOnly = r.AskOnly || lo.AskOnly
 			continue
 		}
-		g := gone
-		found = append(found, &model.Resource{ID: "left:" + key, Kind: model.RKLeftover, Source: "procs",
-			Name: filepath.Base(p.Exe), Detail: trunc(p.Args, 90), PID: p.PID, MemMB: p.RSSMB + under[p.PID], CPU: p.CPU,
-			StartedBy: lo.Session, Owner: lo.Session, OwnerGoneAt: &g,
-			Restart: "re-run the command that started it"})
+		r := &model.Resource{ID: "left:" + key, Kind: model.RKLeftover, Source: "procs",
+			Name: filepath.Base(p.Exe), Detail: trunc(p.Args, 90), PID: p.PID, MemMB: m.treeSize(p, children, procs, m.held), CPU: p.CPU,
+			Cwd: lo.Cwd, StartedBy: lo.Session, AskOnly: lo.AskOnly, RestartArgv: lo.Argv, RestartEnv: lo.Env,
+			Restart: "agentrm restore left:" + key}
+		if gone != nil {
+			r.Owner, r.OwnerGoneAt = lo.Session, gone
+		}
+		if len(lo.Argv) == 0 {
+			r.Restart = "re-run the command that started it"
+		}
+		found = append(found, r)
+	}
+	for pid := range m.stale {
+		p := procs[pid]
+		if p == nil {
+			continue
+		}
+		kind := sys.AgentKind(p)
+		found = append(found, &model.Resource{ID: "agent:" + strconv.Itoa(pid), Kind: model.RKStaleAgent, Source: "procs",
+			Name: agentTitle(kind), Detail: fmt.Sprintf("no terminal, not heard from in %dh+: %s", staleAgentHours, trunc(p.Args, 60)),
+			PID: pid, MemMB: m.treeSize(p, children, procs, m.held), CPU: p.CPU, AskOnly: true, Restart: "start the agent again"})
 	}
 	return found
+}
+
+// LeftoverCwds lists leftovers whose working directory is not known yet. Must hold mu.
+func (m *Manager) leftoverCwdsNeeded() []int {
+	var pids []int
+	for _, lo := range m.st.Leftovers {
+		if lo.Cwd == "" {
+			pids = append(pids, lo.PID)
+		}
+	}
+	return pids
+}
+
+// setLeftoverCwds records working directories read outside mu. Must hold mu.
+func (m *Manager) setLeftoverCwds(cwds map[int]string) {
+	for _, lo := range m.st.Leftovers {
+		if c := cwds[lo.PID]; c != "" && lo.Cwd == "" {
+			lo.Cwd = c
+		}
+	}
 }
 
 // ownerGone is when r's owner went, if it went and nothing has used r since.
@@ -293,12 +692,18 @@ func (m *Manager) collectTiming(r *model.Resource, now time.Time, blocked bool) 
 	}
 	old := m.cfg.OldGenerationHours > 0 && !r.FirstSeen.IsZero() &&
 		now.Sub(r.FirstSeen) > time.Duration(m.cfg.OldGenerationHours)*time.Hour
+	pressed, _ := m.thrashing()
+	pressed = pressed || blocked
+	if g, ok := m.learnedGrace(r, map[bool]float64{true: 3, false: 1}[pressed]); ok && !old {
+		return g, hold, fmt.Sprintf("unclaimed for %s; for a %s that is when holding it starts to cost more than restarting it would (learned from %d idle periods)",
+			g.Round(time.Minute), r.Kind, len(m.timingState()[r.Kind])), false
+	}
 	switch {
 	case old:
 		grace *= 3
 		reason = fmt.Sprintf("unclaimed, and it has been running for %s", now.Sub(r.FirstSeen).Round(time.Hour))
 	default:
-		if t, _ := m.thrashing(); t || blocked {
+		if pressed {
 			grace = max(time.Minute, grace/2)
 		}
 	}
@@ -312,6 +717,13 @@ func (m *Manager) end(c api.Caller, r api.Req) (any, []Effect, error) {
 		return m.release(c, r)
 	}
 	s := m.touchSession(c.Session, c.Agent, r.Cwd)
+	if r.Reason == "clear" {
+		// /clear: the agent goes on in a new session, which takes over this one's leases and
+		// what it started as soon as it is heard from (handOver). If the agent exits first,
+		// the session ends then.
+		m.event("SESSION %s was cleared; what it holds passes to the next session of the same agent", short(s.ID))
+		return &api.CountResp{}, nil, nil
+	}
 	n := 0
 	for _, l := range m.st.Leases {
 		if l.Session == s.ID {
@@ -348,4 +760,13 @@ func agentTitle(agent string) string {
 		return "You"
 	}
 	return agent
+}
+
+// traceOwner is what a trace records about who started a process.
+func (m *Manager) traceOwner(p *sys.Proc) (trace.Owner, bool) {
+	info := m.infos.get(p)
+	if !info.Owned() {
+		return trace.Owner{}, false
+	}
+	return trace.Owner{Agent: info.Agent, Session: info.Session, AgentPID: info.AgentPID}, true
 }

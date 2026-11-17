@@ -15,6 +15,7 @@ import (
 	"agentrm/internal/api"
 	"agentrm/internal/discover"
 	"agentrm/internal/model"
+	"agentrm/internal/trace"
 )
 
 // checkOrphans asks about, pauses and stops unclaimed resources. Must hold mu; the returned
@@ -65,6 +66,16 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 		if now.Sub(*r.OrphanSince) < grace {
 			continue
 		}
+		if r.StartedBy == "you" {
+			// What you started is yours to stop: AgentRM asks once, and never pauses or stops it.
+			if !m.wouldDecided["ask:"+r.ID] {
+				m.wouldDecided["ask:"+r.ID] = true
+				m.event("ASKYOU %s (%s, %.1f GB), which you started, has been unclaimed for %s. AgentRM leaves it to you.",
+					r.ID, r.Name, r.MemMB/1024, now.Sub(*r.OrphanSince).Round(time.Minute))
+				m.notify("Still using "+r.Name+"?", fmt.Sprintf("You started it; it holds %s. AgentRM will not stop it.", gb(r.MemMB)))
+			}
+			continue
+		}
 		direct := r.Urgent || blocked || m.cfg.PauseMinutes <= 0 || !discover.CanPause(r)
 		why := fmt.Sprintf("unclaimed for %s", now.Sub(*r.OrphanSince).Round(time.Minute))
 		if reason != "" {
@@ -75,7 +86,7 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 		}
 		switch {
 		case r.PausedAt == nil && !direct:
-			if m.cfg.DryRun {
+			if m.dryFor(r) {
 				m.decideOnce("pause", r, why)
 				continue
 			}
@@ -85,21 +96,21 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 		case r.PausedAt != nil && !direct && now.Sub(*r.PausedAt) < hold:
 			continue
 		case !discover.CanAutoStop(r):
-			if r.PausedAt == nil && discover.CanPause(r) && !m.cfg.DryRun {
+			if r.PausedAt == nil && discover.CanPause(r) && !m.dryFor(r) {
 				m.decide("pause", r, why)
 				m.pending[r.ID] = "pause"
 				effects = append(effects, Effect{Op: "pause", Res: *r, Why: why, By: "agentrm"})
 			} else if !m.wouldDecided["ask:"+r.ID] {
 				m.wouldDecided["ask:"+r.ID] = true
-				m.event("ASKYOU %s (%s, %.1f GB) is unclaimed. AgentRM never stops a VM on its own; stop it yourself if you are done with it.",
-					r.ID, r.Name, r.MemMB/1024)
-				m.notify("Unclaimed VM: "+r.Name, "AgentRM will not stop it. Stop it yourself if you are done.")
+				m.event("ASKYOU %s (%s, %.1f GB) is unclaimed, and %s; stop it yourself if you are done with it.",
+					r.ID, r.Name, r.MemMB/1024, discover.NoAutoStopWhy(r))
+				m.notify("Unclaimed: "+r.Name, "AgentRM will not stop it. Stop it yourself if you are done.")
 			}
 		default:
 			if r.PausedAt != nil {
 				why += fmt.Sprintf(", then paused for %s", now.Sub(*r.PausedAt).Round(time.Minute))
 			}
-			if m.cfg.DryRun {
+			if m.dryFor(r) {
 				m.decideOnce("stop", r, why)
 				continue
 			}
@@ -115,9 +126,18 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 func (m *Manager) decide(action string, r *model.Resource, why string) {
 	d := &model.Decision{ID: newID(), Time: m.now(), Action: action, Why: why, DryRun: m.cfg.DryRun}
 	if r != nil {
+		d.Category, d.DryRun = m.categoryOf(r), m.dryFor(r)
+	}
+	if r != nil {
 		d.Resource, d.Name, d.MemMB = r.ID, r.Name, r.MemMB
 	}
 	m.st.Decisions = append(m.st.Decisions, d)
+	if m.onDecide != nil {
+		m.onDecide(d)
+	}
+	if m.rec != nil {
+		m.rec.Write(trace.Frame{T: d.Time, Decision: d})
+	}
 	if len(m.st.Decisions) > 500 {
 		m.st.Decisions = m.st.Decisions[len(m.st.Decisions)-500:]
 	}
@@ -166,6 +186,7 @@ func (m *Manager) review(c api.Caller, r api.Req) (any, []Effect, error) {
 			if d.ID == r.DecisionID {
 				d.Verdict, d.Note = r.Verdict, r.Note
 				m.event("REVIEW %s %s %s: %s", d.ID, d.Action, d.Resource, r.Verdict)
+				m.relock(d)
 				return m.reviewSummary(r.All), nil, nil
 			}
 		}

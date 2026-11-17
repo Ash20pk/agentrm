@@ -35,8 +35,24 @@ type Req struct {
 	Purpose         string  `json:"purpose,omitempty"`
 	Cmd             string  `json:"cmd,omitempty"`
 	RunInBackground bool    `json:"run_in_background,omitempty"`
+	// WaitSeconds asks /acquire to stay connected when the request is queued, and to answer
+	// when the lease is granted or this long has passed.
+	WaitSeconds int `json:"wait_seconds,omitempty"`
 	// Gate asks /touch to classify Cmd and, if it is heavy, take a lease for it in the same call.
 	Gate bool `json:"gate,omitempty"`
+
+	// Yield: what giving up LeaseID would cost the holder now (none, low, high), and how long
+	// bringing it back would take.
+	Cost           string `json:"cost,omitempty"`
+	RestartSeconds int    `json:"restart_seconds,omitempty"`
+
+	// Repo and Branch are where Cwd is, filled in by the daemon (never trusted from the client):
+	// the task a lease belongs to.
+	Repo   string `json:"repo,omitempty"`
+	Branch string `json:"branch,omitempty"`
+
+	// Reason is why a session ended (Claude Code's SessionEnd: clear, logout, prompt_input_exit, other).
+	Reason string `json:"reason,omitempty"`
 
 	LeaseID    string `json:"lease_id,omitempty"`
 	ResourceID string `json:"resource_id,omitempty"`
@@ -44,12 +60,16 @@ type Req struct {
 	Pinned     *bool  `json:"pinned,omitempty"`
 	Priority   *int   `json:"priority,omitempty"`
 
-	DryRun       *bool    `json:"dry_run,omitempty"`
-	GraceMinutes int      `json:"grace_minutes,omitempty"`
-	HeadroomGB   float64  `json:"headroom_gb,omitempty"`
-	PauseMinutes *int     `json:"pause_minutes,omitempty"`
-	IdleMinutes  int      `json:"idle_minutes,omitempty"`
-	NeverStop    []string `json:"never_stop,omitempty"`
+	DryRun      *bool `json:"dry_run,omitempty"`
+	RecordTrace *bool `json:"record_trace,omitempty"`
+	// AutoStop turns auto-stop levels on or off: {"owner_gone": true}.
+	AutoStop     map[string]bool `json:"auto_stop,omitempty"`
+	Days         int             `json:"days,omitempty"` // receipt: how many days back
+	GraceMinutes int             `json:"grace_minutes,omitempty"`
+	HeadroomGB   float64         `json:"headroom_gb,omitempty"`
+	PauseMinutes *int            `json:"pause_minutes,omitempty"`
+	IdleMinutes  int             `json:"idle_minutes,omitempty"`
+	NeverStop    []string        `json:"never_stop,omitempty"`
 
 	DecisionID string `json:"decision_id,omitempty"`
 	Verdict    string `json:"verdict,omitempty"` // right | wrong
@@ -81,7 +101,7 @@ type AcquireResp struct {
 	Reason  string       `json:"reason,omitempty"`
 	Lease   *model.Lease `json:"lease,omitempty"`
 	Reused  bool         `json:"reused,omitempty"`
-	Queue   int          `json:"queue,omitempty"` // position when refused
+	Queue   int          `json:"queue,omitempty"` // position when refused and queued; 0 when not queued
 }
 
 type ClaimResp struct {
@@ -147,5 +167,42 @@ type Status struct {
 	Sources       map[string]string          `json:"sources"` // source -> "" (ok) or why it failed
 	Self          sys.SelfUsage              `json:"self"`
 	StartedAt     time.Time                  `json:"started_at"`
-	Notes         []string                   `json:"notes,omitempty"` // problems at startup
+	Notes         []string                   `json:"notes,omitempty"`      // problems at startup
+	Prediction    string                     `json:"prediction,omitempty"` // how the command-stream predictor is doing
+	TrustLevels   []TrustLevel               `json:"trust_levels,omitempty"`
+}
+
+// TrustLevel is one auto-stop level, with the evidence for turning it on.
+type TrustLevel struct {
+	Category string `json:"category"`
+	Title    string `json:"title"`
+	Detail   string `json:"detail"`
+	On       bool   `json:"on"`
+	Decided  int    `json:"decided"`  // decisions taken or that would have been
+	Reviewed int    `json:"reviewed"` // of those, marked right or wrong
+	Wrong    int    `json:"wrong"`
+	Days     int    `json:"days"`              // since its first decision
+	Eligible bool   `json:"eligible"`          // the evidence says it may be turned on
+	Blocked  string `json:"blocked,omitempty"` // why it cannot be turned on yet (an earlier level is off)
+	Evidence string `json:"evidence"`
+}
+
+// Receipt is what AgentRM did over a period, from its decision log and events log.
+type Receipt struct {
+	Since         time.Time     `json:"since"`
+	Until         time.Time     `json:"until"`
+	SessionsEnded int           `json:"sessions_ended"`
+	Leftovers     int           `json:"leftovers"`
+	Paused        int           `json:"paused"`
+	Stopped       int           `json:"stopped"`
+	FreedGB       float64       `json:"freed_gb"`
+	WouldStop     int           `json:"would_stop"` // in dry run
+	WouldFreeGB   float64       `json:"would_free_gb"`
+	Wrong         int           `json:"wrong"` // reviewed wrong
+	Restored      int           `json:"restored"`
+	Queued        int           `json:"queued"`
+	WaitMean      time.Duration `json:"wait_mean"`
+	WaitMax       time.Duration `json:"wait_max"`
+	Misreports    int           `json:"misreports"`
+	Text          string        `json:"text"`
 }

@@ -13,6 +13,7 @@ import (
 	"agentrm/internal/evidence"
 	"agentrm/internal/model"
 	"agentrm/internal/sys"
+	"agentrm/internal/trace"
 )
 
 // Run samples the machine until ctx is done. Two tiers:
@@ -27,16 +28,29 @@ func (m *Manager) Run(ctx context.Context) {
 	go func() {
 		t := time.NewTicker(time.Second)
 		defer t.Stop()
+		n := 0
 		for {
 			select {
 			case <-ctx.Done():
 				return
 			case <-t.C:
 				m.persist()
+				if n++; n%10 == 0 {
+					m.mu.Lock()
+					rec := m.rec
+					m.mu.Unlock()
+					if rec != nil {
+						rec.Flush()
+					}
+				}
 			}
 		}
 	}()
 	m.Sweep()
+	var exits <-chan int
+	if m.exits != nil {
+		exits = m.exits.C
+	}
 	full := time.NewTimer(m.sweepEvery())
 	fast := time.NewTicker(time.Duration(max(1, m.cfg.FastSweepSeconds)) * time.Second)
 	defer full.Stop()
@@ -61,6 +75,14 @@ func (m *Manager) Run(ctx context.Context) {
 			if m.needsFast() {
 				m.FastTick()
 			}
+		case pid := <-exits:
+			// An agent exited: end its sessions now, with a table read after the exit.
+			procs := sys.ListProcs()
+			if m.rec != nil {
+				now := m.now()
+				m.rec.Write(trace.Frame{T: now, Exit: pid, ExitTab: m.rec.Procs(now, procs, m.traceOwner, m.footprint)})
+			}
+			m.AgentExited(pid, procs)
 		}
 	}
 }
@@ -109,6 +131,15 @@ func (m *Manager) needsFast() bool {
 func (m *Manager) FastTick() {
 	procs := sys.ListProcs()
 	mem := sys.ReadMem()
+	if m.rec != nil {
+		now := m.now()
+		m.rec.Write(trace.Frame{T: now, Fast: &trace.Sweep{Procs: m.rec.Procs(now, procs, m.traceOwner, m.footprint), Mem: mem}})
+	}
+	m.fastWith(procs, mem)
+}
+
+// fastWith is a fast tick on what was read (live, or from a trace).
+func (m *Manager) fastWith(procs map[int]*sys.Proc, mem sys.MemStats) {
 	m.mu.Lock()
 	now := m.now()
 	m.takeMem(mem, now)
@@ -116,6 +147,7 @@ func (m *Manager) FastTick() {
 		sys.Procs.Set(procs)
 		m.updateFootprints(procs, now)
 	}
+	m.grantWaiters(now, false) // memory may have just come free
 	var watch []string
 	paused := map[string]*model.Resource{}
 	if m.cfg.AutoThawOnConnect {
@@ -177,10 +209,43 @@ func (m *Manager) Sweep() {
 	cfg := m.cfg
 	m.mu.Unlock()
 	found := discover.Discover(cfg, procs)
+	m.infos.refresh(procs) // read new processes' environments outside mu
+	m.mu.Lock()
+	needCwd := m.leftoverCwdsNeeded()
+	m.mu.Unlock()
+	var cwds map[int]string
+	if len(needCwd) > 0 {
+		cwds = sys.Cwds(needCwd)
+	}
 	mem := sys.ReadMem()
 	est := sys.EstablishedPorts()
 	m.tamperCheck()
+	m.recordSweep(procs, found, mem, est, cwds)
+	m.sweepWith(procs, found, mem, est, cwds)
+	self := sys.Self()
+	self.SweepMS = float64(time.Since(start).Microseconds()) / 1000
+	m.mu.Lock()
+	m.self = self
+	m.mu.Unlock()
+}
 
+// recordSweep writes a sweep's inputs to the trace, if one is being kept.
+func (m *Manager) recordSweep(procs map[int]*sys.Proc, found discover.Result, mem sys.MemStats, est map[string]bool, cwds map[int]string) {
+	if m.rec == nil {
+		return
+	}
+	m.infos.refresh(procs) // so the trace has each process's owner from its first frame
+	now := m.now()
+	failed := map[string]string{}
+	for src, err := range found.Failed {
+		failed[src] = err.Error()
+	}
+	m.rec.Write(trace.Frame{T: now, Sweep: &trace.Sweep{Procs: m.rec.Procs(now, procs, m.traceOwner, m.footprint),
+		Found: found.Resources, Failed: failed, Mem: mem, Est: est, Cwds: cwds}})
+}
+
+// sweepWith is a full sweep on what was read (live, or from a trace).
+func (m *Manager) sweepWith(procs map[int]*sys.Proc, found discover.Result, mem sys.MemStats, est map[string]bool, cwds map[int]string) {
 	m.mu.Lock()
 	now := m.now()
 	m.takeMem(mem, now)
@@ -188,17 +253,22 @@ func (m *Manager) Sweep() {
 	if procs != nil {
 		m.updateFootprints(procs, now)
 		m.checkLiveness(procs, now)
+		m.setLeftoverCwds(cwds)
 		found.Resources = m.withLeftovers(found.Resources, procs)
 	}
 	m.merge(found, procs, est, now)
 	m.checkLeases(now)
+	m.judgeYields(now)
+	m.markExpected(now)
+	m.weeklyReceipt(now)
 	effects := m.checkOrphans(now)
+	m.grantWaiters(now, true)
 	for id, s := range m.st.Sessions {
 		if now.Sub(s.LastSeen) > 24*time.Hour && s.FootprintMB == 0 {
 			delete(m.st.Sessions, id)
 			delete(m.footBase, id)
 			delete(m.recent, id)
-			delete(m.trees, id)
+			delete(m.st.Trees, id)
 			delete(m.missing, id)
 		}
 	}
@@ -213,11 +283,6 @@ func (m *Manager) Sweep() {
 	if len(effects) > 0 {
 		m.afterAsync(RunEffects(effects))
 	}
-	self := sys.Self()
-	self.SweepMS = float64(time.Since(start).Microseconds()) / 1000
-	m.mu.Lock()
-	m.self = self
-	m.mu.Unlock()
 }
 
 func (m *Manager) origins() map[string]origin { return m.dockerOrigin }
@@ -239,12 +304,13 @@ func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[
 			if r.Owner == "" {
 				r.Owner, r.OwnerGoneAt = old.Owner, old.OwnerGoneAt
 			}
-			r.PausedAt, r.Urgent = old.PausedAt, old.Urgent
+			r.PausedAt, r.Urgent, r.ReleasedIdle = old.PausedAt, old.Urgent, old.ReleasedIdle && r.LeaseID == ""
 			if r.Cwd == "" {
 				r.Cwd = old.Cwd
 			}
 		} else {
 			r.FirstSeen = now
+			m.yieldsSeeReturn(r, now)
 		}
 		if r.LeaseID != "" && m.st.Leases[r.LeaseID] == nil {
 			r.LeaseID = ""
@@ -257,6 +323,11 @@ func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[
 			m.attribute(r, procs, now, old == nil && m.firstDone)
 		}
 		if r.PausedAt == nil && m.activity.Active(r, est) {
+			last := r.LastActive
+			if last.IsZero() {
+				last = r.FirstSeen
+			}
+			m.noteIdleGap(r.Kind, now.Sub(last).Minutes())
 			r.LastActive = now
 		}
 	}
@@ -264,6 +335,7 @@ func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[
 		if seen[id] || found.Failed[r.Source] != nil || m.pending[id] != "" {
 			continue
 		}
+		m.noteGone(r, now)
 		delete(m.st.Resources, id)
 		delete(m.st.Questions, id)
 		delete(m.st.Touches, id)
@@ -305,6 +377,7 @@ func (m *Manager) attribute(r *model.Resource, procs map[int]*sys.Proc, now time
 			best = &model.Lease{ID: newID(), Session: s, Agent: agent, Kind: model.ResourceToLease[r.Kind], MemGB: r.MemMB / 1024,
 				Purpose: "started without a lease", Cwd: r.Cwd, TTL: m.cfg.DefaultTTLMinutes, Created: now,
 				Expires: now.Add(minutes(m.cfg.DefaultTTLMinutes)), Verified: true, Evidence: ev, LastUsed: now}
+			m.stampTask(best)
 			m.st.Leases[best.ID] = best
 			if s == "you" {
 				best.Purpose = "started by you"
@@ -354,7 +427,13 @@ func (m *Manager) startedBy(r *model.Resource, procs map[int]*sys.Proc, now time
 				return "you" // started from your terminal or IDE, with no agent above it
 			}
 		}
-		// Detached (Gradle daemons always are): fall through to what commands say.
+		// Detached (Gradle daemons always are): its environment says which agent session
+		// started it, if one did.
+		if p := procs[r.PID]; p != nil {
+			if session, _, _, ok := m.envOwner(p, procs); ok {
+				return session
+			}
+		}
 	}
 	if !isNew {
 		return ""
@@ -384,7 +463,9 @@ func (m *Manager) agentsQuiet(procs map[int]*sys.Proc, now time.Time) bool {
 	agents := 0
 	for _, p := range procs {
 		if k := sys.AgentKind(p); k != "" {
-			if !sys.Hooked(k) {
+			// Hooked: it reports every command before running it (Claude Code always; another
+			// agent once its hooks have been heard from today).
+			if seen, ok := m.hookSeen[k]; !ok || now.Sub(seen) > 24*time.Hour {
 				return false
 			}
 			agents++
@@ -392,9 +473,6 @@ func (m *Manager) agentsQuiet(procs map[int]*sys.Proc, now time.Time) bool {
 	}
 	if agents == 0 {
 		return true
-	}
-	if m.hookSeen.IsZero() {
-		return false
 	}
 	for _, cmds := range m.recent {
 		for _, c := range cmds {
@@ -461,6 +539,14 @@ func (m *Manager) followDocker(ctx context.Context) error {
 		if s := originFromProcs(procs, names); s != "" {
 			m.mu.Lock()
 			m.dockerOrigin[id] = origin{session: m.resolveOrigin(s), at: m.now()}
+			if m.rec != nil {
+				f := trace.Frame{T: m.now()}
+				f.Origin = &struct {
+					ID      string `json:"id"`
+					Session string `json:"session"`
+				}{id, m.dockerOrigin[id].session}
+				m.rec.Write(f)
+			}
 			m.mu.Unlock()
 		}
 	}

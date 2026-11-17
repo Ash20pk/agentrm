@@ -1,10 +1,12 @@
 package manager
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"agentrm/internal/api"
+	"agentrm/internal/discover"
 	"agentrm/internal/model"
 	"agentrm/internal/sys"
 )
@@ -245,5 +247,239 @@ func TestCompressedLeftoverIsStillFound(t *testing.T) {
 	m.checkLiveness(gone, c.Now())
 	if m.st.Leftovers["600"] == nil {
 		t.Fatal("an idle leftover whose memory was compressed was missed")
+	}
+}
+
+// fakeInfos makes the environment reader answer from a table.
+func fakeInfos(m *Manager, infos map[int]sys.ProcInfo) {
+	m.infos = newInfoCache(func(pid int) (sys.ProcInfo, bool) {
+		i, ok := infos[pid]
+		return i, ok
+	})
+}
+
+func TestResumedSessionGetsItsThingsBack(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.cfg.DryRun = false
+	got := fakeEffects(t, nil)
+	start := c.Now().Add(-time.Hour)
+	liveSession(m, "s", start)
+	l := acquire(t, m, agent("s"), "server", 0.5)
+	r := addRes(m, "srv:3000", model.RKServer, 400, l.Lease.ID)
+	r.StartedBy, r.FirstSeen = "s", c.Now()
+	if _, _, err := m.end(agent("s"), api.Req{}); err != nil {
+		t.Fatal(err)
+	}
+	if r.Owner != "s" {
+		t.Fatal("not marked when the session ended")
+	}
+	m.applyEffects(RunEffects(m.checkOrphans(c.Now())))
+	// It talks again before the owner-gone grace runs out.
+	c.Add(time.Minute)
+	m.touchSession("s", "claude", "")
+	c.Add(minutes(m.cfg.OwnerGoneGraceMinutes) + time.Minute)
+	m.applyEffects(RunEffects(m.checkOrphans(c.Now())))
+	if r.Owner != "" || r.OwnerGoneAt != nil {
+		t.Fatalf("still marked owner-gone after the session came back: %+v", r)
+	}
+	for _, e := range *got {
+		if e.Res.ID == r.ID {
+			t.Fatalf("%s a resumed session's server", e.Op)
+		}
+	}
+	// And it claims it back, verified, because it started it.
+	out, _, err := m.claim(agent("s"), api.Req{ResourceID: r.ID, Purpose: "still developing"})
+	if err != nil || !out.(*api.ClaimResp).Verified {
+		t.Fatalf("claim after resume: %+v %v", out, err)
+	}
+}
+
+func TestClearHandsOverToTheNextSession(t *testing.T) {
+	m, c := newTest(t, 8)
+	start := c.Now().Add(-time.Hour)
+	m.agentSessions[500] = "old"
+	liveSession(m, "old", start)
+	l := acquire(t, m, agent("old"), "server", 0.5)
+	r := addRes(m, "srv:3000", model.RKServer, 400, l.Lease.ID)
+	r.StartedBy = "old"
+	if _, _, err := m.end(agent("old"), api.Req{Reason: "clear"}); err != nil {
+		t.Fatal(err)
+	}
+	if m.st.Sessions["old"].EndedAt != nil || m.st.Leases[l.Lease.ID] == nil {
+		t.Fatal("/clear ended the session and released its lease")
+	}
+	// The new session's first hook call arrives from the same agent process.
+	m.mu.Lock()
+	m.resolve(facts{pid: 900, agentPID: 500, agent: "claude"}, &api.Req{Session: "new", Via: "hook"})
+	m.mu.Unlock()
+	if got := m.st.Leases[l.Lease.ID]; got == nil || got.Session != "new" || r.StartedBy != "new" {
+		t.Fatalf("not handed over: lease=%+v startedBy=%q", got, r.StartedBy)
+	}
+	if !strings.HasPrefix(m.st.Sessions["old"].EndReason, "cleared:") {
+		t.Fatalf("old session: %+v", m.st.Sessions["old"])
+	}
+	// The old one does not come back to life by being mentioned.
+	m.touchSession("old", "claude", "")
+	if m.st.Sessions["old"].EndedAt == nil {
+		t.Fatal("a cleared session was revived")
+	}
+}
+
+func TestKernelExitEndsTheSessionAtOnce(t *testing.T) {
+	m, c := newTest(t, 8)
+	start := c.Now().Add(-time.Hour)
+	s := liveSession(m, "s", start)
+	l := acquire(t, m, agent("s"), "server", 0.5)
+	procs := agentTree(start)
+	m.checkLiveness(procs, c.Now())
+	m.AgentExited(500, afterExit(procs))
+	if s.EndedAt == nil || m.st.Leases[l.Lease.ID] != nil {
+		t.Fatal("the exit notice did not end the session at once")
+	}
+	if m.st.Leftovers["600"] == nil {
+		t.Fatal("what it left was not found on the exit notice")
+	}
+	// A notice for a PID that is still the agent (reused, or a stale notice) ends nothing.
+	s2 := liveSession(m, "t", start)
+	m.AgentExited(500, agentTree(start))
+	if s2.EndedAt != nil {
+		t.Fatal("an exit notice for a running agent ended its session")
+	}
+}
+
+// A dev server started with & from a Bash command: re-parented to launchd before any sample
+// saw it under the agent. Its environment still names the session.
+func detachedServer(start time.Time) (map[int]*sys.Proc, map[int]sys.ProcInfo) {
+	procs := agentTree(start)
+	procs[700] = &sys.Proc{PID: 700, PPID: 1, Exe: "/opt/homebrew/bin/node", Args: "node server.js", Start: start.Add(2 * time.Minute), RSSMB: 500}
+	infos := map[int]sys.ProcInfo{700: {Argv: []string{"node", "server.js"}, Env: map[string]string{"PATH": "/opt/homebrew/bin"},
+		Agent: "claude", Session: "s", AgentPID: 500}}
+	return procs, infos
+}
+
+func TestDetachedProcessIsOwnedByItsEnvironment(t *testing.T) {
+	m, c := newTest(t, 8)
+	start := c.Now().Add(-time.Hour)
+	liveSession(m, "s", start)
+	procs, infos := detachedServer(start)
+	fakeInfos(m, infos)
+	m.checkLiveness(procs, c.Now())
+	if _, ok := m.st.Trees["s"][700]; !ok {
+		t.Fatal("a process that detached at once was not recorded as the session's")
+	}
+	if len(m.st.Leftovers) != 0 {
+		t.Fatal("a live session's detached server was taken for a leftover")
+	}
+	srv := &model.Resource{ID: "srv:3000", Kind: model.RKServer, PID: 700, MemMB: 500}
+	if got := m.startedBy(srv, procs, c.Now(), false); got != "s" {
+		t.Fatalf("detached server credited to %q, want s", got)
+	}
+	// The agent exits: the server is a leftover, with how to start it again.
+	m.AgentExited(500, afterExit(procs))
+	lo := m.st.Leftovers["700"]
+	if lo == nil || lo.Session != "s" || len(lo.Argv) != 2 || len(lo.Env) != 1 {
+		t.Fatalf("detached server not collected with its restart command: %+v", lo)
+	}
+	res := m.withLeftovers(nil, afterExit(procs))
+	var r *model.Resource
+	for _, x := range res {
+		if x.ID == "left:700" {
+			r = x
+		}
+	}
+	if r == nil || r.Restart != "agentrm restore left:700" || len(r.RestartArgv) != 2 {
+		t.Fatalf("leftover not restorable: %+v", r)
+	}
+}
+
+func TestLeftoversFromBeforeAgentRMAreFound(t *testing.T) {
+	m, c := newTest(t, 8)
+	// An agent that exited yesterday left a database and launched Docker Desktop. AgentRM never
+	// saw that agent; only the environment says who started them.
+	procs := map[int]*sys.Proc{
+		1:   {PID: 1, Exe: "/sbin/launchd"},
+		800: {PID: 800, PPID: 1, Exe: "/opt/homebrew/bin/postgres", Args: "postgres -D /tmp/x", Start: c.Now().Add(-20 * time.Hour), RSSMB: 120},
+		801: {PID: 801, PPID: 800, Exe: "/opt/homebrew/bin/postgres", Args: "postgres: checkpointer", Start: c.Now().Add(-20 * time.Hour), RSSMB: 20},
+		900: {PID: 900, PPID: 1, Exe: "/Applications/Docker.app/Contents/MacOS/com.docker.backend", Start: c.Now().Add(-20 * time.Hour), RSSMB: 400},
+		950: {PID: 950, PPID: 1, Exe: "/opt/homebrew/bin/redis-server", Start: c.Now().Add(-20 * time.Hour), RSSMB: 80}, // nobody's
+	}
+	gone := sys.ProcInfo{Agent: "claude", Session: "dead", AgentPID: 4242}
+	fakeInfos(m, map[int]sys.ProcInfo{800: gone, 801: gone, 900: gone})
+	m.checkLiveness(procs, c.Now())
+	if m.st.Leftovers["800"] == nil || m.st.Leftovers["801"] != nil {
+		t.Fatalf("want the top of the database's tree: %+v", m.st.Leftovers)
+	}
+	if lo := m.st.Leftovers["900"]; lo == nil || !lo.AskOnly {
+		t.Fatalf("an app an agent launched must be ask-only: %+v", lo)
+	}
+	if m.st.Leftovers["950"] != nil {
+		t.Fatal("a process with no agent in its environment was taken for a leftover")
+	}
+	for _, r := range m.withLeftovers(nil, procs) {
+		if r.PID == 900 && (discover.CanAutoStop(r) || discover.CanPause(r)) {
+			t.Fatal("an app an agent launched could be paused or stopped")
+		}
+	}
+}
+
+func TestStaleAgentIsListedAndOnlyAsked(t *testing.T) {
+	m, c := newTest(t, 8)
+	procs := map[int]*sys.Proc{
+		1:   {PID: 1, Exe: "/sbin/launchd"},
+		500: {PID: 500, PPID: 1, Exe: "/usr/local/bin/claude", Args: "claude", Start: c.Now().Add(-30 * time.Hour), RSSMB: 300},
+		510: {PID: 510, PPID: 500, Exe: "node", Args: "node mcp-server", Start: c.Now().Add(-30 * time.Hour), RSSMB: 90},
+	}
+	m.checkLiveness(procs, c.Now())
+	res := m.withLeftovers(nil, procs)
+	if len(res) != 1 || res[0].Kind != model.RKStaleAgent || res[0].MemMB < 390 || discover.CanAutoStop(res[0]) {
+		t.Fatalf("stale agent not listed as ask-only with its subtree: %+v", res)
+	}
+	// One under a terminal is not stale, however quiet.
+	procs[400] = &sys.Proc{PID: 400, PPID: 1, Exe: "/Applications/Warp.app/Contents/MacOS/stable"}
+	procs[500].PPID = 400
+	m.checkLiveness(procs, c.Now())
+	if len(m.withLeftovers(nil, procs)) != 0 {
+		t.Fatal("an agent in a terminal was listed as stale")
+	}
+}
+
+func TestMCPServerOfAGoneAgentIsCollected(t *testing.T) {
+	m, c := newTest(t, 8)
+	t0 := c.Now().Add(-10 * time.Hour)
+	procs := map[int]*sys.Proc{
+		1:   {PID: 1, Exe: "/sbin/launchd"},
+		700: {PID: 700, PPID: 1, Exe: "node", Args: "node /x/mcp-server-github/index.js", Start: t0, RSSMB: 90},
+	}
+	fakeInfos(m, map[int]sys.ProcInfo{700: {Agent: "claude"}}) // only CLAUDECODE=1 in its environment
+	// A Claude Code started later cannot be the one that spawned it.
+	procs[500] = &sys.Proc{PID: 500, PPID: 1, Exe: "/usr/local/bin/claude", Args: "claude", Start: t0.Add(time.Hour)}
+	m.checkLiveness(procs, c.Now())
+	if lo := m.st.Leftovers["700"]; lo == nil || lo.Session != "claude-unknown" {
+		t.Fatalf("an MCP server whose agent is gone was not collected: %+v", m.st.Leftovers)
+	}
+	// With an older Claude Code still running, it may be that one's: leave it.
+	m.st.Leftovers = nil
+	procs[500].Start = t0.Add(-time.Hour)
+	m.checkLiveness(procs, c.Now())
+	if len(m.st.Leftovers) != 0 {
+		t.Fatal("an MCP server that a running agent may own was collected")
+	}
+}
+
+func TestAgentInsideAnAppIsAnAgentNotYou(t *testing.T) {
+	m, _ := newTest(t, 8)
+	m.mu.Lock()
+	c := m.resolve(facts{pid: 900, gui: true, app: "Cursor.app"}, &api.Req{Via: "hook", Agent: "cursor", Session: "conv-1"})
+	m.mu.Unlock()
+	if c.Human || c.Agent != "cursor" || c.Session != "conv-1" {
+		t.Fatalf("Cursor's agent passed for a person: %+v", c)
+	}
+	// Without the hook's word it is you; claiming to be you from an agent gets nothing.
+	m.mu.Lock()
+	you := m.resolve(facts{pid: 901, gui: true, app: "Cursor.app"}, &api.Req{})
+	under := m.resolve(facts{pid: 902, agentPID: 500, agent: "codex"}, &api.Req{Via: "hook", Agent: "you", Session: "you"})
+	m.mu.Unlock()
+	if !you.Human || under.Human || under.Agent != "codex" {
+		t.Fatalf("you=%+v under-agent=%+v", you, under)
 	}
 }

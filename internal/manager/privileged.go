@@ -143,6 +143,10 @@ func (m *Manager) setPriority(c api.Caller, r api.Req) (any, []Effect, error) {
 func (m *Manager) setConfig(c api.Caller, r api.Req) (any, []Effect, error) {
 	var changes []string
 	cfg := m.cfg
+	cfg.AutoStop = map[string]bool{}
+	for k, v := range m.cfg.AutoStop {
+		cfg.AutoStop[k] = v
+	}
 	if r.DryRun != nil {
 		cfg.DryRun = *r.DryRun
 		changes = append(changes, fmt.Sprintf("dry_run=%v", cfg.DryRun))
@@ -163,6 +167,17 @@ func (m *Manager) setConfig(c api.Caller, r api.Req) (any, []Effect, error) {
 		cfg.IdleMinutes = r.IdleMinutes
 		changes = append(changes, fmt.Sprintf("idle=%dm", r.IdleMinutes))
 	}
+	if len(r.AutoStop) > 0 {
+		ch, err := m.applyAutoStop(&cfg, r.AutoStop)
+		if err != nil {
+			return nil, nil, err
+		}
+		changes = append(changes, ch...)
+	}
+	if r.RecordTrace != nil {
+		cfg.RecordTrace = *r.RecordTrace
+		changes = append(changes, fmt.Sprintf("record_trace=%v", cfg.RecordTrace))
+	}
 	if r.NeverStop != nil {
 		cfg.NeverStop = nil
 		for _, x := range r.NeverStop {
@@ -181,6 +196,7 @@ func (m *Manager) setConfig(c api.Caller, r api.Req) (any, []Effect, error) {
 	m.cfg = cfg
 	m.cfgDirty = true
 	m.applyLogLevel()
+	m.applyRecording()
 	m.event("CONFIG %s", strings.Join(changes, " "))
 	return m.cfg, nil, nil
 }
@@ -241,7 +257,7 @@ func (m *Manager) restore(c api.Caller, r api.Req) (any, []Effect, error) {
 	}
 	kind := model.ResourceToLease[res.Kind]
 	now := m.now()
-	if ok, why, pos := m.admit(c.Session, kind, res.MemMB, now); !ok {
+	if ok, why, pos := m.admit(model.Waiter{Session: c.Session, Agent: c.Agent, Kind: kind, NeedMB: res.MemMB, Via: r.Via, Retry: true}, now); !ok {
 		return &api.AcquireResp{Reason: why, Queue: pos}, nil, nil
 	}
 	purpose := r.Purpose
