@@ -37,11 +37,16 @@ func main() {
 			os.Exit(1)
 		}
 	case "hook":
-		event := ""
+		event, agent := "", ""
 		if len(os.Args) > 2 {
 			event = os.Args[2]
 		}
-		hook.Run(event)
+		for i := 3; i+1 < len(os.Args); i++ {
+			if os.Args[i] == "--agent" {
+				agent = os.Args[i+1]
+			}
+		}
+		hook.Run(event, agent)
 	case "mcp":
 		if err := mcp.Serve(os.Stdin, os.Stdout, version); err != nil {
 			fmt.Fprintln(os.Stderr, "agentrm mcp:", err)

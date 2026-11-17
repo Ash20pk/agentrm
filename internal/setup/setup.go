@@ -43,7 +43,7 @@ func ShimDir() string            { return filepath.Join(store.Dir(), "shims") }
 
 // Our hook commands end in "hook <event>" (protocol 1) or "hook <event> --proto N". Matching
 // on that shape, not on the binary's name, finds them wherever AgentRM is installed.
-var hookRe = regexp.MustCompile(`\shook\s+(pre|post|prompt|end)(\s+--proto\s+\d+)?\s*$`)
+var hookRe = regexp.MustCompile(`\shook\s+(pre|post|prompt|end)(\s+--proto\s+\d+)?(\s+--agent\s+\w+)?\s*$`)
 
 func isOurHook(h any) bool {
 	m, ok := h.(map[string]any)
@@ -103,7 +103,7 @@ func backup(path string, b []byte) error {
 	return os.WriteFile(path+".agentrm-backup-"+time.Now().Format("20060102-150405.000000"), b, 0o600)
 }
 
-var hookEvents = []struct{ event, matcher, arg string }{
+var hookEvents = []hookEvent{
 	{"PreToolUse", "Bash", "pre"},
 	{"PostToolUse", "*", "post"},
 	{"UserPromptSubmit", "", "prompt"},
@@ -248,7 +248,9 @@ you run may be checked by it (and refused when the machine is short of memory).
   Kinds: cluster compose docker-build cargo-build gradle xcode-build simulator emulator vm model
   loadtest server browser. Release it with ` + "`agentrm release <lease id>`" + ` when done.
 - If a command is refused by AgentRM, do not try to get around it. Tell the user what it said,
-  or free something you hold.
+  or free something you hold. If it says you are queued, do not retry in a loop: run
+  ` + "`agentrm acquire --kind <kind> --purpose \"<why>\" --wait`" + `, which returns when the lease is
+  yours, then run the command again.
 - At the start of each task run ` + "`agentrm inbox`" + ` and answer every question:
   ` + "`agentrm claim <resource> --purpose \"<why>\"`" + ` for what you use, ` + "`agentrm disown <resource>`" + ` for what you don't.
 `

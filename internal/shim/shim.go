@@ -37,7 +37,7 @@ func Run(name string, args []string) int {
 		return 127
 	}
 	_, agent, _ := sys.QuickAncestry(os.Getppid())
-	if agent == "" || sys.Hooked(agent) {
+	if agent == "" || sys.Hooked(agent) || setup.AgentHooksInstalled(agent) {
 		return execReal(real, name, args)
 	}
 	cmdline := name + " " + strings.Join(quoteAll(args), " ")
@@ -49,7 +49,7 @@ func Run(name string, args []string) int {
 	}
 	if !resp.Acquire.Granted {
 		fmt.Fprintf(os.Stderr, "agentrm refused a %s lease for `%s`: %s\n"+
-			"Free something you hold (agentrm release <lease>), or wait and retry. Do not try to get around this check.\n",
+			"If you hold something you no longer need, free it (agentrm release <lease>). Do not try to get around this check.\n",
 			resp.Kind, cmdline, resp.Acquire.Reason)
 		return ExitRefused
 	}
