@@ -19,30 +19,10 @@ type Proc struct {
 	Start time.Time
 }
 
-// ListProcs reads the whole process table.
-func ListProcs() map[int]*Proc {
-	out, err := Run(5*time.Second, "ps", "-axww", "-o", "pid=,ppid=,rss=,%cpu=,etime=,args=")
-	if err != nil && out == "" {
-		return nil
-	}
-	now := time.Now().Truncate(time.Second)
-	procs := map[int]*Proc{}
-	for _, l := range strings.Split(out, "\n") {
-		f := strings.Fields(l)
-		if len(f) < 6 {
-			continue
-		}
-		pid, _ := strconv.Atoi(f[0])
-		ppid, _ := strconv.Atoi(f[1])
-		rss, _ := strconv.ParseFloat(f[2], 64)
-		cpu, _ := strconv.ParseFloat(f[3], 64)
-		p := &Proc{PID: pid, PPID: ppid, RSSMB: rss / 1024, CPU: cpu, Exe: f[5], Args: strings.Join(f[5:], " ")}
-		if el, ok := ParseElapsed(f[4]); ok {
-			p.Start = now.Add(-el)
-		}
-		procs[pid] = p
-	}
-	return procs
+// CompleteTable reports whether a process table looks whole: it has launchd and the process
+// that read it. A table missing either was cut short.
+func CompleteTable(procs map[int]*Proc, self int) bool {
+	return procs[1] != nil && procs[self] != nil
 }
 
 // ParseElapsed reads ps's etime column: [[dd-]hh:]mm:ss.
@@ -175,9 +155,8 @@ func GUIAncestor(procs map[int]*Proc, pid int) (found bool, app string, viaAgent
 		if p == nil {
 			return false, "", false
 		}
-		if i := strings.Index(p.Exe, ".app/Contents/"); i >= 0 {
-			app = filepath.Base(p.Exe[:i+4])
-			return true, app, strings.Contains(p.Exe, "/AgentRM.app/Contents/")
+		if app, ok := guiApp(p.Exe); ok {
+			return true, app, strings.Contains(p.Exe, "/AgentRM.app/Contents/") || app == "agentrm-app"
 		}
 		pid = p.PPID
 	}
@@ -220,25 +199,26 @@ func SubtreeRSS(procs map[int]*Proc) map[int]float64 {
 	return out
 }
 
-// Cwds returns the working directory of each pid, in one lsof call.
-func Cwds(pids []int) map[int]string {
-	out := map[int]string{}
-	if len(pids) == 0 {
-		return out
+// linuxGUI are the terminals, editors and desktop apps a person works in on Linux: what an
+// .app bundle is on macOS.
+var linuxGUI = map[string]bool{
+	"gnome-terminal-server": true, "konsole": true, "xterm": true, "alacritty": true, "kitty": true, "wezterm-gui": true,
+	"foot": true, "tilix": true, "terminator": true, "xfce4-terminal": true, "ghostty": true, "warp-terminal": true,
+	"code": true, "cursor": true, "zed": true, "zeditor": true, "idea": true, "goland": true, "agentrm-app": true,
+}
+
+// guiApp says whether exe is an app a person works in, and which.
+func guiApp(exe string) (string, bool) {
+	if i := strings.Index(exe, ".app/Contents/"); i >= 0 {
+		return filepath.Base(exe[:i+4]), true
 	}
-	ps := make([]string, len(pids))
-	for i, p := range pids {
-		ps[i] = strconv.Itoa(p)
+	if base := filepath.Base(exe); linuxGUI[base] {
+		return base, true
 	}
-	s, _ := Run(5*time.Second, "lsof", "-a", "-d", "cwd", "-Fpn", "-p", strings.Join(ps, ","))
-	pid := 0
-	for _, l := range strings.Split(s, "\n") {
-		switch {
-		case strings.HasPrefix(l, "p"):
-			pid, _ = strconv.Atoi(l[1:])
-		case strings.HasPrefix(l, "n") && pid != 0:
-			out[pid] = l[1:]
-		}
-	}
-	return out
+	return "", false
+}
+
+func isGUIApp(exe string) bool {
+	_, ok := guiApp(exe)
+	return ok
 }

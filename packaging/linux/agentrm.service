@@ -1,0 +1,22 @@
+# AgentRM daemon as a systemd user service (Linux).
+#
+#   install -Dm755 agentrm ~/.local/bin/agentrm
+#   install -Dm644 agentrm.service ~/.config/systemd/user/agentrm.service
+#   systemctl --user daemon-reload && systemctl --user enable --now agentrm
+#   agentrm setup claude        # hooks, as on macOS
+#
+# State, config and traces live in ~/.agentrm, as on macOS. There is no menu-bar app on Linux:
+# use `agentrm status`, `agentrm top` and `agentrm review`.
+[Unit]
+Description=AgentRM: a resource manager for coding agents
+After=default.target
+
+[Service]
+ExecStart=%h/.local/bin/agentrm daemon
+Restart=on-failure
+RestartSec=5
+# Pausing and stopping use signals to this user's processes only; no extra privileges.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target
