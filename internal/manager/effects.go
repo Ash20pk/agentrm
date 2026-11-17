@@ -106,6 +106,8 @@ func (m *Manager) applyEffects(results []EffectResult) {
 				continue
 			}
 			m.recordStopped(e.Res, e.Why, e.By, now)
+			m.noteGone(&e.Res, now)
+			m.yieldTaken(e.Res.ID, now)
 			if l := m.st.Leases[e.Res.LeaseID]; l != nil {
 				l.Resources = remove(l.Resources, e.Res.ID)
 			}

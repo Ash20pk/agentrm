@@ -7,6 +7,7 @@ struct WelcomeView: View {
     @Environment(\.dismissWindow) private var dismissWindow
     @State private var hooks = true
     @State private var shim = false
+    @State private var others = true
     @State private var cli = true
     @State private var showChange = false
 
@@ -17,6 +18,7 @@ struct WelcomeView: View {
                 Silk("First reading")
             }
             reading
+            if !store.leftBehind.isEmpty || !store.askOnlyLeftBehind.isEmpty { leaking }
             options
             Spacer(minLength: 0)
             HStack(spacing: 8) {
@@ -27,7 +29,7 @@ struct WelcomeView: View {
             }
         }
         .padding(22)
-        .frame(width: 640, height: showChange ? 640 : 520)
+        .frame(width: 640, height: (showChange ? 640 : 520) + (store.leftBehind.isEmpty && store.askOnlyLeftBehind.isEmpty ? 0 : 210))
         .background(Ink.bg)
         .foregroundStyle(Ink.text)
         .font(Face.body(14))
@@ -46,6 +48,46 @@ struct WelcomeView: View {
                 LEDMeter(segments: Array(repeating: .off, count: 16), height: 40, showScale: false)
                 Text("The background daemon is starting.").font(Face.body(13)).foregroundStyle(Ink.dim)
             }
+        }
+        .padding(14).panel()
+    }
+
+    /// What agents that already exited left running, found from their environments before any
+    /// setting is touched: the first thing worth seeing.
+    private var leaking: some View {
+        let left = store.leftBehind
+        let mb = left.reduce(0) { $0 + $1.mem_mb }
+        return VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text(left.isEmpty ? "Agents that already exited left these running"
+                                  : "Leaking right now: \(Fmt.gb(mb)) GB left by agents that already exited")
+                    .font(Face.body(15, .semibold))
+                Spacer()
+                if !left.isEmpty {
+                    Button("Collect \(left.count)") { store.collect() }.buttonStyle(.key(.go))
+                        .help("Stops them now. Each can be restored from the Stopped tab.")
+                }
+            }
+            ScrollView {
+                VStack(spacing: 0) {
+                    ForEach(left + store.askOnlyLeftBehind) { r in
+                        HStack(spacing: 10) {
+                            LampDot(color: r.ask_only == true ? Ink.scale : Lamp.nobody.color, glow: false)
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(r.name).font(Face.body(13, .semibold))
+                                Text(r.ask_only == true ? "An app an agent launched: AgentRM only asks about it." : r.detail)
+                                    .font(Face.body(11)).foregroundStyle(Ink.dim).lineLimit(1)
+                            }
+                            Spacer()
+                            Text("\(Fmt.gb(r.mem_mb)) GB").font(Face.mono(12))
+                        }
+                        .padding(.vertical, 5)
+                    }
+                }
+            }
+            .frame(maxHeight: 120)
+            Text("Found from what each agent leaves in its processes' environment. Collecting stops them now; everything stopped can be restored. Nothing else is touched in dry run.")
+                .font(Face.body(11)).foregroundStyle(Ink.label).fixedSize(horizontal: false, vertical: true)
         }
         .padding(14).panel()
     }
@@ -73,7 +115,8 @@ struct WelcomeView: View {
                 }
                 .frame(height: 110).padding(10).background(Ink.off)
             }
-            option($shim, "Codex, Gemini CLI, Aider, OpenCode, Cursor", "A PATH shim in front of docker, cargo and kind. You and Claude pass straight through.") { EmptyView() }
+            option($others, "Codex, Gemini CLI, Cursor", "Their hooks too, where installed: heavy commands ask first, and questions reach them.") { EmptyView() }
+            option($shim, "Aider, OpenCode and older agents", "A PATH shim in front of docker, cargo and kind. Agents with hooks pass straight through.") { EmptyView() }
             option($cli, "The agentrm command", "A link in ~/.local/bin for agents and your terminal.") { EmptyView() }
         }
         .panel()
@@ -101,6 +144,13 @@ struct WelcomeView: View {
     private func finish(install: Bool) {
         if install {
             if hooks { store.setup("claude", install: true) }
+            if others {
+                let home = FileManager.default.homeDirectoryForCurrentUser
+                for (agent, dir) in [("codex", ".codex"), ("gemini", ".gemini"), ("cursor", ".cursor")]
+                    where FileManager.default.fileExists(atPath: home.appendingPathComponent(dir).path) {
+                    store.setup(agent, install: true)
+                }
+            }
             if shim { store.setup("shim", install: true) }
             if cli { store.setup("path", install: true) }
         }

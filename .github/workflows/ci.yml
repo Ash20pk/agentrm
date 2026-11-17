@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go:
+    # AgentRM reads macOS process tables, kqueue and proc_info: test on macOS.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - name: vet
+        run: go vet ./...
+      - name: tests (race detector, property tests in full)
+        run: go test -race -count=1 ./...
+      - name: Linux build
+        run: GOOS=linux GOARCH=amd64 go build ./... && GOOS=linux GOARCH=amd64 go vet ./...
+
+  app:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: xcodegen
+        run: brew install xcodegen && cd app && xcodegen generate -q
+      - name: build (unsigned)
+        run: |
+          cd app
+          xcodebuild -project AgentRM.xcodeproj -scheme AgentRM -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" -derivedDataPath build build | tail -20

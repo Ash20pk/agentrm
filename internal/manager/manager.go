@@ -3,6 +3,7 @@
 package manager
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -24,6 +25,7 @@ import (
 	"agentrm/internal/shell"
 	"agentrm/internal/store"
 	"agentrm/internal/sys"
+	"agentrm/internal/trace"
 )
 
 type cmdRecord struct {
@@ -57,7 +59,7 @@ type Manager struct {
 
 	agentSessions   map[int]string
 	recent          map[string][]cmdRecord
-	hookSeen        time.Time
+	hookSeen        map[string]time.Time // agent kind -> last hook call
 	waiters         []*model.Waiter
 	swapRate        float64
 	lastSwapouts    float64
@@ -69,6 +71,18 @@ type Manager struct {
 	connSeen        map[string]map[string]bool // paused resource -> connections already seen
 	footBase        map[string]float64         // session -> idle footprint baseline (MB)
 	wouldDecided    map[string]bool            // dry-run decisions already recorded
+	missing         map[string]int             // session -> sweeps its agent process has been missing
+	infos           *infoCache                 // what each process was started with, and by which session
+	exits           *sys.ExitWatcher           // the kernel's word that an agent exited; nil in tests
+	stale           map[int]bool               // agent processes with no terminal, silent for hours
+	selfPID         int
+	rec             *trace.Writer                             // what the daemon sees, for replay; nil unless recording
+	onDecide        func(*model.Decision)                     // replay watches decisions as they are taken
+	onGrant         func(needMB, headroomMB float64)          // tests check every grant fits
+	backfilled      map[*model.Waiter]map[string]bool         // head of the queue -> sessions that went ahead of it
+	lastBackfill    bool                                      // the admission just decided was a backfill
+	footprint       func(pid int) (float64, bool)             // compressed memory included; nil in tests
+	parked          map[*model.Waiter][]chan *api.AcquireResp // queued request -> clients connected and waiting for it
 	self            sys.SelfUsage
 	tamper          tamperState
 	dockerEventsErr string
@@ -104,6 +118,8 @@ func New(o Options) *Manager {
 		agentSessions: map[int]string{}, recent: map[string][]cmdRecord{}, failed: map[string]error{},
 		activity: evidence.NewActivity(), dockerOrigin: map[string]origin{}, pending: map[string]string{},
 		connSeen: map[string]map[string]bool{}, footBase: map[string]float64{}, wouldDecided: map[string]bool{},
+		missing: map[string]int{}, hookSeen: map[string]time.Time{}, infos: newInfoCache(nil), stale: map[int]bool{}, selfPID: os.Getpid(),
+		parked: map[*model.Waiter][]chan *api.AcquireResp{}, backfilled: map[*model.Waiter]map[string]bool{},
 		kick: make(chan struct{}, 1), readFast: sys.ReadFast,
 	}
 	m.notify = o.Notify
@@ -132,6 +148,14 @@ func New(o Options) *Manager {
 	for _, p := range bad {
 		m.notes = append(m.notes, "extra_patterns: invalid pattern ignored: "+p)
 	}
+	m.infos = newInfoCache(sys.ReadProcInfo)
+	m.footprint = sys.Footprint
+	if w, err := sys.NewExitWatcher(); err == nil {
+		m.exits = w
+	} else {
+		m.notes = append(m.notes, "could not watch agent exits (sweeps will notice instead): "+err.Error())
+	}
+	m.applyRecording()
 	m.evlog = store.NewRotatingFile(filepath.Join(o.Dir, "events.log"), 5<<20, 3)
 	m.saver = store.NewSaver(o.Dir, time.Second, func(err error) { m.log.Error("state not saved", "err", err) })
 	// Keep only agent-process mappings whose process is still that agent.
@@ -205,8 +229,23 @@ func (m *Manager) persist() {
 	}
 }
 
+// applyRecording starts or stops the trace recorder to match the config. Must hold mu, or be
+// in New.
+func (m *Manager) applyRecording() {
+	switch {
+	case m.cfg.RecordTrace && m.rec == nil && m.dir != "":
+		m.rec = trace.NewWriter(trace.Dir(m.dir), max(1, m.cfg.TraceDays))
+	case !m.cfg.RecordTrace && m.rec != nil:
+		m.rec.Close()
+		m.rec = nil
+	}
+}
+
 // Close writes the state and marks a clean shutdown.
 func (m *Manager) Close() {
+	if m.rec != nil {
+		m.rec.Close()
+	}
 	m.persist()
 	if m.saver != nil {
 		m.saver.Close()
@@ -249,6 +288,10 @@ func (m *Manager) routes() map[string]handler {
 	return map[string]handler{
 		"/acquire":  m.acquire,
 		"/release":  m.release,
+		"/end":      m.end,
+		"/yield":    m.yield,
+		"/collect":  m.collect,
+		"/receipt":  m.receipt,
 		"/renew":    m.renew,
 		"/claim":    m.claim,
 		"/disown":   m.disown,
@@ -273,12 +316,33 @@ func (m *Manager) routes() map[string]handler {
 // Handle serves one request: it finds out who is calling (outside the lock), decides (under
 // it), runs any effects (outside it) and records their results (under it again).
 func (m *Manager) Handle(path string, peerPID int, req api.Req) (any, error) {
+	return m.HandleCtx(context.Background(), path, peerPID, req)
+}
+
+// HandleCtx is Handle for a caller that may go away: ctx ends when its connection does. Only a
+// request that waits (acquire with WaitSeconds) looks at it.
+func (m *Manager) HandleCtx(ctx context.Context, path string, peerPID int, req api.Req) (any, error) {
 	h, ok := m.routes()[path]
 	if !ok {
 		return nil, fmt.Errorf("unknown request %s", path)
 	}
 	facts := gatherFacts(peerPID)
+	req.Repo, req.Branch = "", ""
+	if req.Cwd != "" && (path == "/touch" || path == "/acquire" || path == "/renew" || path == "/claim") {
+		req.Repo, req.Branch = sys.GitHead(req.Cwd) // a file read: outside the lock
+	}
+	return m.handleFacts(ctx, path, h, facts, req)
+}
 
+// readOnly requests change nothing and are not recorded.
+var readOnly = map[string]bool{"/status": true, "/whoami": true, "/approval": true, "/receipt": true}
+
+// handleFacts serves a request from a caller already traced (live, or from a trace).
+func (m *Manager) handleFacts(ctx context.Context, path string, h handler, facts facts, req api.Req) (any, error) {
+	if m.rec != nil && !readOnly[path] {
+		m.rec.Write(trace.Frame{T: m.now(), Request: &trace.Request{Path: path, Req: req, Facts: trace.Facts{
+			PID: facts.pid, AgentPID: facts.agentPID, Agent: facts.agent, GUI: facts.gui, App: facts.app, ViaApp: facts.viaApp}}})
+	}
 	m.mu.Lock()
 	caller := m.resolve(facts, &req)
 	resp, effects, err := h(caller, req)
@@ -289,7 +353,14 @@ func (m *Manager) Handle(path string, peerPID int, req api.Req) (any, error) {
 		return nil, &ErrNeedsApproval{Approval: a}
 	}
 	m.dirty = true
+	var parked chan *api.AcquireResp
+	if a, ok := resp.(*api.AcquireResp); ok && path == "/acquire" && err == nil && req.WaitSeconds > 0 && !a.Granted && a.Queue > 0 {
+		parked = m.park(caller.Session, req.Kind)
+	}
 	m.mu.Unlock()
+	if parked != nil {
+		return m.awaitGrant(ctx, parked, caller, req)
+	}
 
 	if len(effects) > 0 {
 		results := RunEffects(effects)
@@ -319,7 +390,8 @@ func (m *Manager) status(c api.Caller, r api.Req) (any, []Effect, error) {
 		Waiters: m.liveWaiters(m.now()), Config: m.cfg, Leases: m.st.Leases, Resources: m.st.Resources,
 		Sessions: m.st.Sessions, Questions: m.st.Questions, LastSweep: m.lastSweep, Events: m.events,
 		Learned: m.st.Learned, Stopped: m.st.Stopped, Approvals: m.st.Approvals, Sources: src,
-		Self: m.self, StartedAt: m.started, Notes: m.notes,
+		Self: m.self, StartedAt: m.started, Notes: m.notes, Prediction: m.predictionScore(),
+		TrustLevels: m.trustLevels(m.now()),
 	}, nil, nil
 }
 

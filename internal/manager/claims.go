@@ -73,6 +73,7 @@ func (m *Manager) claim(c api.Caller, r api.Req) (any, []Effect, error) {
 		u := now.Add(minutes(r.UntilMinutes))
 		l.Until = &u
 	}
+	m.stampTask(l)
 	m.st.Leases[l.ID] = l
 	res.LeaseID, res.OrphanSince, res.Urgent = l.ID, nil, false
 	delete(m.st.Questions, res.ID)
@@ -134,6 +135,11 @@ func (m *Manager) touchCmd(c api.Caller, r api.Req) (any, []Effect, error) {
 	}
 	m.recent[c.Session] = rec
 	ids := evidence.TouchedBy(r.Cmd, r.Cwd, m.st.Resources, evidence.CurrentKubeContext())
+	m.yieldsSeeUse(c.Session, append(ids, m.stoppedTouchedBy(r.Cmd, r.Cwd)...), "", now)
+	m.noticeTaskEnd(c.Session, r.Cmd, now)
+	if kind := m.classifier.Classify(r.Cmd); kind != "" {
+		m.observeKind(c.Session, r.Cwd, kind, now)
+	}
 	resp := &api.TouchResp{Touched: ids}
 	var effects []Effect
 	for _, id := range ids {

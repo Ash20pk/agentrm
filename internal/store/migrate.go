@@ -42,6 +42,12 @@ func Migrate(st *model.State, now time.Time) []string {
 	if st.Approvals == nil {
 		st.Approvals = fresh.Approvals
 	}
+	if st.Leftovers == nil {
+		st.Leftovers = fresh.Leftovers
+	}
+	if st.Trees == nil {
+		st.Trees = fresh.Trees
+	}
 
 	// v0/v1 → v2: leases from before use tracking have no LastUsed; learned values below the
 	// minimum came from leases that never ran anything.

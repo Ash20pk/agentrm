@@ -16,6 +16,12 @@ const (
 	RKModel      = "model-server"
 	RKDatabase   = "database"
 	RKBrowser    = "headless-browser"
+	// RKLeftover is a process an agent started that kept running after the agent exited:
+	// re-parented to launchd, with no known kind. Found by the collector, not by discovery.
+	RKLeftover = "leftover-process"
+	// RKStaleAgent is an agent process with no terminal or app above it that has not been
+	// heard from in hours. Only ever asked about: it may be someone's tmux session.
+	RKStaleAgent = "stale-agent"
 )
 
 // Lease kinds.
@@ -85,6 +91,20 @@ type Resource struct {
 	PausedAt    *time.Time `json:"paused_at,omitempty"`   // frozen since then, not yet stopped
 	Urgent      bool       `json:"urgent,omitempty"`      // a blocked request needs its memory: stop, do not freeze
 	Restart     string     `json:"restart,omitempty"`     // how to bring it back after a stop
+	// Owner is the session that started or last held it, once that session is gone, and
+	// OwnerGoneAt when it went: the collector's strongest evidence that nobody needs it.
+	Owner       string     `json:"owner,omitempty"`
+	OwnerGoneAt *time.Time `json:"owner_gone_at,omitempty"`
+	// AskOnly: never paused or stopped by AgentRM, only asked about (an app an agent happened
+	// to launch, such as Docker Desktop; an agent process).
+	AskOnly bool `json:"ask_only,omitempty"`
+	// ReleasedIdle: its lease was released because its holder let it sit idle and did not
+	// answer (the idle_lease auto-stop level).
+	ReleasedIdle bool `json:"released_idle,omitempty"`
+	// RestartArgv, RestartEnv and Cwd are how a stopped leftover is started again: exactly
+	// the command, environment (without secrets) and directory it was running with.
+	RestartArgv []string `json:"restart_argv,omitempty"`
+	RestartEnv  []string `json:"restart_env,omitempty"`
 }
 
 type Lease struct {
@@ -113,6 +133,23 @@ type Lease struct {
 	Overran         bool    `json:"overran,omitempty"`
 	// Until is an end time the holder declared; past it the lease is released, not renewed.
 	Until *time.Time `json:"until,omitempty"`
+	// Offered is when the lease was granted from the queue, until its session takes it up. A
+	// lease nobody takes up goes to the next in the queue.
+	Offered *time.Time `json:"offered,omitempty"`
+	// The task it was granted for: the repository and branch its session was on. When the
+	// task looks finished (a pull request opened, the branch left), TaskDoneAt is set: the
+	// holder is asked, and unless the lease is used again it is released.
+	Repo        string     `json:"repo,omitempty"`
+	Branch      string     `json:"branch,omitempty"`
+	TaskDoneAt  *time.Time `json:"task_done_at,omitempty"`
+	TaskDoneWhy string     `json:"task_done_why,omitempty"`
+	// ExpectedEnd is when leases of this kind in this project usually end (learned);
+	// LikelyDone is set once it has outlived nine in ten of them and is idle.
+	ExpectedEnd *time.Time `json:"expected_end,omitempty"`
+	LikelyDone  bool       `json:"likely_done,omitempty"`
+	// Backfill: granted ahead of a larger waiting request, because it is expected to finish
+	// before that request could start.
+	Backfill bool `json:"backfill,omitempty"`
 }
 
 type Session struct {
@@ -129,6 +166,82 @@ type Session struct {
 	DistrustUntil time.Time `json:"distrust_until,omitempty"`
 	// Priority: 0 normal, 1 urgent (set by the user). Urgent sessions go ahead in the queue.
 	Priority int `json:"priority,omitempty"`
+	// AgentStart is when the agent process started: with AgentPID it tells a live agent from
+	// a reused PID.
+	AgentStart time.Time `json:"agent_start,omitempty"`
+	// EndedAt is when the session ended: it said so (SessionEnd), or its agent process exited.
+	// An ended session is no longer a root: nothing it held or started is kept alive by it.
+	EndedAt   *time.Time `json:"ended_at,omitempty"`
+	EndReason string     `json:"end_reason,omitempty"`
+	// Yields this session offered whose outcome is known, and how many of those it got wrong
+	// (said it was done, then used it again). Its later offers are weighted by the record.
+	YieldReports    int `json:"yield_reports,omitempty"`
+	YieldMisreports int `json:"yield_misreports,omitempty"`
+	// Where it is working now.
+	Repo   string `json:"repo,omitempty"`
+	Branch string `json:"branch,omitempty"`
+}
+
+// Honesty is how far a session's yield offers can be believed: Laplace-smoothed share of its
+// offers that turned out true (2/3 with no record, so one lie halves it).
+func (s *Session) Honesty() float64 {
+	return float64(s.YieldReports-s.YieldMisreports+2) / float64(s.YieldReports+3)
+}
+
+// Yield is a holder's answer to "what would giving up this lease cost you right now?", and what
+// happened after: whether it used the thing again, and how long bringing it back really took.
+type Yield struct {
+	ID             string     `json:"id"`
+	Lease          string     `json:"lease"`
+	Session        string     `json:"session"`
+	Kind           string     `json:"kind"`
+	Resources      []string   `json:"resources,omitempty"`
+	Cost           string     `json:"cost"` // none, low, high
+	RestartSeconds int        `json:"restart_seconds,omitempty"`
+	At             time.Time  `json:"at"`
+	Taken          *time.Time `json:"taken,omitempty"` // its lease was released or its resource stopped
+	UsedAgainAt    *time.Time `json:"used_again_at,omitempty"`
+	RestartBegan   *time.Time `json:"restart_began,omitempty"`
+	RestartedAt    *time.Time `json:"restarted_at,omitempty"`
+	Verdict        string     `json:"verdict,omitempty"` // true, false
+}
+
+// Prediction is the command-stream model (see manager/predict.go).
+type Prediction struct {
+	// Next[project][previous kind][next kind] counts transitions ("" is a session's start).
+	Next map[string]map[string]map[string]int `json:"next"`
+	// Lifetimes[kind@project] and [kind]: recent lease lifetimes, in minutes.
+	Lifetimes map[string][]float64 `json:"lifetimes"`
+	// Last is each session's last heavy kind.
+	Last map[string]string `json:"last"`
+	// Score: predictions made, right, and how the most-frequent-kind baseline did on the same.
+	Total    int `json:"total"`
+	Hits     int `json:"hits"`
+	BaseHits int `json:"base_hits"`
+}
+
+// Leftover is a process an ended session started that is still running.
+type Leftover struct {
+	PID     int       `json:"pid"`
+	Start   time.Time `json:"start"`
+	Session string    `json:"session"`
+	Agent   string    `json:"agent"`
+	Found   time.Time `json:"found"`
+	// How it was found: "tree" (seen under the agent) or "env" (the agent's session in its
+	// environment, for processes that detached before they were seen, or ended before AgentRM ran).
+	Via     string   `json:"via,omitempty"`
+	AskOnly bool     `json:"ask_only,omitempty"`
+	Argv    []string `json:"argv,omitempty"`
+	Env     []string `json:"env,omitempty"`
+	Cwd     string   `json:"cwd,omitempty"`
+}
+
+// TreeProc is one process an agent started: which process (PID and start) and the most memory
+// it was seen using. The peak matters because macOS compresses an idle process's memory, so a
+// leftover that sits idle soon shows a fraction of what it holds.
+type TreeProc struct {
+	Start  time.Time `json:"start"`
+	PeakMB float64   `json:"peak_mb,omitempty"`
 }
 
 type Question struct {
@@ -184,6 +297,23 @@ type State struct {
 	Approvals map[string]*Approval `json:"approvals"`
 	// Decisions records each would-pause/would-stop decision for review.
 	Decisions []*Decision `json:"decisions"`
+	// Leftovers are processes ended sessions left running, keyed by PID.
+	Leftovers map[string]*Leftover `json:"leftovers,omitempty"`
+	// Trees is, per live session, every process its agent started, so a daemon restart does
+	// not forget what has detached.
+	Trees map[string]map[int]TreeProc `json:"trees,omitempty"`
+	// Yields are recent answers to "what would giving it up cost you?" (the newest 200).
+	Yields []*Yield `json:"yields,omitempty"`
+	// RestartSeconds is, per resource kind, how long bringing one back took, as measured.
+	RestartSeconds map[string]float64 `json:"restart_seconds,omitempty"`
+	// Predict is what the command stream has taught: which heavy kind follows which, per
+	// project, and how long leases live.
+	Predict *Prediction `json:"predict,omitempty"`
+	// IdleGaps is, per resource kind, how long things sat idle before being used again, in
+	// minutes (-1: never used again). Learned stop timing works from it.
+	IdleGaps map[string][]float64 `json:"idle_gaps,omitempty"`
+	// LastReceipt is when the weekly receipt was last sent.
+	LastReceipt time.Time `json:"last_receipt,omitempty"`
 }
 
 // Decision is one pause or stop decision (taken, or that would have been taken in dry run),
@@ -197,15 +327,18 @@ type Decision struct {
 	MemMB    float64   `json:"mem_mb"`
 	Why      string    `json:"why"`
 	DryRun   bool      `json:"dry_run"`
-	Verdict  string    `json:"verdict,omitempty"` // right, wrong, or empty when not reviewed
-	Note     string    `json:"note,omitempty"`
+	// Category is the auto-stop level it belongs to: owner_gone, unclaimed, idle_lease.
+	Category string `json:"category,omitempty"`
+	Verdict  string `json:"verdict,omitempty"` // right, wrong, or empty when not reviewed
+	Note     string `json:"note,omitempty"`
 }
 
 func NewState() State {
 	return State{Version: StateVersion, Leases: map[string]*Lease{}, Sessions: map[string]*Session{},
 		Resources: map[string]*Resource{}, Questions: map[string]*Question{}, Pinned: map[string]bool{},
 		Touches: map[string]map[string]time.Time{}, Learned: map[string]float64{}, LearnedDev: map[string]float64{},
-		AgentSessions: map[string]string{}, Approvals: map[string]*Approval{}}
+		AgentSessions: map[string]string{}, Approvals: map[string]*Approval{}, Leftovers: map[string]*Leftover{},
+		Trees: map[string]map[int]TreeProc{}}
 }
 
 type Event struct {
@@ -222,4 +355,18 @@ type Waiter struct {
 	Since    time.Time `json:"since"`
 	LastSeen time.Time `json:"last_seen"`
 	Priority int       `json:"priority,omitempty"`
+	// What was asked for, so the lease can be granted when it fits without being asked again.
+	Agent        string `json:"agent,omitempty"`
+	Purpose      string `json:"purpose,omitempty"`
+	Cmd          string `json:"cmd,omitempty"`
+	Cwd          string `json:"cwd,omitempty"`
+	Via          string `json:"via,omitempty"`
+	TTLMinutes   int    `json:"ttl_minutes,omitempty"`
+	UntilMinutes int    `json:"until_minutes,omitempty"`
+	Declared     bool   `json:"declared,omitempty"`
+	// Retry marks a request only its own retry can complete (a restore has to start the thing
+	// as well), so no lease is granted for it from the queue.
+	Retry bool `json:"retry,omitempty"`
+	// Pressed is when holders were last pressed to make room for it.
+	Pressed time.Time `json:"-"`
 }

@@ -58,7 +58,7 @@ func Handler(m *manager.Manager) http.Handler {
 			writeJSON(w, http.StatusBadRequest, api.Error{Error: "bad request: " + err.Error()})
 			return
 		}
-		resp, err := m.Handle(r.URL.Path, sys.PeerFrom(r.Context()), req)
+		resp, err := m.HandleCtx(r.Context(), r.URL.Path, sys.PeerFrom(r.Context()), req)
 		var na *manager.ErrNeedsApproval
 		switch {
 		case errors.As(err, &na):

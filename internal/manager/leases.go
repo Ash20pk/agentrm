@@ -26,6 +26,9 @@ func (m *Manager) touchSession(id, agent, cwd string) *model.Session {
 		s.Cwd = cwd
 	}
 	s.LastSeen = m.now()
+	if s.EndedAt != nil && !strings.HasPrefix(s.EndReason, "cleared:") {
+		m.reviveSession(s) // it is talking again: resumed, or its end was a false alarm
+	}
 	return s
 }
 
@@ -43,60 +46,78 @@ func (m *Manager) acquire(c api.Caller, r api.Req) (any, []Effect, error) {
 			cwd = s.Cwd
 		}
 	}
-	// A session that already holds a lease of this kind reuses it.
+	// A session that already holds a lease of this kind reuses it. That is also how a lease
+	// granted from the queue is taken up.
 	for _, l := range m.st.Leases {
 		if l.Session == c.Session && l.Kind == r.Kind {
 			l.Expires = now.Add(minutes(l.TTL))
 			l.LastUsed = now
+			m.takeUp(l)
+			m.dropWaiter(c.Session, r.Kind)
 			return &api.AcquireResp{Granted: true, Lease: l, Reused: true}, nil, nil
 		}
 	}
+	m.yieldsSeeUse(c.Session, nil, r.Kind, now)
 	memGB := m.effectiveGB(r.Kind, cwd, r.MemGB, c.Session, now)
 	fast := m.readFast() // pressure, load and disk right now, not as of the last sweep
 	m.mem.PressureLevel, m.mem.Load1, m.mem.Cores, m.mem.DiskFreeGB = fast.PressureLevel, fast.Load1, fast.Cores, fast.DiskFreeGB
-	if model.DiskKinds[r.Kind] && m.mem.DiskFreeGB >= 0 && m.mem.DiskFreeGB < m.cfg.MinDiskGB {
-		return &api.AcquireResp{Reason: fmt.Sprintf(
-			"the disk is nearly full (%.1f GB free on /, minimum %.0f GB). Prune Docker images or build caches first",
-			m.mem.DiskFreeGB, m.cfg.MinDiskGB)}, nil, nil
+	if why := m.busy(r.Kind); why != "" {
+		return &api.AcquireResp{Reason: why}, nil, nil
 	}
-	if model.CPUKinds[r.Kind] && m.mem.Cores > 0 && m.mem.Load1 > float64(m.mem.Cores)*m.cfg.MaxLoadPerCore {
-		return &api.AcquireResp{Reason: fmt.Sprintf("the CPU is saturated (load %.1f on %d cores, limit %.1f per core). %s",
-			m.mem.Load1, m.mem.Cores, m.cfg.MaxLoadPerCore, m.holders())}, nil, nil
-	}
-	if ok, why, pos := m.admit(c.Session, r.Kind, memGB*1024, now); !ok {
+	want := model.Waiter{Session: c.Session, Agent: c.Agent, Kind: r.Kind, NeedMB: memGB * 1024,
+		Purpose: r.Purpose, Cmd: trunc(r.Cmd, 200), Cwd: cwd, Via: r.Via,
+		TTLMinutes: r.TTLMinutes, UntilMinutes: r.UntilMinutes, Declared: r.MemGB > 0}
+	if ok, why, pos := m.admit(want, now); !ok {
 		m.kickSweep() // sample fast while someone waits
 		return &api.AcquireResp{Reason: why + ". " + m.holders(), Queue: pos}, nil, nil
 	}
-	ttl := r.TTLMinutes
-	if ttl == 0 {
-		ttl = m.cfg.DefaultTTLMinutes
-		if model.BuildKinds[r.Kind] {
-			ttl = m.cfg.BuildTTLMinutes
-		}
-	}
-	l := &model.Lease{ID: newID(), Session: c.Session, Agent: c.Agent, Kind: r.Kind, MemGB: memGB,
-		Purpose: r.Purpose, Cmd: trunc(r.Cmd, 200), Cwd: cwd, TTL: ttl, Created: now,
-		Expires: now.Add(minutes(ttl)), Verified: true, Evidence: "requested before starting", LastUsed: now,
-		Declared: r.MemGB > 0}
-	if r.UntilMinutes > 0 {
-		u := now.Add(minutes(r.UntilMinutes))
-		l.Until = &u
-	}
-	if s := m.st.Sessions[c.Session]; s != nil {
-		l.BaseFootprintMB = s.FootprintMB
-	}
-	m.st.Leases[l.ID] = l
-	m.event("GRANT %s %s %.1f GB to %s (%s): %s", l.ID, l.Kind, memGB, c.Session, c.Agent, l.Purpose)
+	l := m.grant(&want, now, "")
 	m.kickSweep() // bind what it starts as soon as it appears
 	return &api.AcquireResp{Granted: true, Lease: l}, nil, nil
 }
 
+// grant makes the lease w asks for. Must hold mu.
+func (m *Manager) grant(w *model.Waiter, now time.Time, note string) *model.Lease {
+	if m.onGrant != nil {
+		m.onGrant(w.NeedMB, m.headroomMB())
+	}
+	ttl := w.TTLMinutes
+	if ttl == 0 {
+		ttl = m.cfg.DefaultTTLMinutes
+		if model.BuildKinds[w.Kind] {
+			ttl = m.cfg.BuildTTLMinutes
+		}
+	}
+	l := &model.Lease{ID: newID(), Session: w.Session, Agent: w.Agent, Kind: w.Kind, MemGB: w.NeedMB / 1024,
+		Purpose: w.Purpose, Cmd: w.Cmd, Cwd: w.Cwd, TTL: ttl, Created: now,
+		Expires: now.Add(minutes(ttl)), Verified: true, Evidence: "requested before starting", LastUsed: now,
+		Declared: w.Declared}
+	if w.UntilMinutes > 0 {
+		u := now.Add(minutes(w.UntilMinutes))
+		l.Until = &u
+	}
+	if s := m.st.Sessions[w.Session]; s != nil {
+		l.BaseFootprintMB = s.FootprintMB
+	}
+	m.stampTask(l)
+	if m.lastBackfill {
+		l.Backfill, m.lastBackfill = true, false
+		note += " (backfilled ahead of a larger waiting request)"
+	}
+	m.st.Leases[l.ID] = l
+	m.event("GRANT %s %s %.1f GB to %s (%s)%s: %s", l.ID, l.Kind, l.MemGB, w.Session, w.Agent, note, l.Purpose)
+	return l
+}
+
 func (m *Manager) dropLease(l *model.Lease, why string) {
 	m.learn(l)
+	m.learnLifetime(l, m.now())
 	delete(m.st.Questions, "idle:"+l.ID)
+	delete(m.st.Questions, "grant:"+l.ID)
+	idle := strings.HasPrefix(why, "idle for")
 	for _, rid := range l.Resources {
 		if r := m.st.Resources[rid]; r != nil && r.LeaseID == l.ID {
-			r.LeaseID = ""
+			r.LeaseID, r.ReleasedIdle = "", idle
 		}
 	}
 	delete(m.st.Leases, l.ID)
@@ -118,6 +139,7 @@ func (m *Manager) release(c api.Caller, r api.Req) (any, []Effect, error) {
 			}
 		}
 		m.dropLease(l, "released by "+c.Session)
+		m.grantWaiters(m.now(), false) // what it was promised can go to the queue at once
 		return &api.CountResp{N: 1}, nil, nil
 	}
 	if c.Session == "detached" {
@@ -129,6 +151,9 @@ func (m *Manager) release(c api.Caller, r api.Req) (any, []Effect, error) {
 			m.dropLease(l, "released by "+c.Session)
 			n++
 		}
+	}
+	if n > 0 {
+		m.grantWaiters(m.now(), false)
 	}
 	return &api.CountResp{N: n}, nil, nil
 }
@@ -163,9 +188,15 @@ func (m *Manager) checkLeases(now time.Time) {
 	grace := minutes(m.cfg.GraceMinutes)
 	idle := minutes(m.cfg.IdleMinutes)
 	for _, l := range m.st.Leases {
+		if l.Offered != nil && (len(l.Resources) > 0 || m.materialisedMB(l) >= 50) {
+			m.takeUp(l) // something started under it
+		}
 		switch {
 		case now.After(l.Expires):
 			m.dropLease(l, "expired (not renewed or released)")
+			continue
+		case l.Offered != nil && now.Sub(*l.Offered) > m.grantHold():
+			m.dropLease(l, fmt.Sprintf("granted from the queue but not taken up in %d min", int(m.grantHold().Minutes())))
 			continue
 		case !model.BuildKinds[l.Kind] && l.Kind != model.KHeavy && len(l.Resources) == 0 &&
 			now.Sub(l.Created) > 15*time.Minute && m.materialisedMB(l) < 50:
@@ -203,6 +234,9 @@ func (m *Manager) checkLeases(now time.Time) {
 		l.PeakMB = max(l.PeakMB, mem)
 		l.HadResources = true
 		m.checkOverrun(l, now)
+		if m.checkTaskDone(l, used, now) {
+			continue
+		}
 		if used.After(l.LastUsed) {
 			l.LastUsed, l.IdleAsked = used, nil
 			delete(m.st.Questions, "idle:"+l.ID)
@@ -264,6 +298,17 @@ func (m *Manager) updateFootprints(procs map[int]*sys.Proc, now time.Time) {
 		if s == nil {
 			s = &model.Session{ID: id, Agent: kind, LastSeen: now}
 			m.st.Sessions[id] = s
+		}
+		if p := procs[apid]; p != nil && (s.AgentPID != apid || s.AgentStart.IsZero() || !sys.SameProcess(p, s.AgentStart)) {
+			if s.EndedAt != nil && s.AgentPID == apid {
+				// Same ID, new process (a PID reused by the same kind of agent): a new session.
+				s.EndedAt, s.EndReason = nil, ""
+				m.event("SESSION %s is a new %s process (pid %d)", short(id), kind, apid)
+			}
+			s.AgentStart = p.Start
+		}
+		if s.EndedAt != nil {
+			continue // it said it ended; its process is on its way out
 		}
 		s.FootprintMB, s.AgentPID = mb, apid
 		live[id] = true
