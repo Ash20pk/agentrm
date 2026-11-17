@@ -335,6 +335,10 @@ func (m *Manager) handOver(from, to string) {
 		m.st.Trees[to] = t
 		delete(m.st.Trees, from)
 	}
+	if nw := m.st.Sessions[to]; nw != nil && nw.EndedAt != nil {
+		// Handed back to a session that was cleared before (it is the one talking): live again.
+		nw.EndedAt, nw.EndReason = nil, ""
+	}
 	if old := m.st.Sessions[from]; old != nil {
 		now := m.now()
 		old.EndedAt, old.EndReason = &now, "cleared: continued as "+short(to)

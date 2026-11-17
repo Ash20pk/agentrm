@@ -51,7 +51,9 @@ func (m *Manager) resolve(f facts, req *api.Req) api.Caller {
 	c := api.Caller{PID: f.pid, AgentPID: f.agentPID, Agent: f.agent, App: f.app}
 	switch {
 	case f.agent != "":
-		if req.Via == "hook" {
+		// A hook's session ID names the agent it runs under, unless the hook says it is another
+		// agent's (run by hand, or from inside a different agent): then it renames nothing.
+		if req.Via == "hook" && (req.Agent == "" || req.Agent == f.agent) {
 			m.hookSeen[f.agent] = m.now()
 			if real := req.Session; real != "" && m.agentSessions[f.agentPID] != real {
 				m.learnSession(f.agentPID, real, f.agent)

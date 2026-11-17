@@ -483,3 +483,34 @@ func TestAgentInsideAnAppIsAnAgentNotYou(t *testing.T) {
 		t.Fatalf("you=%+v under-agent=%+v", you, under)
 	}
 }
+
+func TestHookForAnotherAgentRenamesNothing(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.agentSessions[500] = "real"
+	liveSession(m, "real", c.Now())
+	m.mu.Lock()
+	m.resolve(facts{pid: 900, agentPID: 500, agent: "claude"}, &api.Req{Via: "hook", Agent: "codex", Session: "other"})
+	m.mu.Unlock()
+	if m.agentSessions[500] != "real" || m.st.Sessions["real"].EndedAt != nil {
+		t.Fatalf("a hook claiming another agent renamed this one's session: %v %+v", m.agentSessions[500], m.st.Sessions["real"])
+	}
+}
+
+func TestClearedSessionHandedBackIsLive(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.agentSessions[500] = "a"
+	liveSession(m, "a", c.Now())
+	hook := func(s string) {
+		m.mu.Lock()
+		m.resolve(facts{pid: 900, agentPID: 500, agent: "claude"}, &api.Req{Via: "hook", Session: s})
+		m.mu.Unlock()
+	}
+	hook("b") // /clear
+	hook("a") // the first session talks again
+	if s := m.st.Sessions["a"]; s.EndedAt != nil {
+		t.Fatalf("the session that is talking is still ended: %+v", s)
+	}
+	if m.st.Sessions["b"].EndedAt == nil {
+		t.Fatal("the session it was handed back from is still live")
+	}
+}
