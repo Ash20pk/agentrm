@@ -2,7 +2,7 @@
 
 `~/.agentrm/config.json`, created on first run with defaults sized to this Mac's memory. AgentRM
 notices edits within a sweep and applies them (and tells you, in case it was not you). The app's
-Settings → Limits changes the common ones. Keys not listed are ignored.
+The Limits tab of the Activity window changes the common ones. Keys not listed are ignored.
 
 ## Memory and admission
 

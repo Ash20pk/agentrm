@@ -7,6 +7,12 @@ struct AgentRMApp: App {
     // Sparkle checks GitHub releases for signed updates (SUFeedURL / SUPublicEDKey in Info.plist).
     private let updates = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: nil, userDriverDelegate: nil)
 
+    init() {
+        #if DEBUG
+        Snapshot.runIfAsked()
+        #endif
+    }
+
     var body: some Scene {
         MenuBarExtra {
             MenuView(updater: updates.updater)
@@ -21,10 +27,11 @@ struct AgentRMApp: App {
         }
         .windowResizability(.contentSize)
 
-        Settings {
-            SettingsView(updater: updates.updater)
+        Window("AgentRM", id: "activity") {
+            ActivityView(updater: updates.updater)
                 .environmentObject(store)
         }
+        .defaultSize(width: 1060, height: 720)
     }
 }
 
@@ -34,7 +41,12 @@ struct MenuIcon: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Image(systemName: icon)
+        HStack(spacing: 3) {
+            Image(systemName: icon)
+            // A count only when something needs a decision; a quiet icon otherwise.
+            if attention > 0 { Text("\(attention)").monospacedDigit() }
+        }
+            .accessibilityElement(children: .ignore)
             .accessibilityLabel(label)
             .task {
                 if !store.onboarded {
@@ -43,6 +55,8 @@ struct MenuIcon: View {
                 }
             }
     }
+
+    private var attention: Int { store.pendingApprovals.count + store.orphans.count }
 
     private var icon: String {
         if store.status == nil { return "memorychip.fill" }
