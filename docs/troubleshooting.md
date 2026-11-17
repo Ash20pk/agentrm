@@ -11,8 +11,10 @@ daemon was not restarted. Quit and reopen AgentRM, or run
 `launchctl kickstart -k gui/$(id -u)/dev.agentrm.daemon`. Hooks keep working (they fail open).
 
 **An agent's command was refused** — the refusal says why (no memory, thrashing, full disk, busy
-CPU, fair share) and what AgentRM is reclaiming. `agentrm status` shows who holds what. The agent
-keeps its place in the queue for 90 seconds between tries. If it is urgent, mark the session:
+CPU, fair share) and what AgentRM is reclaiming. `agentrm status` shows who holds what. A request
+that is queued does not need retrying: the lease is granted when it fits, and the agent is told on
+its next tool call (or at once, if it ran `agentrm acquire --wait`). It then has
+`grant_hold_minutes` to start. If it is urgent, mark the session:
 `agentrm priority SESSION urgent` (you approve it in the app).
 
 **Something I am using was paused** — anything that uses it resumes it: a command naming it, a

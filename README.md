@@ -1,6 +1,6 @@
 # AgentRM
 
-A resource manager for coding agents on macOS: Activity Monitor for the agentic era.
+A resource manager for coding agents on macOS (and Linux): Activity Monitor for the agentic era.
 
 When several Claude Code, Codex or other agent sessions share one laptop, each starts clusters,
 builds, simulators and dev servers as if it had the machine to itself. Nobody stops them, memory
@@ -50,11 +50,18 @@ agentrm claim kind:dev --purpose "still debugging the ingress"
 agentrm resume srv:4242            # thaw something AgentRM paused
 agentrm restore kind:dev           # bring back something it stopped
 agentrm review                     # mark its decisions right or wrong
+agentrm collect                    # stop now what ended sessions left (restorable)
+agentrm receipt                    # the week: freed, found, waited, restored
+agentrm compare                    # AgentRM against a parent-PID reaper, on your recorded traces
 ```
 
 ## Docs
 
-- [How it decides](docs/how-it-works.md): admission, the queue, evidence, pause and stop
+- [How it decides](docs/how-it-works.md): admission, the queue, evidence, pause and stop,
+  garbage collection, cooperative preemption, learning from use
+- [Agents and the lease API](docs/agents.md): Claude Code, Codex, Gemini CLI, Cursor; orchestrators
+- [Traces and replay](docs/replay.md): measuring a policy on real days
+- [Design](docs/design.md): garbage collection for what coding agents leave behind
 - [Configuration](docs/config.md): every setting and file
 - [Troubleshooting](docs/troubleshooting.md)
 - [Threat model](docs/threat-model.md): what it defends against, and what it does not
