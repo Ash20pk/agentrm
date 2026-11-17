@@ -63,6 +63,12 @@ var tools = []tool{
 		obj(map[string]any{"lease_id": str("the lease to release")})},
 	{"agentrm_claim", "Claim something already running that you are using, so it is not paused or stopped.",
 		obj(map[string]any{"resource_id": str("e.g. kind:dev or srv:4242"), "purpose": str("why you need it")}, "resource_id", "purpose")},
+	{"agentrm_yield", "Answer AgentRM's question about what giving up one of your leases would cost you right now. Answer honestly: AgentRM checks afterwards and weighs your later answers by it.",
+		obj(map[string]any{
+			"lease_id":        str("the lease"),
+			"cost":            str("none (you are done with it: released now) | low (fine to stop; you can bring it back) | high (you are using it)"),
+			"restart_seconds": num("with low: about how long bringing it back would take"),
+		}, "lease_id", "cost")},
 	{"agentrm_disown", "Say that something AgentRM asked about is not yours.",
 		obj(map[string]any{"resource_id": str("the resource")}, "resource_id")},
 	{"agentrm_inbox", "Questions AgentRM has for you. Answer each with agentrm_claim or agentrm_disown.", obj(map[string]any{})},
@@ -148,6 +154,13 @@ func call(name string, a map[string]any) (string, bool) {
 			return "Refused: " + r.Reason + " Do not start the job.", true
 		}
 		return fmt.Sprintf("Granted lease %s (%s, %.1f GB). Release it with agentrm_release when done.", r.Lease.ID, r.Lease.Kind, r.Lease.MemGB), false
+	case "agentrm_yield":
+		req.LeaseID, req.Cost, req.RestartSeconds = s(a, "lease_id"), s(a, "cost"), int(n(a, "restart_seconds"))
+		var r api.CountResp
+		if err := api.Call("/yield", req, &r); err != nil {
+			return err.Error(), true
+		}
+		return "Noted: " + r.Note + ".", false
 	case "agentrm_release":
 		req.LeaseID = s(a, "lease_id")
 		var r api.CountResp
