@@ -13,6 +13,8 @@ import (
 	"agentrm/internal/api"
 	"agentrm/internal/model"
 	"agentrm/internal/setup"
+	"agentrm/internal/store"
+	"agentrm/internal/trace"
 )
 
 const usage = `agentrm — a resource manager for coding agents on this Mac
@@ -22,6 +24,8 @@ Leases
   agentrm release [LEASE] | --all             release a lease, or all of yours
   agentrm claim RESOURCE --purpose "why" [--until MIN]   adopt something already running
   agentrm disown RESOURCE                      "not mine", answering an orphan question
+  agentrm yield LEASE --cost none|low|high [--restart-seconds N]
+                                               what giving up a lease would cost you now (answers AgentRM)
   agentrm inbox                                questions waiting for you
   agentrm whoami                               who the daemon thinks you are
 
@@ -29,6 +33,14 @@ Looking
   agentrm status [--json] [--stopped] | top    memory, leases, what is running
   agentrm review [--all] [--json]              pause/stop decisions to mark right or wrong
   agentrm review mark ID right|wrong [--note "..."]
+  agentrm receipt [--days 7] [--json]          what AgentRM did: freed, found, waited, restored
+  agentrm collect                              stop now what ended sessions left (asks for approval)
+
+Measuring policies (see docs/replay.md)
+  agentrm record on|off                        keep a trace of what the daemon sees (~/.agentrm/traces)
+  agentrm replay [TRACE] [--policy agentrm|reaper] [--config FILE] [--json]
+                                               run a policy over a trace: wrong stops, memory freed, waits
+  agentrm compare [TRACE] [--config FILE]      AgentRM and a parent-PID reaper on the same trace
 
 Acting (pinning, settings and overriding others ask for approval in the app)
   agentrm stop RESOURCE                        stop something now (it can be restored)
@@ -39,8 +51,9 @@ Acting (pinning, settings and overriding others ask for approval in the app)
   agentrm config [--dry-run=true|false] [--grace MIN] [--headroom GB] [--idle MIN] [--pause MIN]
 
 Setup
-  agentrm setup claude|codex|path|shim [--uninstall]   hooks, Codex note, CLI link, PATH shim
-  agentrm setup preview claude                 what installing the hooks would change
+  agentrm setup claude|codex|gemini|cursor|path|shim [--uninstall]
+                                               an agent's hooks, the CLI link, or the PATH shim
+  agentrm setup preview claude|codex|gemini|cursor   what installing the hooks would change
   agentrm setup check [--json]                 what is installed, and what needs repair
   agentrm setup repair                         point everything at this copy of AgentRM
   agentrm setup uninstall                      remove everything AgentRM installed
@@ -62,7 +75,7 @@ func runCLI(cmd string, args []string) int {
 	mem := fs.Float64("mem", 0, "memory in GB (default: AgentRM's estimate)")
 	ttl := fs.Int("ttl", 0, "lease lifetime in minutes")
 	until := fs.Int("until", 0, "you need it for this many minutes; the lease ends then")
-	wait := fs.Bool("wait", false, "keep retrying until granted (max 30 min)")
+	wait := fs.Bool("wait", false, "if queued, stay until the lease is granted (max 30 min)")
 	all := fs.Bool("all", false, "all of yours / everything")
 	last := fs.Bool("last", false, "the most recent one")
 	asJSON := fs.Bool("json", false, "machine-readable output")
@@ -74,6 +87,12 @@ func runCLI(cmd string, args []string) int {
 	idle := fs.Int("idle", 0, "minutes unused before a holder is asked")
 	pause := fs.Int("pause", -1, "minutes frozen before an unclaimed resource is stopped (0 = stop directly)")
 	note := fs.String("note", "", "a note for a review mark")
+	policy := fs.String("policy", "agentrm", "replay: agentrm or reaper")
+	cost := fs.String("cost", "", "yield: none, low or high")
+	days := fs.Int("days", 7, "receipt: how many days back")
+	autoStop := fs.String("auto-stop", "", "config: level=on|off (owner_gone, unclaimed, idle_lease)")
+	restartSecs := fs.Int("restart-seconds", 0, "yield: how long bringing it back would take")
+	configFile := fs.String("config", "", "replay: a config.json to replay with (default: this Mac's)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -101,7 +120,10 @@ func runCLI(cmd string, args []string) int {
 		deadline := time.Now().Add(30 * time.Minute)
 		for {
 			var r api.AcquireResp
-			if err = api.Call("/acquire", req, &r); err != nil {
+			asked, held := time.Now(), req.WaitSeconds > 0
+			// With WaitSeconds the daemon keeps a queued request connected and answers when the
+			// lease is granted, so there is nothing to poll.
+			if err = api.CallTimeout(time.Duration(req.WaitSeconds)*time.Second+5*time.Second, "/acquire", req, &r); err != nil {
 				break
 			}
 			if r.Granted {
@@ -110,12 +132,20 @@ func runCLI(cmd string, args []string) int {
 				fmt.Printf("release it when done: agentrm release %s\n", r.Lease.ID)
 				break
 			}
-			if !*wait || time.Now().After(deadline) {
+			left := time.Until(deadline)
+			if !*wait || left <= 0 {
 				fmt.Fprintln(os.Stderr, "refused:", r.Reason)
 				return 2
 			}
-			fmt.Fprintf(os.Stderr, "waiting (number %d in the queue): %s\n", r.Queue, trunc(r.Reason, 160))
-			time.Sleep(20 * time.Second)
+			if req.WaitSeconds == 0 {
+				fmt.Fprintf(os.Stderr, "waiting (number %d in the queue): %s\n", r.Queue, trunc(r.Reason, 160))
+			}
+			req.WaitSeconds = max(1, int(left.Seconds()))
+			// Not queued (a full disk, a busy CPU), or a daemon that does not hold requests:
+			// it answered at once, so pace the retries here.
+			if held && time.Since(asked) < 5*time.Second {
+				time.Sleep(min(20*time.Second, left))
+			}
 		}
 	case "release":
 		req.LeaseID = arg(0)
@@ -141,6 +171,12 @@ func runCLI(cmd string, args []string) int {
 			}
 			fmt.Printf("%s is held by lease %s (%s: %s)\n", req.ResourceID, r.Lease.ID, v, r.Evidence)
 			fmt.Println("it stays held while you use it; unused for a while, you will be asked again")
+		}
+	case "yield":
+		req.LeaseID, req.Cost, req.RestartSeconds = arg(0), *cost, *restartSecs
+		var r api.CountResp
+		if err = api.Call("/yield", req, &r); err == nil {
+			fmt.Println(r.Note)
 		}
 	case "disown":
 		req.ResourceID = arg(0)
@@ -228,6 +264,10 @@ func runCLI(cmd string, args []string) int {
 		if *pause >= 0 {
 			req.PauseMinutes = pause
 		}
+		if *autoStop != "" {
+			level, v, _ := strings.Cut(*autoStop, "=")
+			req.AutoStop = map[string]bool{level: v == "on" || v == "true"}
+		}
 		var cfg model.Config
 		if err = callApproved("/config", req, &cfg); err == nil {
 			b, _ := json.MarshalIndent(cfg, "", "  ")
@@ -256,6 +296,34 @@ func runCLI(cmd string, args []string) int {
 		}
 	case "setup":
 		err = runSetup(arg(0), arg(1), *uninstall, *asJSON)
+	case "collect":
+		var r api.CountResp
+		if err = callApproved("/collect", req, &r); err == nil {
+			fmt.Printf("collecting %d thing(s) ended sessions left (%s)\n", r.N, r.Note)
+		}
+	case "receipt":
+		req.Days = *days
+		var r api.Receipt
+		if err = api.Call("/receipt", req, &r); err == nil {
+			if *asJSON {
+				b, _ := json.Marshal(r)
+				fmt.Println(string(b))
+				break
+			}
+			fmt.Printf("%s to %s: %s\n", r.Since.Format("Jan 2"), r.Until.Format("Jan 2"), r.Text)
+		}
+	case "record":
+		on := arg(0) == "on"
+		if !on && arg(0) != "off" {
+			return fail(fmt.Errorf("agentrm record on|off"))
+		}
+		req.RecordTrace = &on
+		var r model.Config
+		if err = callApproved("/config", req, &r); err == nil {
+			fmt.Printf("recording: %v (traces in %s, kept %d days)\n", r.RecordTrace, trace.Dir(store.Dir()), r.TraceDays)
+		}
+	case "replay", "compare":
+		err = runReplay(cmd, arg(0), *policy, *configFile, *asJSON)
 	default:
 		fmt.Print(usage)
 		return 2
@@ -319,8 +387,16 @@ func runSetup(what, sub string, uninstall, asJSON bool) error {
 	switch what {
 	case "claude":
 		return done(setup.SetupClaude(uninstall))
-	case "codex":
-		return done(setup.SetupCodex(uninstall))
+	case "codex", "gemini", "cursor":
+		if what == "codex" {
+			if err := setup.SetupCodex(uninstall); err != nil { // the AGENTS.md note
+				return err
+			}
+		}
+		if !uninstall {
+			fmt.Print(setup.PreviewAgentHooks(what))
+		}
+		return done(setup.SetupAgentHooks(what, uninstall))
 	case "path":
 		return done(setup.SetupPath(uninstall))
 	case "shim":
@@ -332,6 +408,10 @@ func runSetup(what, sub string, uninstall, asJSON bool) error {
 		}
 		return nil
 	case "preview":
+		if sub != "" && sub != "claude" {
+			fmt.Print(setup.PreviewAgentHooks(sub))
+			return nil
+		}
 		s, err := setup.PreviewClaude(uninstall)
 		if err == nil {
 			fmt.Print(s)
@@ -423,8 +503,12 @@ func printStatus(showStopped bool) error {
 	fmt.Printf("HEADROOM %.1f GB can be granted now (%.1f GB available - %.1f GB promised - %.1f GB kept free)%s\n",
 		max(0, st.HeadroomMB)/1024, m.AvailableMB/1024, st.PendingMB/1024, st.Config.HeadroomGB,
 		map[bool]string{true: "   [DRY RUN]"}[st.Config.DryRun])
-	fmt.Printf("DAEMON   %s · swept %s ago · itself %.0f MB, %.1f%% CPU, last sweep %.0f ms\n", st.DaemonVersion,
-		time.Since(st.LastSweep).Round(time.Second), st.Self.RSSMB, st.Self.CPUPercent, st.Self.SweepMS)
+	swept := "not swept yet (starting)"
+	if !st.LastSweep.IsZero() {
+		swept = "swept " + time.Since(st.LastSweep).Round(time.Second).String() + " ago"
+	}
+	fmt.Printf("DAEMON   %s · %s · itself %.0f MB, %.1f%% CPU, last sweep %.0f ms\n", st.DaemonVersion,
+		swept, st.Self.RSSMB, st.Self.CPUPercent, st.Self.SweepMS)
 	for src, why := range st.Sources {
 		if why != "" {
 			fmt.Printf("SOURCE   %s unavailable: %s (its resources are kept as last seen)\n", src, why)
@@ -463,6 +547,28 @@ func printStatus(showStopped bool) error {
 		}
 		fmt.Printf("  %-8s %s %-20s %5.1f GB  %-7s %-14s used %-8s ago  %s\n", l.ID, v, l.Kind, l.MemGB, l.Agent,
 			short(l.Session), time.Since(l.LastUsed).Round(time.Minute), trunc(l.Purpose, 50))
+		var notes []string
+		if l.ExpectedEnd != nil {
+			notes = append(notes, "usually ends "+l.ExpectedEnd.Format("15:04"))
+		}
+		if l.LikelyDone {
+			notes = append(notes, "probably finished")
+		}
+		if l.TaskDoneAt != nil {
+			notes = append(notes, "task finished: "+l.TaskDoneWhy)
+		}
+		if l.Branch != "" {
+			notes = append(notes, "branch "+l.Branch)
+		}
+		if l.Backfill {
+			notes = append(notes, "backfilled")
+		}
+		if len(notes) > 0 {
+			fmt.Printf("           %s\n", strings.Join(notes, " · "))
+		}
+	}
+	if st.Prediction != "" {
+		fmt.Printf("  (%s)\n", st.Prediction)
 	}
 
 	fmt.Println("\nRUNNING")
