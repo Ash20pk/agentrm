@@ -86,6 +86,7 @@ type Manager struct {
 	self            sys.SelfUsage
 	tamper          tamperState
 	dockerEventsErr string
+	returnProbes    []*returnProbe // stops whose effect on available memory is being measured
 	cfgDirty        bool
 
 	dirty    bool

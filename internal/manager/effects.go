@@ -105,6 +105,7 @@ func (m *Manager) applyEffects(results []EffectResult) {
 				m.event("STOP FAILED %s: %v", e.Res.ID, res.Err)
 				continue
 			}
+			m.noteStopped(e.Res, now)
 			m.recordStopped(e.Res, e.Why, e.By, now)
 			m.noteGone(&e.Res, now)
 			m.yieldTaken(e.Res.ID, now)

@@ -196,6 +196,7 @@ func (m *Manager) takeMem(mem sys.MemStats, now time.Time) {
 	}
 	m.lastSwapouts, m.lastSwapAt = mem.Swapouts, now
 	m.mem = mem
+	m.measureReturns(now)
 }
 
 // Sweep is the full pass: discovery, attribution, leases, orphans.

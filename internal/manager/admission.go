@@ -40,9 +40,14 @@ func (m *Manager) materialisedMB(l *model.Lease) float64 {
 		}
 	}
 	if len(l.Resources) == 0 {
-		// Builds and not-yet-visible resources: growth of the session's process tree since the grant.
-		if s := m.st.Sessions[l.Session]; s != nil {
-			used = max(0, s.FootprintMB-l.BaseFootprintMB)
+		// Builds and not-yet-visible resources: what the session started since the grant (an
+		// inferred lease: the growth of its whole tree).
+		if inferred(l) {
+			if s := m.st.Sessions[l.Session]; s != nil {
+				used = max(0, s.FootprintMB-l.BaseFootprintMB)
+			}
+		} else {
+			used = l.UsedMB
 		}
 	}
 	return used
@@ -455,8 +460,9 @@ func (m *Manager) reclaim(needMB float64, forSession string, now time.Time) stri
 			r.OrphanSince = &early
 		}
 		r.Urgent = true
-		freed += r.MemMB
-		done = append(done, fmt.Sprintf("unclaimed %s (%.1f GB)", r.ID, r.MemMB/1024))
+		back := r.MemMB * m.returnRatio(r.Source) // what macOS really gets back
+		freed += back
+		done = append(done, fmt.Sprintf("unclaimed %s (%.1f GB, ~%.1f GB back)", r.ID, r.MemMB/1024, back/1024))
 	}
 
 	type cand struct {
@@ -483,7 +489,9 @@ func (m *Manager) reclaim(needMB float64, forSession string, now time.Time) stri
 		over := m.cfg.MaxSessionShare > 0 && m.heldMB(l.Session) > share
 		rank := m.costRank(l)
 		if rank == 1 || !l.Verified || idle >= minIdle || over && idle >= minIdle/2 {
-			cands = append(cands, cand{l, m.materialisedMB(l), idle, over, p, rank})
+			// Releasing a lease frees its whole promise (what it has not taken yet stops being
+			// held back) as well as what it uses.
+			cands = append(cands, cand{l, max(l.MemGB*1024, m.materialisedMB(l)), idle, over, p, rank})
 		}
 	}
 	sortCands(cands, func(c cand) int { return c.rank }, func(a, b cand) bool {
@@ -559,7 +567,11 @@ func (m *Manager) estimateGB(kind, cwd string) float64 {
 			continue
 		}
 		if mb := m.st.Learned[key]; mb > 0 {
-			return max(max(mb+2*m.st.LearnedDev[key], mb*1.15)/1024, 0.25)
+			// The typical peak plus its spread, the spread capped at half the peak: one odd
+			// run (a clean build, a build measured with a simulator in its tree) must not
+			// double what every later build is charged. Real use is measured as it runs, and a
+			// build that goes over is caught by the pressure checks.
+			return max(max(mb+min(m.st.LearnedDev[key], mb/2), mb*1.15)/1024, 0.25)
 		}
 	}
 	if gb := m.cfg.KindMemGB[kind]; gb > 0 {

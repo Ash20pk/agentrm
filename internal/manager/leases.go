@@ -291,7 +291,12 @@ func (m *Manager) askHolder(l *model.Lease, now, deadline time.Time, lead string
 // process tree, not the command text, is the primary sign of heavy work. Must hold mu.
 func (m *Manager) updateFootprints(procs map[int]*sys.Proc, now time.Time) {
 	live := map[string]bool{}
-	for apid, mb := range sys.SubtreeRSS(procs) {
+	trees := sys.AgentTrees(procs)
+	for apid, tree := range trees {
+		mb := 0.0
+		for _, p := range tree {
+			mb += m.procMB(p)
+		}
 		kind := sys.AgentKind(procs[apid])
 		id := m.sessionOf(apid, kind)
 		s := m.st.Sessions[id]
@@ -320,11 +325,19 @@ func (m *Manager) updateFootprints(procs map[int]*sys.Proc, now time.Time) {
 	}
 	explained := map[string]bool{} // sessions whose growth a lease accounts for
 	for _, l := range m.st.Leases {
-		if len(l.Resources) == 0 {
+		if len(l.Resources) == 0 && !inferred(l) {
+			// A build: what it uses is what it started. Only processes started since the grant
+			// count, by footprint, so a simulator, a Gradle daemon or a dev server the session
+			// already had is not charged to the build.
 			if s := m.st.Sessions[l.Session]; s != nil {
-				l.PeakMB = max(l.PeakMB, s.FootprintMB-l.BaseFootprintMB)
+				l.UsedMB = m.usedSince(trees[s.AgentPID], l.Created.Add(-2*time.Second))
+				l.PeakMB = max(l.PeakMB, l.UsedMB)
 				m.checkOverrun(l, now)
 			}
+		}
+		// Growth soon after a grant is that lease's work, whatever kind it is (a Gradle build
+		// holds a daemon resource, and was being counted a second time as inferred heavy work).
+		if len(l.Resources) == 0 || now.Sub(l.Created) < minutes(m.cfg.BuildTTLMinutes) {
 			explained[l.Session] = true
 		}
 	}
@@ -398,4 +411,32 @@ func (m *Manager) lastCmd(session string) string {
 		return rec[len(rec)-1].Cmd
 	}
 	return ""
+}
+
+// inferred is a lease AgentRM recorded itself because a session's process tree grew.
+func inferred(l *model.Lease) bool {
+	return l.Kind == model.KHeavy && strings.HasPrefix(l.Purpose, "inferred:")
+}
+
+// procMB is what a process holds: its footprint where that can be read (what Activity Monitor
+// shows: shared pages counted once, compressed and swapped pages included), else its resident
+// size.
+func (m *Manager) procMB(p *sys.Proc) float64 {
+	if m.footprint != nil {
+		if fp, ok := m.footprint(p.PID); ok {
+			return fp
+		}
+	}
+	return p.RSSMB
+}
+
+// usedSince is what the processes of a tree started at or after t hold now.
+func (m *Manager) usedSince(tree []*sys.Proc, t time.Time) float64 {
+	total := 0.0
+	for _, p := range tree {
+		if !p.Start.IsZero() && !p.Start.Before(t) {
+			total += m.procMB(p)
+		}
+	}
+	return total
 }

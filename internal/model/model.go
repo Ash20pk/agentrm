@@ -129,6 +129,9 @@ type Lease struct {
 	LastUsed  time.Time  `json:"last_used"`
 	IdleAsked *time.Time `json:"idle_asked,omitempty"`
 	PeakMB    float64    `json:"peak_mb,omitempty"`
+	// UsedMB is what a build lease uses now: the footprint of what its session started since
+	// the grant.
+	UsedMB float64 `json:"used_mb,omitempty"`
 	// BaseFootprintMB is the session's process-tree memory when the lease was granted.
 	BaseFootprintMB float64 `json:"base_footprint_mb,omitempty"`
 	Declared        bool    `json:"declared,omitempty"` // the holder chose MemGB itself
@@ -307,6 +310,11 @@ type State struct {
 	Trees map[string]map[int]TreeProc `json:"trees,omitempty"`
 	// Yields are recent answers to "what would giving it up cost you?" (the newest 200).
 	Yields []*Yield `json:"yields,omitempty"`
+	// ReturnRatio is, per discovery source, how much of a stopped resource's counted memory
+	// the Mac really got back, as measured (Docker Desktop's VM keeps much of what its
+	// containers free); ReturnN is how many stops that is from.
+	ReturnRatio map[string]float64 `json:"return_ratio,omitempty"`
+	ReturnN     map[string]int     `json:"return_n,omitempty"`
 	// RestartSeconds is, per resource kind, how long bringing one back took, as measured.
 	RestartSeconds map[string]float64 `json:"restart_seconds,omitempty"`
 	// Predict is what the command stream has taught: which heavy kind follows which, per

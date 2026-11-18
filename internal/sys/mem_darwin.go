@@ -30,7 +30,7 @@ func ReadMem() MemStats {
 			}
 		}
 		mb := func(k string) float64 { return pages[k] * pageSize / 1048576 }
-		m.AvailableMB = mb("Pages free") + mb("Pages inactive") + mb("Pages purgeable") + mb("Pages speculative")
+		m.AvailableMB = availableMB(mb)
 		m.CompressedMB = mb("Pages occupied by compressor")
 		m.Swapouts = mb("Swapouts")
 		m.WiredMB = mb("Pages wired down")

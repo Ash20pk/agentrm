@@ -166,6 +166,19 @@ func GUIAncestor(procs map[int]*Proc, pid int) (found bool, app string, viaAgent
 // SubtreeRSS sums the resident memory of every descendant of each agent process.
 func SubtreeRSS(procs map[int]*Proc) map[int]float64 {
 	out := map[int]float64{}
+	for a, ps := range AgentTrees(procs) {
+		out[a] = 0
+		for _, p := range ps {
+			out[a] += p.RSSMB
+		}
+	}
+	return out
+}
+
+// AgentTrees lists the descendants of each agent process (every agent process has an entry,
+// empty if it has no children). A descendant belongs to its nearest agent ancestor.
+func AgentTrees(procs map[int]*Proc) map[int][]*Proc {
+	out := map[int][]*Proc{}
 	owner := map[int]int{} // pid -> agent pid (0 = none), memoised
 	var find func(pid, depth int) int
 	find = func(pid, depth int) int {
@@ -188,12 +201,12 @@ func SubtreeRSS(procs map[int]*Proc) map[int]float64 {
 	for pid, p := range procs {
 		if AgentKind(p) != "" {
 			if _, ok := out[pid]; !ok {
-				out[pid] = 0
+				out[pid] = nil
 			}
 			continue
 		}
 		if a := find(pid, 0); a != 0 {
-			out[a] += p.RSSMB
+			out[a] = append(out[a], p)
 		}
 	}
 	return out
