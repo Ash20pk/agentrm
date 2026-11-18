@@ -127,7 +127,17 @@ func pauseTree(r *model.Resource) error {
 // resumeTree thaws r's process and its descendants, children first, so that a parent never
 // runs while what it waits on is still frozen. A process that is gone, or whose PID is now
 // another process, has nothing left to resume.
+//
+// Something paused before start times were recorded (an upgrade from 0.1) has none. It is
+// thawed anyway: SIGCONT does nothing to a process that is not stopped, so a wrong PID costs
+// nothing, while refusing would leave the real one frozen for good.
 func resumeTree(r *model.Resource) error {
+	if r.ProcStart.IsZero() && r.PID > 1 && r.PID != os.Getpid() {
+		if p := quickProc(r.PID); p != nil {
+			return signalTree(reversed(procTree(p)), syscall.SIGCONT)
+		}
+		return nil
+	}
 	root, err := liveRoot(r)
 	if err != nil {
 		if errors.Is(err, errGone) || errors.Is(err, errReused) {
