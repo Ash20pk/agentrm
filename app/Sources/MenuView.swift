@@ -253,12 +253,20 @@ struct MenuView: View {
             .toggleStyle(.switch).controlSize(.mini).tint(Lamp.inUse.color)
             .disabled(store.status == nil)
             Spacer()
-            if let w = store.status?.waiters, !w.isEmpty {
+            if let open = store.status?.fail_open {
+                Silk("Open: \(open)", color: Lamp.waiting.color).lineLimit(1).help(open)
+            } else if let w = store.status?.waiters, !w.isEmpty {
                 Silk("\(w.count) queued, \(Fmt.gb(w.reduce(0) { $0 + $1.need_mb })) GB")
             }
             Button("Open") { NSApp.activate(ignoringOtherApps: true); openWindow(id: "activity") }
                 .buttonStyle(.key).keyboardShortcut(",")
             Menu {
+                if store.status?.fail_open != nil {
+                    Button("Manage memory again") { store.bypass(minutes: 0) }
+                } else {
+                    Button("Let everything through for 1 hour") { store.bypass(minutes: 60) }
+                }
+                Divider()
                 Button("Check for Updates…") { updater.checkForUpdates() }
                 Divider()
                 Button("Quit AgentRM") { NSApp.terminate(nil) }.keyboardShortcut("q")

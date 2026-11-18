@@ -134,6 +134,7 @@ struct Status: Codable {
     var headroom_mb: Double
     var pending_mb: Double
     var swap_rate_mb_min: Double?
+    var fail_open: String?
     var waiters: [Waiter]?
     var config: Config
     var leases: [String: Lease]?
