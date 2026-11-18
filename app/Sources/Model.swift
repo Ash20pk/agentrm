@@ -113,6 +113,23 @@ struct Approval: Codable, Identifiable {
     var expires: Date
     var from: String?
     var state: String
+    var path: String?
+}
+
+/// A process whose memory keeps climbing with nothing to explain it (status "leaks"; absent
+/// from older daemons). Every field but the id is optional so a changed daemon still decodes.
+struct Leak: Codable, Identifiable {
+    var id: String
+    var pid: Int?
+    var name: String?
+    var resource: String?
+    var since: Date?
+    var start_mb: Double?
+    var now_mb: Double?
+    var rate_mb_per_hour: Double?
+    var action: String?
+    var approval: String?
+    var dismissed: Bool?
 }
 
 struct StoppedItem: Codable, Identifiable {
@@ -150,10 +167,11 @@ struct Status: Codable {
     var selfUsage: SelfUsage?
     var prediction: String?
     var trust_levels: [TrustLevel]?
+    var leaks: [Leak]?
 
     enum CodingKeys: String, CodingKey {
         case mem, headroom_mb, pending_mb, swap_rate_mb_min, waiters, config, leases, resources, sessions,
-             events, last_sweep, daemon_version, sources, stopped, approvals, notes, prediction, trust_levels
+             events, last_sweep, daemon_version, sources, stopped, approvals, notes, prediction, trust_levels, leaks, fail_open
         case selfUsage = "self"
     }
 }

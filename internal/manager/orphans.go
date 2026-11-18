@@ -234,6 +234,14 @@ func (m *Manager) prune(now time.Time) {
 	for id, a := range m.st.Approvals {
 		if now.Sub(a.Expires) > 24*time.Hour {
 			delete(m.st.Approvals, id)
+			continue
+		}
+		// A question about a leak that is no longer flagged (it exited, or the daemon restarted
+		// and has not seen it climb since) has nothing left to act on.
+		if a.Path == "/leak" && a.State == "pending" {
+			if id, _ := a.Request["resource_id"].(string); m.findLeak(id) == nil {
+				a.State = "expired"
+			}
 		}
 	}
 	for key := range m.wouldDecided {

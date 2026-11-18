@@ -258,6 +258,9 @@ func (m *Manager) sweepWith(procs map[int]*sys.Proc, found discover.Result, mem 
 	}
 	m.merge(found, procs, est, now)
 	m.checkLeases(now)
+	if procs != nil {
+		m.watchLeaks(procs, now) // after merge and the leases: what explains growth is current
+	}
 	m.judgeYields(now)
 	m.markExpected(now)
 	m.weeklyReceipt(now)

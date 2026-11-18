@@ -51,6 +51,7 @@ agentrm resume srv:4242            # thaw something AgentRM paused
 agentrm restore kind:dev           # bring back something it stopped
 agentrm review                     # mark its decisions right or wrong
 agentrm collect                    # stop now what ended sessions left (restorable)
+agentrm leak accept leak-1a2b3c4d  # restart (or stop) a process whose memory keeps climbing
 agentrm receipt                    # the week: freed, found, waited, restored
 agentrm compare                    # AgentRM against a parent-PID reaper, on your recorded traces
 ```

@@ -12,7 +12,7 @@ import (
 
 // Effect is an action on a resource decided under the lock and carried out outside it (D1).
 type Effect struct {
-	Op  string // pause, resume, stop, restore
+	Op  string // pause, resume, stop, restore, restart
 	Res model.Resource
 	Why string
 	By  string // who asked: "agentrm" or a session
@@ -38,6 +38,8 @@ var Executor = func(e Effect) error {
 		return discover.Stop(&r)
 	case "restore":
 		return discover.Restore(&r)
+	case "restart":
+		return discover.Restart(&r)
 	}
 	return nil
 }
@@ -134,6 +136,14 @@ func (m *Manager) applyEffects(results []EffectResult) {
 				continue
 			}
 			m.event("RESTORED %s (%s) for %s", e.Res.ID, e.Res.Name, e.By)
+			m.kickSweep()
+		case "restart":
+			if res.Err != nil {
+				m.event("RESTART FAILED %s: %v", e.Res.ID, res.Err)
+				continue
+			}
+			m.event("RESTARTED %s (%s): %s", e.Res.ID, e.Res.Name, e.Why)
+			m.notify("Restarted "+e.Res.Name, e.Why)
 			m.kickSweep()
 		}
 	}

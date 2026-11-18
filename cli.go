@@ -49,6 +49,7 @@ Acting (pinning, settings and overriding others ask for approval in the app)
   agentrm stop RESOURCE                        stop something now (it can be restored)
   agentrm resume RESOURCE | --all              thaw something AgentRM paused
   agentrm restore RESOURCE | --last            bring back something AgentRM stopped
+  agentrm leak accept|dismiss LEAK|PID         restart (or stop) a process flagged as leaking, or leave it
   agentrm pin RESOURCE | unpin RESOURCE        never / again pause or stop it
   agentrm priority SESSION urgent|normal       an urgent session goes first in the queue
   agentrm config [--dry-run=true|false] [--grace MIN] [--headroom GB] [--idle MIN] [--pause MIN]
@@ -296,6 +297,16 @@ func runCLI(cmd string, args []string) int {
 				break
 			}
 			printReview(&r)
+		}
+	case "leak":
+		ok := arg(0) == "accept"
+		if (!ok && arg(0) != "dismiss") || arg(1) == "" {
+			return fail(fmt.Errorf("usage: agentrm leak accept|dismiss LEAK|PID (see agentrm status)"))
+		}
+		req.ResourceID, req.Approve = arg(1), &ok
+		var r api.CountResp
+		if err = callApproved("/leak", req, &r); err == nil {
+			fmt.Println(r.Note)
 		}
 	case "approve", "deny":
 		ok := cmd == "approve"
@@ -586,6 +597,14 @@ func printStatus(showStopped bool) error {
 		if a.State == "pending" {
 			fmt.Printf("APPROVE  %s: %s (from %s; answer in the AgentRM app)\n", a.ID, a.What, orNone(a.From))
 		}
+	}
+	for _, l := range st.Leaks {
+		ask := fmt.Sprintf("%s it: agentrm leak accept %s", l.Action, l.ID)
+		if l.Dismissed {
+			ask = "left alone"
+		}
+		fmt.Printf("LEAKING  %s (pid %d) %.1f → %.1f GB since %s, %+.0f MB/h · %s\n", l.Name, l.PID, l.StartMB/1024,
+			l.NowMB/1024, l.Since.Format("15:04"), l.RateMBh, ask)
 	}
 	fmt.Println()
 

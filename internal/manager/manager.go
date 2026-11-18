@@ -92,6 +92,9 @@ type Manager struct {
 	returnProbes    []*returnProbe // stops whose effect on available memory is being measured
 	grantProbes     []*grantProbe  // recent grants, watched for the Mac starting to swap
 	cfgDirty        bool
+	leakTracks      map[procKey]*leakTrack    // large processes watched for leaks (leaks.go)
+	leakProcs       map[int]*sys.Proc         // the process table the leak watch last saw
+	procUID         func(pid int) (int, bool) // who a process runs as; nil in tests
 
 	dirty    bool
 	saver    *store.Saver
@@ -155,6 +158,7 @@ func New(o Options) *Manager {
 	}
 	m.infos = newInfoCache(sys.ReadProcInfo)
 	m.footprint = sys.Footprint
+	m.procUID = sys.ProcUID
 	if w, err := sys.NewExitWatcher(); err == nil {
 		m.exits = w
 	} else {
@@ -335,6 +339,7 @@ func (m *Manager) routes() map[string]handler {
 		"/approve":  m.approve,
 		"/bypass":   m.bypass,
 		"/approval": m.approvalStatus,
+		"/leak":     m.leakAct,
 		"/whoami": func(c api.Caller, r api.Req) (any, []Effect, error) {
 			return c, nil, nil
 		},
@@ -424,6 +429,7 @@ func (m *Manager) status(c api.Caller, r api.Req) (any, []Effect, error) {
 		Learned: m.st.Learned, Stopped: m.st.Stopped, Approvals: m.st.Approvals, Sources: src,
 		Self: m.self, StartedAt: m.started, Notes: m.notes, Prediction: m.predictionScore(),
 		TrustLevels: m.trustLevels(m.now()), Accuracy: m.st.Accuracy, FailOpen: m.failOpen(m.now()),
+		Leaks: m.leakList(),
 	}, nil, nil
 }
 

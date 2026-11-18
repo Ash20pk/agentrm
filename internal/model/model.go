@@ -22,6 +22,9 @@ const (
 	// RKStaleAgent is an agent process with no terminal or app above it that has not been
 	// heard from in hours. Only ever asked about: it may be someone's tmux session.
 	RKStaleAgent = "stale-agent"
+	// RKProcess is a plain process AgentRM acts on only because it was flagged as leaking and
+	// you said to stop it. Never discovered as a resource.
+	RKProcess = "process"
 )
 
 // Lease kinds.
@@ -280,6 +283,28 @@ type Approval struct {
 	Path    string         `json:"path"`
 	From    string         `json:"from"` // the terminal app it came from
 	State   string         `json:"state"`
+}
+
+// Leak is a process whose memory footprint kept climbing for an hour or more with nothing to
+// explain it (see manager/leaks.go). AgentRM only asks about it: what happens to it is yours.
+type Leak struct {
+	ID        string    `json:"id"`
+	PID       int       `json:"pid"`
+	ProcStart time.Time `json:"proc_start"`
+	Name      string    `json:"name"`
+	Cmd       string    `json:"cmd,omitempty"`
+	// Resource is the tracked resource it is part of (a dev server, a leftover), if any: what
+	// accepting acts on.
+	Resource string    `json:"resource,omitempty"`
+	Since    time.Time `json:"since"` // first sample of the climb
+	StartMB  float64   `json:"start_mb"`
+	NowMB    float64   `json:"now_mb"`
+	RateMBh  float64   `json:"rate_mb_per_hour"`
+	Flagged  time.Time `json:"flagged"`
+	// Action is what accepting does: "restart" (it has a known restart) or "stop" (SIGTERM).
+	Action    string `json:"action"`
+	Approval  string `json:"approval,omitempty"`  // the approval waiting for you, if one is
+	Dismissed bool   `json:"dismissed,omitempty"` // you said leave it; not asked about again
 }
 
 // Accuracy is a running comparison of one kind of prediction with its outcome.
