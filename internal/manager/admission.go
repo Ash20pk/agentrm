@@ -439,8 +439,10 @@ func (m *Manager) reclaim(needMB float64, forSession string, now time.Time) stri
 
 	var orphans []*model.Resource
 	for _, r := range m.st.Resources {
-		// Only what AgentRM will really stop frees memory: not pinned, not exempt, not a VM.
-		if r.LeaseID == "" && !r.Pinned && !m.neverStop(r) && r.OrphanSince != nil && discover.CanAutoStop(r) && r.StartedBy != "you" {
+		// Only what AgentRM will really stop frees memory: not pinned, not exempt, not a VM, and
+		// not something last seen on a source that no longer answers (it cannot be stopped, and
+		// counting on it would leave the request waiting on memory that never comes).
+		if r.LeaseID == "" && r.Unseen == nil && !r.Pinned && !m.neverStop(r) && r.OrphanSince != nil && discover.CanAutoStop(r) && r.StartedBy != "you" {
 			orphans = append(orphans, r)
 		}
 	}

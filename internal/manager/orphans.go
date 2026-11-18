@@ -27,6 +27,11 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 		if m.pending[r.ID] != "" {
 			continue
 		}
+		if r.Unseen != nil {
+			// Its source is not answering (Docker hung): it may be gone, and a pause or stop
+			// would only time out against the same engine. Nothing is decided until it is seen.
+			continue
+		}
 		if r.LeaseID != "" || r.Pinned || m.neverStop(r) {
 			if r.PausedAt != nil {
 				effects = append(effects, m.thawEffect(r, "it is held or pinned now"))

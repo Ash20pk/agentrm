@@ -661,6 +661,55 @@ func TestFailedSourceKeepsItsResources(t *testing.T) {
 	}
 }
 
+// 2026-11-17: Docker hung for five hours. Every sweep kept its containers as last seen, reclaim
+// counted on stopping them for a blocked request, each stop timed out, and the request waited
+// on memory that never came. What a source cannot see is now neither acted on nor counted on.
+func TestUnseenResourcesAreNotCountedOnOrActedOn(t *testing.T) {
+	m, c := newTest(t, 1.0)
+	got := fakeEffects(t, nil)
+	m.cfg.DryRun = false
+	now := c.Now()
+	since := now.Add(-time.Hour)
+	ghost := addRes(m, "compose:openbox-local", model.RKContainers, 1100, "")
+	ghost.OrphanSince = &since
+	m.st.Leases["idle"] = &model.Lease{ID: "idle", Session: "s2", Kind: "cluster", MemGB: 2, TTL: 120,
+		Verified: true, LastUsed: now.Add(-30 * time.Minute), Expires: now.Add(time.Hour)}
+	addRes(m, "kind:idle", model.RKCluster, 2048, "idle")
+	live := &model.Resource{ID: "kind:idle", Kind: model.RKCluster, Name: "idle", MemMB: 2048, Source: "procs"}
+
+	m.merge(discover.Result{Resources: []*model.Resource{live}, Failed: map[string]error{"docker": discover.ErrEngineHung}}, nil, nil, now)
+	if ghost = m.st.Resources["compose:openbox-local"]; ghost == nil || ghost.Unseen == nil {
+		t.Fatal("a resource on a hung source should be kept and marked unseen")
+	}
+
+	acquire(t, m, agent("waiting"), "heavy", 2)
+	if ghost.Urgent {
+		t.Error("reclaim counted on stopping something on a hung engine")
+	}
+	if m.st.Leases["idle"].IdleAsked == nil {
+		t.Error("with nothing stoppable, the idle lease should have been pressed instead")
+	}
+	c.Add(time.Hour)
+	m.applyEffects(RunEffects(m.checkOrphans(c.Now())))
+	for _, e := range *got {
+		if e.Res.ID == ghost.ID {
+			t.Fatalf("acted on an unseen resource: %s", e.Op)
+		}
+	}
+
+	// The engine answers again and the stack is still there: live once more.
+	fresh := &model.Resource{ID: "compose:openbox-local", Kind: model.RKContainers, Name: "x", MemMB: 1100, Source: "docker"}
+	m.merge(discover.Result{Resources: []*model.Resource{fresh}, Failed: map[string]error{}}, nil, nil, c.Now())
+	if r := m.st.Resources["compose:openbox-local"]; r == nil || r.Unseen != nil {
+		t.Fatal("a resource seen again should no longer be marked unseen")
+	}
+	// The engine is down: gone, at once.
+	m.merge(discover.Result{Failed: map[string]error{}}, nil, nil, c.Now())
+	if m.st.Resources["compose:openbox-local"] != nil {
+		t.Fatal("a stack on a stopped engine was kept")
+	}
+}
+
 func TestEffectsRunOutsideTheLock(t *testing.T) {
 	m, c := newTest(t, 8)
 	old := Executor

@@ -79,8 +79,19 @@ func parseSize(s string) float64 { // in MB
 // Docker groups running containers: one resource per kind cluster, per Compose project (and
 // Supabase stack), or per standalone container.
 func Docker() ([]*model.Resource, error) {
-	if off, until := sys.BackedOff("docker"); off {
-		return nil, fmt.Errorf("docker has been timing out; skipped until %s", until.Format("15:04:05"))
+	// Ask the engine's socket first. Down is certain: nothing of Docker's is running. Hung keeps
+	// the last view. Only an engine that answered is worth running the CLI against, and then the
+	// CLI's back-off is not consulted: it is also fed by docker stop and pause timing out, and
+	// skipping discovery because a stop timed out is how a stopped Docker went unnoticed.
+	switch state, sock := DockerEngine(); state {
+	case EngineDown:
+		return nil, nil
+	case EngineHung:
+		return nil, fmt.Errorf("%w (%s)", ErrEngineHung, sock)
+	case EngineUnknown:
+		if off, until := sys.BackedOff("docker"); off {
+			return nil, fmt.Errorf("docker has been timing out; skipped until %s", until.Format("15:04:05"))
+		}
 	}
 	out, err := sys.Run(5*time.Second, "docker", "ps", "--format",
 		`{{.Names}}	{{.Label "io.x-k8s.kind.cluster"}}	{{.Label "com.docker.compose.project"}}	{{.Label "com.supabase.cli.project"}}	{{.Image}}	{{.Ports}}	{{.Label "com.docker.compose.project.working_dir"}}`)

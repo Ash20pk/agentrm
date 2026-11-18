@@ -584,6 +584,8 @@ func printStatus(showStopped bool) error {
 	for _, r := range rs {
 		owner := "lease " + r.LeaseID
 		switch {
+		case r.Unseen != nil:
+			owner = fmt.Sprintf("UNSEEN %s (%s not answering; last view)", time.Since(*r.Unseen).Round(time.Minute), r.Source)
 		case r.Pinned:
 			owner = "pinned"
 		case r.PausedAt != nil:

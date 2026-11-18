@@ -332,7 +332,15 @@ func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[
 		}
 	}
 	for id, r := range m.st.Resources {
-		if seen[id] || found.Failed[r.Source] != nil || m.pending[id] != "" {
+		if found.Failed[r.Source] != nil && !seen[id] {
+			// Kept as last seen, and marked so: it may well be gone (D4).
+			if r.Unseen == nil {
+				t := now
+				r.Unseen = &t
+			}
+			continue
+		}
+		if seen[id] || m.pending[id] != "" {
 			continue
 		}
 		m.noteGone(r, now)

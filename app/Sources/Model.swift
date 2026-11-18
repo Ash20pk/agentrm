@@ -62,6 +62,7 @@ struct Resource: Codable, Identifiable {
     var pinned: Bool?
     var started_by: String?
     var paused_at: Date?
+    var unseen: Date?
     var source: String?
     var restart: String?
     var owner: String?

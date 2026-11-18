@@ -78,6 +78,13 @@ extension Store {
     private func item(for r: Resource, lamp: Lamp, _ s: Status) -> Item {
         let grace = Double(s.config.grace_minutes) * 60
         let pause = Double(s.config.pause_minutes ?? 30) * 60
+        if let unseen = r.unseen {
+            // Its source stopped answering: this is the last view, not a live one, and nothing is
+            // done to it (or counted on from it) until it is seen again.
+            let src = r.source == "docker" ? "Docker" : (r.source ?? "Its source")
+            return Item(id: r.id, name: r.name, detail: "\(src) not answering since \(Fmt.rel(unseen)), may be gone",
+                        mb: r.mem_mb, lamp: lamp, resource: r, actions: [])
+        }
         switch lamp {
         case .paused:
             let stopAt = (r.paused_at ?? Date()).addingTimeInterval(pause)

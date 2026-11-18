@@ -90,7 +90,10 @@ type Resource struct {
 	StartedBy   string     `json:"started_by,omitempty"`  // session that started it, when known
 	PausedAt    *time.Time `json:"paused_at,omitempty"`   // frozen since then, not yet stopped
 	Urgent      bool       `json:"urgent,omitempty"`      // a blocked request needs its memory: stop, do not freeze
-	Restart     string     `json:"restart,omitempty"`     // how to bring it back after a stop
+	// Unseen is the time its source last failed to answer (Docker hung): what is shown is the
+	// last view, not the current one, and nothing is paused, stopped or counted on from it.
+	Unseen  *time.Time `json:"unseen,omitempty"`
+	Restart string     `json:"restart,omitempty"` // how to bring it back after a stop
 	// Owner is the session that started or last held it, once that session is gone, and
 	// OwnerGoneAt when it went: the collector's strongest evidence that nobody needs it.
 	Owner       string     `json:"owner,omitempty"`
