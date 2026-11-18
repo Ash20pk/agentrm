@@ -269,14 +269,19 @@ func (m *Manager) sweepWith(procs map[int]*sys.Proc, found discover.Result, mem 
 			delete(m.recent, id)
 			delete(m.st.Trees, id)
 			delete(m.missing, id)
+			if m.st.Predict != nil {
+				delete(m.st.Predict.Last, id)
+			}
 		}
 	}
+	m.prune(now)
 	for id, o := range m.origins() {
 		if now.Sub(o.at) > time.Hour {
 			delete(m.dockerOrigin, id)
 		}
 	}
 	m.dirty = true
+	effects = m.gateAuto(effects)
 	m.mu.Unlock()
 
 	if len(effects) > 0 {

@@ -117,7 +117,9 @@ func (m *Manager) liveWaiters(now time.Time) []*model.Waiter {
 	for _, w := range m.waiters {
 		heard := w.LastSeen
 		// Your own session is touched by everything you do in the app, so only the request counts.
-		if s := m.st.Sessions[w.Session]; s != nil && w.Session != "you" && s.LastSeen.After(heard) {
+		// A restore waits on its own retry only: the session getting on with other work does not
+		// keep it (it was never granted from the queue, yet held up everyone behind it).
+		if s := m.st.Sessions[w.Session]; s != nil && w.Session != "you" && !w.Retry && s.LastSeen.After(heard) {
 			heard = s.LastSeen
 		}
 		if len(m.parked[w]) > 0 || now.Sub(heard) < keep {
@@ -459,10 +461,14 @@ func (m *Manager) reclaim(needMB float64, forSession string, now time.Time) stri
 		if freed >= needMB {
 			break
 		}
-		if early := deadline.Add(-grace); r.OrphanSince.After(early) {
-			r.OrphanSince = &early
+		// Dry run decides nothing: it neither shortens clocks nor marks anything for a direct
+		// stop, which would otherwise take effect the moment dry run is turned off.
+		if !m.dryFor(r) {
+			if early := deadline.Add(-grace); r.OrphanSince.After(early) {
+				r.OrphanSince = &early
+			}
+			r.Urgent = true
 		}
-		r.Urgent = true
 		back := r.MemMB * m.returnRatio(r.Source) // what macOS really gets back
 		freed += back
 		done = append(done, fmt.Sprintf("unclaimed %s (%.1f GB, ~%.1f GB back)", r.ID, r.MemMB/1024, back/1024))
@@ -526,9 +532,12 @@ func (m *Manager) reclaim(needMB float64, forSession string, now time.Time) stri
 			m.dropLease(l, "its holder offered it at low cost to a waiting request")
 			continue
 		}
-		asked := deadline.Add(-grace)
-		if l.IdleAsked == nil || l.IdleAsked.After(asked) {
-			l.IdleAsked = &asked
+		if !m.cfg.DryRun {
+			// Pressed: its idle deadline moves up to the pressure grace period.
+			asked := deadline.Add(-grace)
+			if l.IdleAsked == nil || l.IdleAsked.After(asked) {
+				l.IdleAsked = &asked
+			}
 		}
 		why := fmt.Sprintf("unused %s", c.idle.Round(time.Minute))
 		if c.over {

@@ -46,10 +46,17 @@ func (m *Manager) acquire(c api.Caller, r api.Req) (any, []Effect, error) {
 			cwd = s.Cwd
 		}
 	}
+	memGB := m.effectiveGB(r.Kind, cwd, r.MemGB, c.Session, now)
 	// A session that already holds a lease of this kind reuses it. That is also how a lease
-	// granted from the queue is taken up.
+	// granted from the queue is taken up. Only for what the lease covers: asking for more goes
+	// through admission for the difference (it used to be granted at the old size).
+	extraGB := 0.0
 	for _, l := range m.st.Leases {
 		if l.Session == c.Session && l.Kind == r.Kind {
+			if more := memGB - l.MemGB; more > 0.25 {
+				extraGB = max(extraGB, more)
+				continue
+			}
 			l.Expires = now.Add(minutes(l.TTL))
 			l.LastUsed = now
 			m.takeUp(l)
@@ -57,8 +64,10 @@ func (m *Manager) acquire(c api.Caller, r api.Req) (any, []Effect, error) {
 			return &api.AcquireResp{Granted: true, Lease: l, Reused: true}, nil, nil
 		}
 	}
+	if extraGB > 0 {
+		memGB = extraGB // a second lease of this kind for the difference
+	}
 	m.yieldsSeeUse(c.Session, nil, r.Kind, now)
-	memGB := m.effectiveGB(r.Kind, cwd, r.MemGB, c.Session, now)
 	fast := m.readFast() // pressure, load and disk right now, not as of the last sweep
 	m.mem.PressureLevel, m.mem.Load1, m.mem.Cores, m.mem.DiskFreeGB = fast.PressureLevel, fast.Load1, fast.Cores, fast.DiskFreeGB
 	if why := m.busy(r.Kind); why != "" {

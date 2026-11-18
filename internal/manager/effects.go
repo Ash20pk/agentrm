@@ -147,3 +147,19 @@ func (m *Manager) recordStopped(r model.Resource, why, by string, now time.Time)
 }
 
 func gb(mb float64) string { return fmt.Sprintf("%.1f GB", mb/1024) }
+
+// gateAuto is the last check on what AgentRM decided by itself, whichever code path decided it:
+// in dry run (for that resource's auto-stop level) nothing is paused or stopped. Each decision
+// site checks too; this makes a new one that forgets harmless. Must hold mu.
+func (m *Manager) gateAuto(effects []Effect) []Effect {
+	out := effects[:0]
+	for _, e := range effects {
+		if e.By == "agentrm" && (e.Op == "pause" || e.Op == "stop") && m.dryFor(&e.Res) {
+			delete(m.pending, e.Res.ID)
+			m.event("DRYRUN blocked an automatic %s of %s that a decision path let through", e.Op, e.Res.ID)
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}

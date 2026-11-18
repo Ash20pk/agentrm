@@ -9,7 +9,9 @@ package manager
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"agentrm/internal/api"
@@ -26,6 +28,10 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 	for _, r := range m.st.Resources {
 		if m.pending[r.ID] != "" {
 			continue
+		}
+		if !blocked && r.Urgent {
+			// Marked for a direct stop because a request was waiting; nobody waits now.
+			r.Urgent = false
 		}
 		if r.Unseen != nil {
 			// Its source is not answering (Docker hung): it may be gone, and a pause or stop
@@ -218,4 +224,32 @@ func (m *Manager) reviewSummary(all bool) *api.ReviewResp {
 		out.FalseRate = float64(out.Wrong) / float64(out.Reviewed)
 	}
 	return out
+}
+
+var episodeTime = regexp.MustCompile(`:\d{4}-\d{2}-\d{2}T`)
+
+// prune drops what would otherwise grow for as long as the daemon runs: approvals a day past
+// their expiry, and once-per-episode markers for resources that are gone. Must hold mu.
+func (m *Manager) prune(now time.Time) {
+	for id, a := range m.st.Approvals {
+		if now.Sub(a.Expires) > 24*time.Hour {
+			delete(m.st.Approvals, id)
+		}
+	}
+	for key := range m.wouldDecided {
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		id := parts[1]
+		if parts[0] != "ask" {
+			// action:<id>:<orphan since>; resource IDs contain colons, the time is RFC 3339.
+			if loc := episodeTime.FindStringIndex(id); loc != nil {
+				id = id[:loc[0]]
+			}
+		}
+		if m.st.Resources[id] == nil {
+			delete(m.wouldDecided, key)
+		}
+	}
 }

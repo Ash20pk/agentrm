@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"agentrm/internal/api"
+	"agentrm/internal/discover"
 	"agentrm/internal/model"
 )
 
@@ -226,6 +227,20 @@ func (m *Manager) stopNow(c api.Caller, r api.Req) (any, []Effect, error) {
 	}
 	if c.Session == "detached" {
 		return nil, nil, fmt.Errorf("a detached process cannot stop anything")
+	}
+	if !c.Human && l == nil && res.StartedBy != c.Session {
+		// Nobody holds it, and this agent did not start it. An agent may stop only what AgentRM
+		// itself would stop: not something you started, not an app, a VM or another agent.
+		switch {
+		case res.StartedBy == "you":
+			return nil, nil, fmt.Errorf("%s was started by you; an agent cannot stop it", res.ID)
+		case res.Kind == model.RKStaleAgent || res.AskOnly || !discover.CanAutoStop(res) || m.neverStop(res):
+			why := discover.NoAutoStopWhy(res)
+			if why == "" {
+				why = "it is exempt in your settings"
+			}
+			return nil, nil, fmt.Errorf("%s is never stopped automatically (%s); an agent cannot stop it either", res.ID, why)
+		}
 	}
 	m.pending[res.ID] = "stop"
 	why := "stopped by " + c.Session
