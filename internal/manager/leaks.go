@@ -101,7 +101,9 @@ var (
 // Resource kinds whose memory growth is expected.
 var leakExpectedKinds = map[string]bool{model.RKVM: true, model.RKEmulator: true, model.RKSimulator: true,
 	model.RKModel: true, model.RKBrowser: true, model.RKCluster: true, model.RKContainers: true,
-	model.RKDatabase: true, model.RKGradle: true, model.RKStaleAgent: true}
+	model.RKDatabase: true, model.RKGradle: true, model.RKStaleAgent: true,
+	// These two have their own reclaim (dockervm.go, xcode helpers); asking twice helps nobody.
+	model.RKDockerVM: true, model.RKXcodeHelper: true}
 
 // leakText is what a process says it is, lower-cased: its executable's name and its command
 // line (bounded).
