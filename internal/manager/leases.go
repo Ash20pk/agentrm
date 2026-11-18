@@ -115,6 +115,7 @@ func (m *Manager) grant(w *model.Waiter, now time.Time, note string) *model.Leas
 	}
 	m.st.Leases[l.ID] = l
 	m.event("GRANT %s %s %.1f GB to %s (%s)%s: %s", l.ID, l.Kind, l.MemGB, w.Session, w.Agent, note, l.Purpose)
+	m.grantProbes = append(m.grantProbes, &grantProbe{at: now, lease: l.ID})
 	return l
 }
 
@@ -425,27 +426,4 @@ func (m *Manager) lastCmd(session string) string {
 // inferred is a lease AgentRM recorded itself because a session's process tree grew.
 func inferred(l *model.Lease) bool {
 	return l.Kind == model.KHeavy && strings.HasPrefix(l.Purpose, "inferred:")
-}
-
-// procMB is what a process holds: its footprint where that can be read (what Activity Monitor
-// shows: shared pages counted once, compressed and swapped pages included), else its resident
-// size.
-func (m *Manager) procMB(p *sys.Proc) float64 {
-	if m.footprint != nil {
-		if fp, ok := m.footprint(p.PID); ok {
-			return fp
-		}
-	}
-	return p.RSSMB
-}
-
-// usedSince is what the processes of a tree started at or after t hold now.
-func (m *Manager) usedSince(tree []*sys.Proc, t time.Time) float64 {
-	total := 0.0
-	for _, p := range tree {
-		if !p.Start.IsZero() && !p.Start.Before(t) {
-			total += m.procMB(p)
-		}
-	}
-	return total
 }

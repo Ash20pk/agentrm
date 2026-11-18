@@ -279,6 +279,17 @@ type Approval struct {
 	State   string         `json:"state"`
 }
 
+// Accuracy is a running comparison of one kind of prediction with its outcome.
+type Accuracy struct {
+	N         int       `json:"n"`
+	Predicted float64   `json:"predicted"` // sums, in MB (or counts for yes/no predictions)
+	Actual    float64   `json:"actual"`
+	AbsErr    float64   `json:"abs_err"`
+	Over      int       `json:"over"`  // predicted more than 1.5x what happened
+	Under     int       `json:"under"` // what happened was more than 1.5x the prediction
+	Since     time.Time `json:"since"`
+}
+
 // StateVersion is the current on-disk state format. Bump it and add a migration in store.
 const StateVersion = 3
 
@@ -310,6 +321,9 @@ type State struct {
 	Trees map[string]map[int]TreeProc `json:"trees,omitempty"`
 	// Yields are recent answers to "what would giving it up cost you?" (the newest 200).
 	Yields []*Yield `json:"yields,omitempty"`
+	// Accuracy compares each kind of prediction with what really happened (see
+	// manager/accuracy.go).
+	Accuracy map[string]*Accuracy `json:"accuracy,omitempty"`
 	// ReturnRatio is, per discovery source, how much of a stopped resource's counted memory
 	// the Mac really got back, as measured (Docker Desktop's VM keeps much of what its
 	// containers free); ReturnN is how many stops that is from.

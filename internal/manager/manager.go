@@ -89,6 +89,7 @@ type Manager struct {
 	tamper          tamperState
 	dockerEventsErr string
 	returnProbes    []*returnProbe // stops whose effect on available memory is being measured
+	grantProbes     []*grantProbe  // recent grants, watched for the Mac starting to swap
 	cfgDirty        bool
 
 	dirty    bool
@@ -401,7 +402,7 @@ func (m *Manager) status(c api.Caller, r api.Req) (any, []Effect, error) {
 		Sessions: m.st.Sessions, Questions: m.st.Questions, LastSweep: m.lastSweep, Events: m.events,
 		Learned: m.st.Learned, Stopped: m.st.Stopped, Approvals: m.st.Approvals, Sources: src,
 		Self: m.self, StartedAt: m.started, Notes: m.notes, Prediction: m.predictionScore(),
-		TrustLevels: m.trustLevels(m.now()),
+		TrustLevels: m.trustLevels(m.now()), Accuracy: m.st.Accuracy,
 	}, nil, nil
 }
 

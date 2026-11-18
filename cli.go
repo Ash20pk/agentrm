@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"agentrm/internal/api"
+	"agentrm/internal/manager"
 	"agentrm/internal/model"
 	"agentrm/internal/setup"
 	"agentrm/internal/store"
@@ -509,6 +510,9 @@ func printStatus(showStopped bool) error {
 	}
 	fmt.Printf("DAEMON   %s · %s · itself %.0f MB, %.1f%% CPU, last sweep %.0f ms\n", st.DaemonVersion,
 		swept, st.Self.RSSMB, st.Self.CPUPercent, st.Self.SweepMS)
+	if line := manager.AccuracyLine(st.Accuracy); line != "" {
+		fmt.Println("ACCURACY", line)
+	}
 	for src, why := range st.Sources {
 		if why != "" {
 			fmt.Printf("SOURCE   %s unavailable: %s (its resources are kept as last seen)\n", src, why)

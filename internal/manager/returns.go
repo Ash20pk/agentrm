@@ -24,6 +24,7 @@ type returnProbe struct {
 	source  string
 	at      time.Time
 	mb      float64 // counted memory stopped
+	counted float64 // share of it reclaim counted on coming back
 	availMB float64 // available memory just before
 }
 
@@ -52,10 +53,12 @@ func (m *Manager) noteStopped(r model.Resource, now time.Time) {
 	for _, p := range m.returnProbes {
 		if p.source == r.Source && now.Sub(p.at) < returnSettle/2 {
 			p.mb += r.MemMB
+			p.counted += r.MemMB * m.returnRatio(r.Source)
 			return
 		}
 	}
-	m.returnProbes = append(m.returnProbes, &returnProbe{source: r.Source, at: now, mb: r.MemMB, availMB: m.mem.AvailableMB})
+	m.returnProbes = append(m.returnProbes, &returnProbe{source: r.Source, at: now, mb: r.MemMB,
+		counted: r.MemMB * m.returnRatio(r.Source), availMB: m.mem.AvailableMB})
 }
 
 // measureReturns reads what pending stops gave back, once they have settled.
@@ -76,6 +79,7 @@ func (m *Manager) measureReturns(now time.Time) {
 			m.st.ReturnRatio[p.source] = 0.7*m.st.ReturnRatio[p.source] + 0.3*got
 		}
 		m.st.ReturnN[p.source]++
+		m.score("return:"+p.source, p.counted, max(0, m.mem.AvailableMB-p.availMB), now)
 		m.event("RETURNED stopping %.1f GB on %s gave back %.1f GB to macOS (%.0f%%); now counting %.0f%%",
 			p.mb/1024, p.source, max(0, m.mem.AvailableMB-p.availMB)/1024, got*100, m.returnRatio(p.source)*100)
 	}

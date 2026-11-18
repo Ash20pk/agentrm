@@ -257,7 +257,7 @@ func (m *Manager) recordTree(id string, agentPID int, procs map[int]*sys.Proc, c
 	tree := map[int]model.TreeProc{}
 	for pid, tp := range m.st.Trees[id] {
 		if p := procs[pid]; p != nil && sys.SameProcess(p, tp.Start) {
-			tp.PeakMB = max(tp.PeakMB, p.RSSMB)
+			tp.PeakMB = max(tp.PeakMB, m.procMB(p))
 			tree[pid] = tp
 		}
 	}
@@ -272,7 +272,7 @@ func (m *Manager) recordTree(id string, agentPID int, procs map[int]*sys.Proc, c
 			continue
 		}
 		if p := procs[pid]; p != nil {
-			tree[pid] = model.TreeProc{Start: p.Start, PeakMB: p.RSSMB}
+			tree[pid] = model.TreeProc{Start: p.Start, PeakMB: m.procMB(p)}
 			stack = append(stack, children[pid]...)
 		}
 	}
@@ -397,22 +397,6 @@ func (m *Manager) dropWaitersOf(session string) {
 	}
 }
 
-// peakOf is the most memory a process was seen using: now, or while its agent ran.
-func peakOf(p *sys.Proc, tree map[int]model.TreeProc) float64 {
-	return max(p.RSSMB, tree[p.PID].PeakMB)
-}
-
-// held is what a process holds now: its footprint (compressed memory included) where that can
-// be read, its resident size otherwise.
-func (m *Manager) held(p *sys.Proc) float64 {
-	if m.footprint != nil {
-		if fp, ok := m.footprint(p.PID); ok {
-			return max(p.RSSMB, fp)
-		}
-	}
-	return p.RSSMB
-}
-
 // treeSize is what a process and everything under it hold.
 func (m *Manager) treeSize(root *sys.Proc, children map[int][]int, procs map[int]*sys.Proc, size func(*sys.Proc) float64) float64 {
 	total, stack, seen := 0.0, []int{root.PID}, map[int]bool{}
@@ -480,7 +464,7 @@ func (m *Manager) findLeftovers(s *model.Session, procs map[int]*sys.Proc, now t
 		return
 	}
 	children := childrenOf(procs)
-	size := func(p *sys.Proc) float64 { return max(m.held(p), tree[p.PID].PeakMB) }
+	size := func(p *sys.Proc) float64 { return max(m.procMB(p), tree[p.PID].PeakMB) }
 	found := 0
 	for _, p := range cands {
 		if cands[p.PPID] != nil {
@@ -535,7 +519,7 @@ func (m *Manager) findEnvLeftovers(procs map[int]*sys.Proc, now time.Time) {
 		if lo := m.st.Leftovers[strconv.Itoa(pid)]; lo != nil && sys.SameProcess(c.p, lo.Start) {
 			continue
 		}
-		mb := m.treeSize(c.p, children, procs, m.held)
+		mb := m.treeSize(c.p, children, procs, m.procMB)
 		if mb < m.cfg.LeftoverMinMB && c.p.CPU < 2 {
 			continue
 		}
@@ -617,7 +601,7 @@ func (m *Manager) withLeftovers(found []*model.Resource, procs map[int]*sys.Proc
 			continue
 		}
 		r := &model.Resource{ID: "left:" + key, Kind: model.RKLeftover, Source: "procs",
-			Name: filepath.Base(p.Exe), Detail: trunc(p.Args, 90), PID: p.PID, MemMB: m.treeSize(p, children, procs, m.held), CPU: p.CPU,
+			Name: filepath.Base(p.Exe), Detail: trunc(p.Args, 90), PID: p.PID, MemMB: m.treeSize(p, children, procs, m.procMB), CPU: p.CPU,
 			Cwd: lo.Cwd, StartedBy: lo.Session, AskOnly: lo.AskOnly, RestartArgv: lo.Argv, RestartEnv: lo.Env,
 			Restart: "agentrm restore left:" + key}
 		if gone != nil {
@@ -636,7 +620,7 @@ func (m *Manager) withLeftovers(found []*model.Resource, procs map[int]*sys.Proc
 		kind := sys.AgentKind(p)
 		found = append(found, &model.Resource{ID: "agent:" + strconv.Itoa(pid), Kind: model.RKStaleAgent, Source: "procs",
 			Name: agentTitle(kind), Detail: fmt.Sprintf("no terminal, not heard from in %dh+: %s", staleAgentHours, trunc(p.Args, 60)),
-			PID: pid, MemMB: m.treeSize(p, children, procs, m.held), CPU: p.CPU, AskOnly: true, Restart: "start the agent again"})
+			PID: pid, MemMB: m.treeSize(p, children, procs, m.procMB), CPU: p.CPU, AskOnly: true, Restart: "start the agent again"})
 	}
 	return found
 }

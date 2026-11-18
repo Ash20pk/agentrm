@@ -170,6 +170,8 @@ type Status struct {
 	Notes         []string                   `json:"notes,omitempty"`      // problems at startup
 	Prediction    string                     `json:"prediction,omitempty"` // how the command-stream predictor is doing
 	TrustLevels   []TrustLevel               `json:"trust_levels,omitempty"`
+	// Accuracy is each kind of prediction against what really happened.
+	Accuracy map[string]*model.Accuracy `json:"accuracy,omitempty"`
 }
 
 // TrustLevel is one auto-stop level, with the evidence for turning it on.

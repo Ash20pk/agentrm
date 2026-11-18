@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -118,6 +119,42 @@ func TestGrowthDuringALeaseIsNotChargedTwice(t *testing.T) {
 	for _, l := range m.st.Leases {
 		if inferred(l) {
 			t.Fatalf("the Gradle build's growth was charged again as %s", l.ID)
+		}
+	}
+}
+
+// Every prediction is scored against what happened, and status says how far off each is.
+func TestAccuracyLedger(t *testing.T) {
+	m, c := newTest(t, 8)
+	now := c.Now()
+	// A build charged 4.2 GB that used 1.1 GB.
+	m.dropLease(&model.Lease{ID: "b", Kind: model.KXcodeBuild, MemGB: 4.2, PeakMB: 1126, Created: now}, "its command finished")
+	a := m.st.Accuracy["charge:xcode-build"]
+	if a == nil || a.N != 1 || a.Over != 1 {
+		t.Fatalf("charge not scored as an over-charge: %+v", a)
+	}
+	// A Docker stop counted at 1.4 GB (half of 2.8) that gave back 0.8 GB.
+	m.mem.AvailableMB = 2500
+	m.noteStopped(model.Resource{ID: "kind:a", Source: "docker", MemMB: 2800}, now)
+	c.Add(returnSettle)
+	m.takeMem(sys.MemStats{AvailableMB: 3300}, c.Now())
+	if r := m.st.Accuracy["return:docker"]; r == nil || r.N != 1 || r.Predicted != 1400 || r.Actual != 800 {
+		t.Fatalf("return not scored: %+v", r)
+	}
+	// A grant followed by heavy swapping counts against admission.
+	m.grantProbes = append(m.grantProbes, &grantProbe{at: c.Now(), lease: "g"})
+	m.lastSwapouts, m.lastSwapAt = 0, c.Now()
+	c.Add(time.Minute)
+	m.takeMem(sys.MemStats{AvailableMB: 3300, Swapouts: 2000}, c.Now()) // 2 GB a minute
+	c.Add(grantWatch)
+	m.takeMem(sys.MemStats{AvailableMB: 3300, Swapouts: 2000}, c.Now())
+	if ad := m.st.Accuracy["admission"]; ad == nil || ad.N != 1 || ad.Under != 1 {
+		t.Fatalf("admission not scored: %+v", ad)
+	}
+	line := AccuracyLine(m.st.Accuracy)
+	for _, want := range []string{"xcode-build charged 3.8x", "docker stops gave back 57%", "heavy swapping 1/1"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("status line %q lacks %q", line, want)
 		}
 	}
 }
