@@ -23,7 +23,9 @@ func fakeSignals(t *testing.T, procs map[int]*sys.Proc) *[]string {
 	return &sent
 }
 
-func itoa(n int) string { return string(rune('0'+n/100%10)) + string(rune('0'+n/10%10)) + string(rune('0'+n%10)) }
+func itoa(n int) string {
+	return string(rune('0'+n/100%10)) + string(rune('0'+n/10%10)) + string(rune('0'+n%10))
+}
 
 // Paused by a 0.1 daemon, which recorded no start time: it must still be thawed (SIGCONT harms
 // nothing), while a pause or a stop with no start time is refused.
