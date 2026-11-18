@@ -518,7 +518,8 @@ func Uninstall() UninstallResult {
 		}
 	}
 	var n api.CountResp
-	switch err := api.Call("/resume", api.Req{All: true}, &n); {
+	// Unpausing many containers can take longer than an ordinary call's 5 s.
+	switch err := api.CallTimeout(45*time.Second, "/resume", api.Req{All: true}, &n); {
 	case errors.Is(err, api.ErrDaemonDown):
 		names, err := resumeOffline()
 		if len(names) > 0 {
