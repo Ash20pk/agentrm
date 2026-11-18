@@ -7,8 +7,14 @@ AgentRM in System Settings → General → Login Items. The daemon's log is
 `~/.agentrm/agentrm.log`.
 
 **"this client speaks API version N and the daemon speaks M"** — the app was updated but the
-daemon was not restarted. Quit and reopen AgentRM, or run
-`launchctl kickstart -k gui/$(id -u)/dev.agentrm.daemon`. Hooks keep working (they fail open).
+daemon was not restarted. The daemon exits within about 15 seconds of its binary being replaced,
+and the app restarts it at launch when its version differs, so this should clear by itself; if
+not, quit and reopen AgentRM, or run `launchctl kickstart -k gui/$(id -u)/dev.agentrm.daemon`.
+Until then hooks fail open: nothing is checked.
+
+**"another AgentRM daemon is already running"** — only one daemon runs per `~/.agentrm`; it holds
+`~/.agentrm/daemon.lock`, which names its PID. Stop the other one (an `agentrm daemon` started
+by hand, or a second copy of the app) rather than deleting the lock.
 
 **An agent's command was refused** — the refusal says why (no memory, thrashing, full disk, busy
 CPU, fair share) and what AgentRM is reclaiming. `agentrm status` shows who holds what. A request
@@ -41,4 +47,7 @@ app, possibly an agent driving it. `~/.agentrm/events.log` shows what and when.
 hooks were removed. If it was not you, check what your agents ran around that time.
 
 **Removing AgentRM** — Activity window → Setup → Uninstall, or `agentrm setup uninstall`, then
-move the app to the Bin. Data stays in `~/.agentrm`.
+move the app to the Bin. It removes the Claude Code, Codex, Gemini CLI and Cursor hooks, the Codex
+note, the CLI link and the PATH shim, and resumes anything paused (from `state.json` if the daemon
+is not running). It lists what it removed, and if anything could not be undone it says what and
+exits non-zero; run it again once that is fixed. Data stays in `~/.agentrm`.

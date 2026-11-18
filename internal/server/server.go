@@ -19,8 +19,25 @@ import (
 	"agentrm/internal/sys"
 )
 
+// Serve takes the daemon lock and serves the API until ctx ends. A second daemon gets an
+// error wrapping store.ErrDaemonRunning and leaves the first one's socket alone.
 func Serve(ctx context.Context, m *manager.Manager) error {
+	lock, err := store.LockDaemon()
+	if err != nil {
+		return err
+	}
+	defer lock.Release()
+	return ServeLocked(ctx, m, lock)
+}
+
+// ServeLocked serves the API for a daemon that already holds the lock (taken before the
+// manager starts, so a second daemon never sweeps or writes the state either).
+func ServeLocked(ctx context.Context, m *manager.Manager, lock *store.DaemonLock) error {
+	if lock == nil {
+		return errors.New("serve: the daemon lock is not held")
+	}
 	sock := store.SockPath()
+	// Only the lock holder removes the socket: it is a dead daemon's, or none.
 	_ = os.Remove(sock)
 	ln, err := net.Listen("unix", sock)
 	if err != nil {

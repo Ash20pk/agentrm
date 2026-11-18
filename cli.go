@@ -258,15 +258,22 @@ func runCLI(cmd string, args []string) int {
 	case "config":
 		req.GraceMinutes, req.HeadroomGB, req.IdleMinutes = *grace, *headroom, *idle
 		if *dryRun != "" {
-			v := *dryRun == "true"
+			v, perr := parseBool(*dryRun)
+			if perr != nil {
+				return fail(fmt.Errorf("--dry-run: %w", perr))
+			}
 			req.DryRun = &v
 		}
 		if *pause >= 0 {
 			req.PauseMinutes = pause
 		}
 		if *autoStop != "" {
-			level, v, _ := strings.Cut(*autoStop, "=")
-			req.AutoStop = map[string]bool{level: v == "on" || v == "true"}
+			level, s, ok := strings.Cut(*autoStop, "=")
+			v, perr := parseBool(s)
+			if !ok || level == "" || perr != nil {
+				return fail(fmt.Errorf("--auto-stop wants level=on|off, got %q", *autoStop))
+			}
+			req.AutoStop = map[string]bool{level: v}
 		}
 		var cfg model.Config
 		if err = callApproved("/config", req, &cfg); err == nil {
@@ -329,6 +336,18 @@ func runCLI(cmd string, args []string) int {
 		return 2
 	}
 	return fail(err)
+}
+
+// parseBool reads a yes/no flag value. Anything it does not recognise is an error, never a
+// silent "false": `--dry-run=yes` once turned dry run off.
+func parseBool(s string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "true", "t", "yes", "y", "on", "1":
+		return true, nil
+	case "false", "f", "no", "n", "off", "0":
+		return false, nil
+	}
+	return false, fmt.Errorf("%q is not true or false (also accepted: yes/no, on/off, 1/0)", s)
 }
 
 func fail(err error) int {
@@ -438,14 +457,20 @@ func runSetup(what, sub string, uninstall, asJSON bool) error {
 		fmt.Println("repaired: everything installed now points at", setup.SelfPath())
 		return nil
 	case "uninstall":
-		errs := setup.Uninstall()
-		for _, e := range errs {
+		r := setup.Uninstall()
+		for _, d := range r.Done {
+			fmt.Println(d)
+		}
+		for _, e := range r.Errs {
 			fmt.Fprintln(os.Stderr, "agentrm:", e)
 		}
-		if len(errs) == 0 {
-			fmt.Println("removed the Claude hooks, the Codex note, the CLI link and the PATH shim; paused resources were resumed.")
-			fmt.Println("To remove the app, quit it and move it to the Bin.")
+		if len(r.Errs) > 0 {
+			return fmt.Errorf("uninstall did not finish: %d problem(s) above; fix them and run agentrm setup uninstall again", len(r.Errs))
 		}
+		if len(r.Done) == 0 {
+			fmt.Println("nothing of AgentRM's was installed.")
+		}
+		fmt.Println("To remove the app, quit it and move it to the Bin.")
 		return nil
 	case "mcp":
 		bin := setup.SelfPath()
