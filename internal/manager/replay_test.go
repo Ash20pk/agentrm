@@ -26,7 +26,7 @@ func recordScenario(t *testing.T, usedAt time.Duration) string {
 	agentUp := func() map[int]*sys.Proc {
 		return map[int]*sys.Proc{
 			1:   {PID: 1, Exe: "/sbin/launchd"},
-			400: {PID: 400, PPID: 1, Exe: "/Applications/Warp.app/Contents/MacOS/stable"},
+			400: {PID: 400, PPID: 1, Exe: "/Applications/Warp.app/Contents/MacOS/stable", Path: "/Applications/Warp.app/Contents/MacOS/stable"},
 			500: {PID: 500, PPID: 400, Exe: "/usr/local/bin/claude", Args: "claude", Start: t0.Add(-time.Hour), RSSMB: 300},
 			700: {PID: 700, PPID: 1, Exe: "node", Args: "node server.js", Start: t0, RSSMB: 500},
 		}

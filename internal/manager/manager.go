@@ -62,6 +62,7 @@ type Manager struct {
 	agentSessions   map[int]string
 	recent          map[string][]cmdRecord
 	hookSeen        map[string]time.Time // agent kind -> last hook call
+	claimRefused    map[string]bool      // "pid session": a hook that named another agent's session, reported once
 	waiters         []*model.Waiter
 	swapRate        float64
 	lastSwapouts    float64
@@ -122,7 +123,7 @@ func New(o Options) *Manager {
 		agentSessions: map[int]string{}, recent: map[string][]cmdRecord{}, failed: map[string]error{},
 		activity: evidence.NewActivity(), dockerOrigin: map[string]origin{}, pending: map[string]string{},
 		connSeen: map[string]map[string]bool{}, footBase: map[string]float64{}, wouldDecided: map[string]bool{},
-		missing: map[string]int{}, hookSeen: map[string]time.Time{}, infos: newInfoCache(nil), stale: map[int]bool{}, selfPID: os.Getpid(),
+		missing: map[string]int{}, hookSeen: map[string]time.Time{}, claimRefused: map[string]bool{}, infos: newInfoCache(nil), stale: map[int]bool{}, selfPID: os.Getpid(),
 		parked: map[*model.Waiter][]chan *api.AcquireResp{}, backfilled: map[*model.Waiter]map[string]bool{},
 		kick: make(chan struct{}, 1), readFast: sys.ReadFast,
 	}
@@ -349,7 +350,7 @@ var readOnly = map[string]bool{"/status": true, "/whoami": true, "/approval": tr
 func (m *Manager) handleFacts(ctx context.Context, path string, h handler, facts facts, req api.Req) (any, error) {
 	if rec := m.recorder(); rec != nil && !readOnly[path] {
 		rec.Write(trace.Frame{T: m.now(), Request: &trace.Request{Path: path, Req: req, Facts: trace.Facts{
-			PID: facts.pid, AgentPID: facts.agentPID, Agent: facts.agent, GUI: facts.gui, App: facts.app, ViaApp: facts.viaApp}}})
+			PID: facts.pid, AgentPID: facts.agentPID, Agent: facts.agent, GUI: facts.gui, App: facts.app, AppPID: facts.appPID, ViaApp: facts.viaApp}}})
 	}
 	m.mu.Lock()
 	caller := m.resolve(facts, &req)

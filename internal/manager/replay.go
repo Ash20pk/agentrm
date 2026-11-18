@@ -303,7 +303,7 @@ func replayAgentRM(path string, truth *usage, o ReplayOptions) (*ReplayReport, e
 			if !ok {
 				continue
 			}
-			fx := facts{pid: r.Facts.PID, agentPID: r.Facts.AgentPID, agent: r.Facts.Agent, gui: r.Facts.GUI, app: r.Facts.App, viaApp: r.Facts.ViaApp}
+			fx := facts{pid: r.Facts.PID, agentPID: r.Facts.AgentPID, agent: r.Facts.Agent, gui: r.Facts.GUI, app: r.Facts.App, appPID: r.Facts.AppPID, viaApp: r.Facts.ViaApp, procs: lastProcs}
 			if r.Path == "/approve" || r.Path == "/config" || r.Path == "/priority" || r.Path == "/review" {
 				continue // a person's settings and marks: not part of the policy
 			}

@@ -165,7 +165,9 @@ func (m *Manager) checkLiveness(procs map[int]*sys.Proc, now time.Time) {
 			byAgent[apid] = append(byAgent[apid], p)
 			// The environment names the agent's real session, which is what the hooks would
 			// say: learn it, so a session is one session however it was first seen.
-			if info := m.infos.get(p); info.Session != "" && m.agentSessions[apid] == "" && sys.AgentKind(procs[apid]) == "claude" {
+			// An environment can be set by hand: a session another live agent holds is not learned.
+			if info := m.infos.get(p); info.Session != "" && m.agentSessions[apid] == "" && sys.AgentKind(procs[apid]) == "claude" &&
+				m.sessionHolder(info.Session, apid, procs) == 0 {
 				m.learnSession(apid, info.Session)
 			}
 		}

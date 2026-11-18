@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"agentrm/internal/api"
 	"agentrm/internal/sys"
@@ -17,7 +18,11 @@ type facts struct {
 	agent    string
 	gui      bool
 	app      string
+	appPID   int // the GUI app's process, when gui
 	viaApp   bool
+	// procs is the table the facts were read from: it says which agent processes are alive.
+	// nil when unknown (a replayed request).
+	procs map[int]*sys.Proc
 }
 
 func gatherFacts(pid int) facts {
@@ -26,8 +31,10 @@ func gatherFacts(pid int) facts {
 		return f
 	}
 	procs := sys.Procs.Lookup(pid)
+	f.procs = procs
 	f.agentPID, f.agent = sys.AgentAncestor(procs, pid)
-	f.gui, f.app, f.viaApp = sys.GUIAncestor(procs, pid)
+	g := sys.CallerGUI(procs, pid)
+	f.gui, f.app, f.appPID, f.viaApp = g.Found, g.App, g.AppPID, g.ViaApp
 	return f
 }
 
@@ -53,10 +60,15 @@ func (m *Manager) resolve(f facts, req *api.Req) api.Caller {
 	case f.agent != "":
 		// A hook's session ID names the agent it runs under, unless the hook says it is another
 		// agent's (run by hand, or from inside a different agent): then it renames nothing.
+		// A session that is another live agent's is not taken over: the caller keeps its own.
 		if req.Via == "hook" && (req.Agent == "" || req.Agent == f.agent) {
 			m.hookSeen[f.agent] = m.now()
 			if real := req.Session; real != "" && m.agentSessions[f.agentPID] != real {
-				m.learnSession(f.agentPID, real, f.agent)
+				if holder := m.sessionHolder(real, f.agentPID, f.procs); holder != 0 {
+					m.refuseClaim(f, real, holder)
+				} else {
+					m.learnSession(f.agentPID, real, f.agent)
+				}
 			}
 		}
 		c.Session = m.sessionOf(f.agentPID, f.agent)
@@ -64,10 +76,14 @@ func (m *Manager) resolve(f facts, req *api.Req) api.Caller {
 		// An agent that runs inside an app (Cursor's): its ancestry shows the app, so it would
 		// pass for you. It says it is an agent, and is taken at its word, because that can
 		// only lower its rights: an agent may do less than a person.
+		//
+		// Its session ID is its own word too, so it is kept inside a name of its own
+		// (agent:app-pid:id): it can never name a session of another agent, or of an agent in
+		// another app. (Agents inside the same app process cannot be told apart by ancestry.)
 		c.Agent, c.App = req.Agent, f.app
-		c.Session = req.Session
-		if c.Session == "" {
-			c.Session = req.Agent + "-app"
+		c.Session = req.Agent + ":" + strconv.Itoa(f.appPID)
+		if req.Session != "" {
+			c.Session += ":" + req.Session
 		}
 		m.hookSeen[req.Agent] = m.now()
 	case f.gui:
@@ -88,6 +104,48 @@ func (m *Manager) resolve(f facts, req *api.Req) api.Caller {
 
 // hookAgents are the agents whose hooks AgentRM installs besides Claude Code's.
 var hookAgents = map[string]bool{"codex": true, "gemini": true, "cursor": true}
+
+// sessionHolder returns the live agent process, other than pid, that session id belongs to, or
+// 0 when none does. A session whose agent exited may be taken up by a new process (a resumed
+// session); one whose agent is alive may not. With no process table (procs nil) a bound agent
+// counts as alive. Must be called with mu held.
+func (m *Manager) sessionHolder(id string, pid int, procs map[int]*sys.Proc) int {
+	alive := func(q int, start time.Time) bool {
+		if procs == nil {
+			return true
+		}
+		p := procs[q]
+		return p != nil && sys.AgentKind(p) != "" && sys.SameProcess(p, start)
+	}
+	if s := m.st.Sessions[id]; s != nil && s.EndedAt == nil && s.AgentPID > 0 && s.AgentPID != pid && alive(s.AgentPID, s.AgentStart) {
+		return s.AgentPID
+	}
+	for q, sid := range m.agentSessions {
+		if sid != id || q == pid {
+			continue
+		}
+		var start time.Time
+		if s := m.st.Sessions[id]; s != nil && s.AgentPID == q {
+			start = s.AgentStart
+		}
+		if alive(q, start) {
+			return q
+		}
+	}
+	return 0
+}
+
+// refuseClaim reports, once per agent process and session, a hook that named another live
+// agent's session. Must be called with mu held.
+func (m *Manager) refuseClaim(f facts, id string, holder int) {
+	key := strconv.Itoa(f.agentPID) + " " + id
+	if m.claimRefused[key] {
+		return
+	}
+	m.claimRefused[key] = true
+	m.event("TAMPER a hook under %s (pid %d) named session %s, which belongs to the live agent pid %d: ignored, it keeps its own session.",
+		agentTitle(f.agent), f.agentPID, short(id), holder)
+}
 
 // learnSession records that agent process pid is the agent's session real (as its hooks or its
 // commands' environment say), and moves anything recorded under the placeholder name to it.
@@ -133,6 +191,9 @@ func (m *Manager) learnSession(pid int, real string, kind ...string) {
 func agentOfSession(s string) string {
 	if s == "you" {
 		return "you"
+	}
+	if k, _, ok := strings.Cut(s, ":"); ok && hookAgents[k] {
+		return k // an agent inside an app: agent:app-pid:id
 	}
 	if i := strings.LastIndex(s, "-"); i > 0 {
 		if _, err := strconv.Atoi(s[i+1:]); err == nil {

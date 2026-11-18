@@ -29,6 +29,10 @@ func ListProcs() map[int]*Proc {
 		rss, _ := strconv.ParseFloat(f[2], 64)
 		cpu, _ := strconv.ParseFloat(f[3], 64)
 		p := &Proc{PID: pid, PPID: ppid, RSSMB: rss / 1024, CPU: cpu, Exe: f[9], Args: strings.Join(f[9:], " ")}
+		// The real executable, from the kernel: one proc_info call, microseconds. Identity
+		// decisions use it, never argv.
+		p.Path = ExePath(pid)
+		p.Exe = fullExe(p.Exe, p.Args, p.Path)
 		if st, ok := ParseLstart(strings.Join(f[4:9], " ")); ok {
 			p.Start = st
 		}
@@ -38,6 +42,16 @@ func ListProcs() map[int]*Proc {
 		return nil
 	}
 	return procs
+}
+
+// fullExe mends an argv[0] that ps split at a space ("/Applications/Visual" for
+// "/Applications/Visual Studio Code.app/..."): when the command line starts with the real
+// executable path, that path is argv[0]. Display only; identity uses Path.
+func fullExe(exe, args, path string) string {
+	if path != "" && strings.HasPrefix(path, exe+" ") && (args == path || strings.HasPrefix(args, path+" ")) {
+		return path
+	}
+	return exe
 }
 
 // ParseLstart reads ps's lstart column in the C locale: "Tue Nov 17 00:30:24 2026", local time.

@@ -15,7 +15,7 @@ import (
 func agentTree(start time.Time) map[int]*sys.Proc {
 	return map[int]*sys.Proc{
 		1:   {PID: 1, PPID: 0, Exe: "/sbin/launchd", Args: "/sbin/launchd"},
-		400: {PID: 400, PPID: 1, Exe: "/Applications/Warp.app/Contents/MacOS/stable", Args: "stable"},
+		400: {PID: 400, PPID: 1, Exe: "/Applications/Warp.app/Contents/MacOS/stable", Path: "/Applications/Warp.app/Contents/MacOS/stable", Args: "stable"},
 		500: {PID: 500, PPID: 400, Exe: "/usr/local/bin/claude", Args: "claude", Start: start, RSSMB: 300},
 		600: {PID: 600, PPID: 500, Exe: "npm", Args: "npm run dev", Start: start.Add(time.Minute), RSSMB: 60},
 		601: {PID: 601, PPID: 600, Exe: "node", Args: "node vite", Start: start.Add(time.Minute), RSSMB: 400},
@@ -435,7 +435,7 @@ func TestStaleAgentIsListedAndOnlyAsked(t *testing.T) {
 		t.Fatalf("stale agent not listed as ask-only with its subtree: %+v", res)
 	}
 	// One under a terminal is not stale, however quiet.
-	procs[400] = &sys.Proc{PID: 400, PPID: 1, Exe: "/Applications/Warp.app/Contents/MacOS/stable"}
+	procs[400] = &sys.Proc{PID: 400, PPID: 1, Exe: "/Applications/Warp.app/Contents/MacOS/stable", Path: "/Applications/Warp.app/Contents/MacOS/stable"}
 	procs[500].PPID = 400
 	m.checkLiveness(procs, c.Now())
 	if len(m.withLeftovers(nil, procs)) != 0 {
@@ -469,10 +469,19 @@ func TestMCPServerOfAGoneAgentIsCollected(t *testing.T) {
 func TestAgentInsideAnAppIsAnAgentNotYou(t *testing.T) {
 	m, _ := newTest(t, 8)
 	m.mu.Lock()
-	c := m.resolve(facts{pid: 900, gui: true, app: "Cursor.app"}, &api.Req{Via: "hook", Agent: "cursor", Session: "conv-1"})
+	c := m.resolve(facts{pid: 900, gui: true, app: "Cursor.app", appPID: 77}, &api.Req{Via: "hook", Agent: "cursor", Session: "conv-1"})
 	m.mu.Unlock()
-	if c.Human || c.Agent != "cursor" || c.Session != "conv-1" {
+	if c.Human || c.Agent != "cursor" || c.Session != "cursor:77:conv-1" || agentOfSession(c.Session) != "cursor" {
 		t.Fatalf("Cursor's agent passed for a person: %+v", c)
+	}
+	// Its session ID is its own word: naming a live Claude session lands in a name of its own.
+	m.agentSessions[500] = "claude-real"
+	liveSession(m, "claude-real", m.now())
+	m.mu.Lock()
+	c = m.resolve(facts{pid: 903, gui: true, app: "Cursor.app", appPID: 77}, &api.Req{Via: "hook", Agent: "cursor", Session: "claude-real"})
+	m.mu.Unlock()
+	if c.Session == "claude-real" || m.st.Sessions["claude-real"].Agent != "claude" {
+		t.Fatalf("an agent inside an app took over another agent's session: %+v", c)
 	}
 	// Without the hook's word it is you; claiming to be you from an agent gets nothing.
 	m.mu.Lock()

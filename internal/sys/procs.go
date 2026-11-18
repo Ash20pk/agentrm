@@ -14,6 +14,12 @@ type Proc struct {
 	RSSMB     float64
 	CPU       float64
 	Exe, Args string
+	// Path is the executable's real path, from the kernel (proc_pidpath on macOS,
+	// /proc/<pid>/exe on Linux), or "" when it could not be read. Exe and Args are what the
+	// process says about itself (argv) and are only good for display and for naming agents:
+	// any process can set its argv[0] to "/Applications/AgentRM.app/...". Every decision about
+	// who a caller is uses Path.
+	Path string
 	// Start is when the process started (to the second). A PID is reused after a process
 	// exits; the pair (PID, Start) is what identifies one process over time.
 	Start time.Time
@@ -146,21 +152,59 @@ func AgentAncestor(procs map[int]*Proc, pid int) (int, string) {
 	return 0, ""
 }
 
-// GUIAncestor reports whether pid descends from a GUI app (a terminal, an IDE, the AgentRM
-// app), which app that is, and whether it is AgentRM itself. A process that was detached and
-// now hangs off launchd has no such ancestor: it is nobody's, and is never treated as a person.
+// GUIAncestor reports whether pid or one of its ancestors is a GUI app (a terminal, an IDE, the
+// AgentRM app), which app that is, and whether it is the AgentRM app. A process that was
+// detached and now hangs off launchd has no such ancestor: it is nobody's, and is never treated
+// as a person. Apps are recognised by their real executable path (Path), never by argv.
 func GUIAncestor(procs map[int]*Proc, pid int) (found bool, app string, viaAgentRM bool) {
+	if _, app := guiAbove(procs, pid); app != "" {
+		return true, app, app == "AgentRM.app"
+	}
+	return false, "", false
+}
+
+// guiAbove walks up from pid (included) to the nearest GUI app, by real executable path.
+func guiAbove(procs map[int]*Proc, pid int) (appPID int, app string) {
 	for i := 0; i < 64 && pid > 1; i++ {
 		p := procs[pid]
 		if p == nil {
-			return false, "", false
+			return 0, ""
 		}
-		if app, ok := guiApp(p.Exe); ok {
-			return true, app, strings.Contains(p.Exe, "/AgentRM.app/Contents/") || app == "agentrm-app"
+		if app, ok := guiApp(p.Path); ok {
+			return p.PID, app
 		}
 		pid = p.PPID
 	}
-	return false, "", false
+	return 0, ""
+}
+
+// GUICaller is what the process table says about whether a person is behind a caller.
+type GUICaller struct {
+	Found  bool   // a GUI app is above the caller
+	App    string // which app ("Warp.app")
+	AppPID int    // that app's process
+	ViaApp bool   // the caller is the AgentRM app itself (see AppCaller)
+}
+
+// CallerGUI decides, for a caller on the socket, whether a person is behind it.
+//
+// The caller's own executable never makes it a GUI app: the walk starts at its parent, so a
+// process that dressed itself up as an app and hangs off launchd is detached. The one
+// exception is the AgentRM app, recognised by AppCaller from the kernel's view of the caller
+// and its parent (real paths, a trusted bundle, the same signing team as this daemon).
+func CallerGUI(procs map[int]*Proc, pid int) GUICaller {
+	p := procs[pid]
+	if p == nil {
+		return GUICaller{}
+	}
+	if AppCaller(procs, pid) {
+		return GUICaller{Found: true, App: "AgentRM.app", AppPID: p.PPID, ViaApp: true}
+	}
+	if p.PPID <= 1 {
+		return GUICaller{}
+	}
+	appPID, app := guiAbove(procs, p.PPID)
+	return GUICaller{Found: app != "", App: app, AppPID: appPID}
 }
 
 // SubtreeRSS sums the resident memory of every descendant of each agent process.
@@ -220,8 +264,12 @@ var linuxGUI = map[string]bool{
 	"code": true, "cursor": true, "zed": true, "zeditor": true, "idea": true, "goland": true, "agentrm-app": true,
 }
 
-// guiApp says whether exe is an app a person works in, and which.
+// guiApp says whether the executable at path is an app a person works in, and which. path is
+// a real executable path from the kernel; "" (unknown) is no app.
 func guiApp(exe string) (string, bool) {
+	if exe == "" {
+		return "", false
+	}
 	if i := strings.Index(exe, ".app/Contents/"); i >= 0 {
 		return filepath.Base(exe[:i+4]), true
 	}
