@@ -4,16 +4,20 @@ package setup
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"agentrm/internal/api"
+	"agentrm/internal/discover"
+	"agentrm/internal/model"
 	"agentrm/internal/store"
 )
 
@@ -495,31 +499,114 @@ func Repair() error {
 	return nil
 }
 
+// UninstallResult is what Uninstall did, and what it could not do.
+type UninstallResult struct {
+	Done []string
+	Errs []error
+}
+
 // Uninstall removes everything AgentRM installed into other tools, and thaws anything paused.
-func Uninstall() []error {
-	var errs []error
-	if err := api.Call("/resume", api.Req{All: true}, nil); err != nil && err != api.ErrDaemonDown {
-		errs = append(errs, fmt.Errorf("resume paused resources: %w", err))
+// It carries on past a failure, so one broken file does not leave everything else installed,
+// and reports every failure: the caller must not claim success when Errs is not empty.
+func Uninstall() UninstallResult {
+	var r UninstallResult
+	step := func(what string, err error) {
+		if err != nil {
+			r.Errs = append(r.Errs, fmt.Errorf("%s: %w", what, err))
+		} else {
+			r.Done = append(r.Done, what)
+		}
+	}
+	var n api.CountResp
+	// Unpausing many containers can take longer than an ordinary call's 5 s.
+	switch err := api.CallTimeout(45*time.Second, "/resume", api.Req{All: true}, &n); {
+	case errors.Is(err, api.ErrDaemonDown):
+		names, err := resumeOffline()
+		if len(names) > 0 {
+			r.Done = append(r.Done, "resumed what AgentRM had paused: "+strings.Join(names, ", "))
+		}
+		if err != nil {
+			r.Errs = append(r.Errs, fmt.Errorf("resume paused resources (the daemon is not running): %w", err))
+		}
+	case err != nil:
+		r.Errs = append(r.Errs, fmt.Errorf("resume paused resources: %w", err))
+	case n.N > 0:
+		r.Done = append(r.Done, fmt.Sprintf("resumed %d paused resource(s)", n.N))
 	}
 	if ok, _ := ClaudeHooksInstalled(); ok {
-		if err := SetupClaude(true); err != nil {
-			errs = append(errs, err)
+		step("removed the Claude Code hooks", SetupClaude(true))
+	}
+	for _, a := range otherAgents {
+		if AgentHooksInstalled(a.name) {
+			step("removed the "+a.title+" hooks from "+a.path(), SetupAgentHooks(a.name, true))
 		}
 	}
 	if CodexNoteInstalled() {
-		if err := SetupCodex(true); err != nil {
-			errs = append(errs, err)
-		}
+		step("removed the Codex note from "+CodexAgentsPath(), SetupCodex(true))
 	}
 	if CLILink() != "" {
-		if err := SetupPath(true); err != nil {
-			errs = append(errs, err)
+		step("removed the command-line link "+CLILinkPath(), SetupPath(true))
+	}
+	if ShimInstalled() || shimBlockInstalled() {
+		step("removed the PATH shim", SetupShim(true))
+	}
+	return r
+}
+
+// shimBlockInstalled reports whether a shell startup file still has the shim block, even
+// with the shim directory gone.
+func shimBlockInstalled() bool {
+	for _, rc := range shimRCFiles() {
+		if raw, err := os.ReadFile(rc); err == nil && strings.Contains(string(raw), shimStart) {
+			return true
 		}
 	}
-	if ShimInstalled() {
-		if err := SetupShim(true); err != nil {
-			errs = append(errs, err)
+	return false
+}
+
+// resumeOffline thaws what state.json says is paused, for when the daemon is not running (it
+// would otherwise stay frozen after AgentRM is gone). It takes the daemon lock first, so it
+// never races a daemon that is starting up, and records the thaw in the state.
+func resumeOffline() ([]string, error) {
+	lock, err := store.LockDaemon()
+	if err != nil {
+		return nil, fmt.Errorf("%w. Run agentrm resume --all once it answers", err)
+	}
+	defer lock.Release()
+	st, _ := store.LoadState(store.Dir(), time.Now())
+	var names []string
+	var errs []error
+	for _, res := range st.Resources {
+		if res.PausedAt == nil {
+			continue
+		}
+		if err := discover.Resume(res); err != nil {
+			errs = append(errs, fmt.Errorf("%s is still paused (%v); resume it with: %s", res.ID, err, thawCommand(res)))
+			continue
+		}
+		res.PausedAt = nil
+		names = append(names, res.ID)
+	}
+	if len(names) > 0 {
+		sort.Strings(names)
+		b, err := json.MarshalIndent(st, "", "  ")
+		if err == nil {
+			err = store.WriteAtomic(filepath.Join(store.Dir(), "state.json"), b, 0o600)
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("resumed, but could not record it in state.json: %w", err))
 		}
 	}
-	return errs
+	return names, errors.Join(errs...)
+}
+
+// thawCommand is how to thaw a resource by hand, without the daemon.
+func thawCommand(r *model.Resource) string {
+	if len(r.Containers) > 0 {
+		return "docker unpause " + strings.Join(r.Containers, " ")
+	}
+	if r.PID > 0 {
+		return fmt.Sprintf("kill -CONT %d", r.PID)
+	}
+	return "agentrm resume " + r.ID
 }

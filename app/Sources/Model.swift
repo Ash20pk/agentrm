@@ -253,8 +253,17 @@ enum CLI {
                 }
                 let killer = DispatchWorkItem { if p.isRunning { p.terminate() } }
                 DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
+                // Drain both pipes at once: read one to the end first and a child that fills the
+                // other's buffer (64 KB) blocks on it forever.
+                let errBox = DataBox()
+                let errDone = DispatchSemaphore(value: 0)
+                DispatchQueue.global(qos: .userInitiated).async {
+                    errBox.data = err.fileHandleForReading.readDataToEndOfFile()
+                    errDone.signal()
+                }
                 let data = out.fileHandleForReading.readDataToEndOfFile()
-                let errData = err.fileHandleForReading.readDataToEndOfFile()
+                errDone.wait()
+                let errData = errBox.data
                 p.waitUntilExit()
                 killer.cancel()
                 if p.terminationStatus == 0 {
@@ -267,6 +276,9 @@ enum CLI {
             }
         }
     }
+
+    /// Holds what one reader thread read, handed over through a semaphore.
+    private final class DataBox: @unchecked Sendable { var data = Data() }
 
     static func text(_ args: [String]) async -> String {
         guard let d = try? await run(args) else { return "" }

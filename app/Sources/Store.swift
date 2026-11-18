@@ -50,10 +50,16 @@ final class Store: ObservableObject {
             registerDaemon()
         }
         timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
-            Task { @MainActor in await self?.refresh() }
+            Task { @MainActor in
+                // A slow `agentrm status` (a busy daemon) must not pile up behind itself.
+                guard let self, self.refreshesInFlight == 0 else { return }
+                await self.refresh()
+            }
         }
+        timer?.tolerance = 1
         Task {
             await refresh()
+            await restartDaemonIfStale()
             await refreshSetup()
             await refreshReview()
             await repairIfMoved()
@@ -90,18 +96,87 @@ final class Store: ObservableObject {
 
     func refresh() async {
         if frozen { return }
+        refreshesStarted += 1
+        let seq = refreshesStarted
+        refreshesInFlight += 1
+        defer { refreshesInFlight -= 1 }
+        let result: Result<Status, Error>
         do {
             let data = try await CLI.run(["status", "--json"])
-            let s = try CLI.decoder.decode(Status.self, from: data)
+            result = .success(try CLI.decoder.decode(Status.self, from: data))
+        } catch {
+            result = .failure(error)
+        }
+        // A refresh that started earlier but finished later must not overwrite a newer answer.
+        guard seq > refreshApplied else { return }
+        refreshApplied = seq
+        switch result {
+        case .success(let s):
             status = s
             daemonError = nil
             notifications.post(newEvents(s.events ?? []))
             record()
-        } catch {
+        case .failure(let error):
             status = nil
             daemonError = error.localizedDescription
         }
         loginItemStatus = service.status
+    }
+
+    private var refreshesInFlight = 0
+    private var refreshesStarted = 0
+    private var refreshApplied = 0
+    private var restartedStaleDaemon = false
+
+    /// The version of the helper bundled with this app, which is what the daemon should run.
+    var bundledVersion: String {
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
+    }
+
+    /// After a Sparkle update the daemon launchd started from the old app keeps running old code;
+    /// if the API version changed, every hook fails open and nothing is enforced. Restart it once
+    /// per launch when it reports another version, or refuses to talk to this one.
+    func restartDaemonIfStale() async {
+        if frozen || restartedStaleDaemon || service.status != .enabled { return }
+        let running = status?.daemon_version
+        let versionMismatch = running != nil && running != "dev" && running != bundledVersion
+        let apiMismatch = status == nil && (daemonError ?? "").contains("API version")
+        guard versionMismatch || apiMismatch else { return }
+        restartedStaleDaemon = true
+        let was = running ?? "an older API", now = bundledVersion
+        log.notice("daemon runs \(was, privacy: .public), app bundles \(now, privacy: .public): restarting it")
+        let label = "gui/\(getuid())/dev.agentrm.daemon"
+        if (try? await Self.launchctl(["kickstart", "-k", label])) == nil {
+            // Not loaded under that label (or launchctl refused): register it afresh.
+            try? await service.unregister()
+            registerDaemon()
+        }
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        await refresh()
+    }
+
+    private static func launchctl(_ args: [String]) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                let p = Process()
+                p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
+                p.arguments = args
+                p.standardOutput = FileHandle.nullDevice
+                p.standardError = FileHandle.nullDevice
+                do {
+                    try p.run()
+                    p.waitUntilExit()
+                } catch {
+                    cont.resume(throwing: error)
+                    return
+                }
+                if p.terminationStatus == 0 {
+                    cont.resume()
+                } else {
+                    cont.resume(throwing: CLI.Failure(message: "launchctl \(args.joined(separator: " ")) exited \(p.terminationStatus)"))
+                }
+            }
+        }
     }
 
     private func record() {
@@ -202,15 +277,30 @@ final class Store: ObservableObject {
     }
     func setup(_ what: String, install: Bool) { act(install ? ["setup", what] : ["setup", what, "--uninstall"]) }
 
-    /// Removes everything AgentRM installed into other tools, stops the daemon, and quits.
+    /// Removes everything AgentRM installed into other tools, stops the daemon, and quits. If
+    /// any step fails, it says which and changes nothing else: the daemon stays on, so paused
+    /// resources can still be resumed, and Uninstall can be tried again.
     func uninstall() {
         Task {
-            _ = try? await CLI.run(["setup", "uninstall"], timeout: 60)
+            let done: String
+            do {
+                let out = try await CLI.run(["setup", "uninstall"], timeout: 60)
+                done = String(data: out, encoding: .utf8) ?? ""
+            } catch {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "AgentRM could not uninstall everything"
+                alert.informativeText = "\(error.localizedDescription)\n\nThe background daemon is still on and the app stays installed. Fix the problem above, then choose Uninstall again."
+                alert.runModal()
+                await refreshSetup()
+                return
+            }
             unregisterDaemon()
             UserDefaults.standard.removeObject(forKey: "onboarded")
             let alert = NSAlert()
             alert.messageText = "AgentRM is uninstalled"
-            alert.informativeText = "The Claude Code hooks, the Codex note, the command-line link and the PATH shim were removed, anything paused was resumed, and the background daemon is off. Move AgentRM to the Bin to finish. Its data is in ~/.agentrm."
+            let steps = done.split(separator: "\n").filter { !$0.hasPrefix("To remove the app") }.joined(separator: "\n")
+            alert.informativeText = "\(steps)\n\nThe background daemon is off. Move AgentRM to the Bin to finish. Its data is in ~/.agentrm."
             alert.runModal()
             NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
             NSApp.terminate(nil)
