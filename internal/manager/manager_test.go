@@ -350,7 +350,7 @@ func TestAttribution(t *testing.T) {
 		100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude"},
 		101: {PID: 101, PPID: 100, Exe: "/bin/zsh", Args: "zsh"},
 		102: {PID: 102, PPID: 101, Exe: "node", Args: "node server.js"},
-		10:  {PID: 10, PPID: 1, Exe: "/Applications/Warp.app/Contents/MacOS/stable", Args: "stable"},
+		10:  {PID: 10, PPID: 1, Exe: "/Applications/Warp.app/Contents/MacOS/stable", Path: "/Applications/Warp.app/Contents/MacOS/stable", Args: "stable"},
 		11:  {PID: 11, PPID: 10, Exe: "-zsh", Args: "-zsh"},
 		12:  {PID: 12, PPID: 11, Exe: "node", Args: "node dev.js"},
 	}
@@ -755,6 +755,68 @@ func TestResolveIdentity(t *testing.T) {
 	}
 	if c = m.resolve(facts{pid: 9}, &api.Req{Session: "you"}); c.Human || c.Session != "detached" {
 		t.Fatalf("a detached caller got an identity: %+v", c)
+	}
+}
+
+// T201: nohup bash -c 'sleep 2; exec -a /tmp/AgentRM.app/Contents/x agentrm config ...' &
+// leaves a process hanging off launchd that names itself the app. It is detached: not you,
+// and not the app.
+func TestSpoofedAppCallerIsDetached(t *testing.T) {
+	m, _ := newTest(t, 8)
+	t.Cleanup(func() { sys.Procs.Set(nil) })
+	const term = "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+	sys.Procs.Set(map[int]*sys.Proc{
+		1:     {PID: 1, Path: "/sbin/launchd"},
+		99901: {PID: 99901, PPID: 1, Exe: "/tmp/AgentRM.app/Contents/x", Args: "/tmp/AgentRM.app/Contents/x config --dry-run=false", Path: "/usr/local/bin/agentrm"},
+		99902: {PID: 99902, PPID: 1, Exe: "/Applications/AgentRM.app/Contents/Helpers/agentrm", Path: "/tmp/AgentRM.app/Contents/Helpers/agentrm"},
+		99903: {PID: 99903, PPID: 1, Exe: term, Path: term},
+	})
+	for _, pid := range []int{99901, 99902, 99903} {
+		f := gatherFacts(pid)
+		m.mu.Lock()
+		c := m.resolve(f, &api.Req{Session: "you"})
+		m.mu.Unlock()
+		if f.gui || f.viaApp || c.Human || c.ViaApp || c.Session != "detached" {
+			t.Errorf("pid %d: facts %+v, caller %+v", pid, f, c)
+		}
+	}
+}
+
+// T201: a hooked agent that names another live agent's session (they are in agentrm status)
+// keeps its own; once that agent has exited, the session may be resumed.
+func TestHookCannotTakeOverALiveSession(t *testing.T) {
+	m, c := newTest(t, 8)
+	start := c.Now().Add(-time.Hour)
+	victim := liveSession(m, "victim", start) // agent pid 500
+	m.agentSessions[500] = "victim"
+	procs := map[int]*sys.Proc{
+		1:   {PID: 1},
+		500: {PID: 500, PPID: 1, Exe: "claude", Args: "claude", Start: start},
+		600: {PID: 600, PPID: 1, Exe: "claude", Args: "claude", Start: start},
+	}
+	hook := func(procs map[int]*sys.Proc) api.Caller {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.resolve(facts{pid: 601, agentPID: 600, agent: "claude", procs: procs}, &api.Req{Via: "hook", Session: "victim"})
+	}
+	for _, table := range []map[int]*sys.Proc{procs, nil} {
+		if got := hook(table); got.Session != "claude-600" || m.agentSessions[600] != "" || m.agentSessions[500] != "victim" || victim.EndedAt != nil {
+			t.Fatalf("another agent's session was taken over: %+v, bindings %v", got, m.agentSessions)
+		}
+	}
+	tamper := 0
+	for _, e := range m.events {
+		if e.Kind == "TAMPER" && strings.Contains(e.Text, "victim") {
+			tamper++
+		}
+	}
+	if tamper != 1 {
+		t.Fatalf("the attempt was reported %d times, want once", tamper)
+	}
+	// A PID reused by another process is not the session's agent.
+	reused := map[int]*sys.Proc{1: procs[1], 600: procs[600], 500: {PID: 500, PPID: 1, Exe: "claude", Args: "claude", Start: start.Add(time.Minute)}}
+	if got := hook(reused); got.Session != "victim" || m.agentSessions[600] != "victim" {
+		t.Fatalf("a session whose agent is gone was not resumed: %+v", got)
 	}
 }
 

@@ -18,7 +18,9 @@ func QuickProc(pid int) *Proc {
 	p := &Proc{PID: pid, PPID: int(kp.Eproc.Ppid)}
 	comm := string(bytes.TrimRight(kp.Proc.P_comm[:], "\x00"))
 	p.Exe, p.Args = comm, comm
+	p.Path = ExePath(pid)
 	// kern.procargs2: int32 argc, the exec path, NUL padding, then argc NUL-terminated args.
+	// All of it lives in the process's own memory: good for display, not for identity (Path).
 	if b, err := unix.SysctlRaw("kern.procargs2", pid); err == nil && len(b) > 4 {
 		argc := int(binary.LittleEndian.Uint32(b[:4]))
 		rest := b[4:]
@@ -55,7 +57,7 @@ func QuickAncestry(pid int) (agentPID int, agent string, gui bool) {
 		if k := AgentKind(p); k != "" {
 			return p.PID, k, false
 		}
-		if strings.Contains(p.Exe, ".app/Contents/") {
+		if isGUIApp(p.Path) {
 			gui = true
 		}
 		pid = p.PPID

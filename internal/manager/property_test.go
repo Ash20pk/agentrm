@@ -60,7 +60,7 @@ func (w *world) procs() map[int]*sys.Proc {
 	start := time.Date(2026, 11, 16, 8, 0, 0, 0, time.UTC)
 	ps := map[int]*sys.Proc{
 		1:   {PID: 1, Exe: "/sbin/launchd"},
-		400: {PID: 400, PPID: 1, Exe: "/Applications/Warp.app/Contents/MacOS/stable"},
+		400: {PID: 400, PPID: 1, Exe: "/Applications/Warp.app/Contents/MacOS/stable", Path: "/Applications/Warp.app/Contents/MacOS/stable"},
 	}
 	for _, pid := range w.agents {
 		if pid > 0 {

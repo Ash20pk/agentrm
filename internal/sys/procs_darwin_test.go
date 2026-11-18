@@ -24,3 +24,13 @@ func TestParseLstartAndStableStarts(t *testing.T) {
 		t.Fatalf("%d processes changed start time between two samples", moved)
 	}
 }
+
+func TestFullExeMendsAPathWithASpace(t *testing.T) {
+	const code = "/Applications/Visual Studio Code.app/Contents/MacOS/Electron"
+	if got := fullExe("/Applications/Visual", code+" --inspect", code); got != code {
+		t.Fatalf("fullExe = %q", got)
+	}
+	if got := fullExe("node", "node /x/server.js", "/opt/homebrew/bin/node"); got != "node" {
+		t.Fatalf("an argv[0] without a space was replaced: %q", got)
+	}
+}
