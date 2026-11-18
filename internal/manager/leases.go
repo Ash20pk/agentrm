@@ -53,7 +53,9 @@ func (m *Manager) acquire(c api.Caller, r api.Req) (any, []Effect, error) {
 	extraGB := 0.0
 	for _, l := range m.st.Leases {
 		if l.Session == c.Session && l.Kind == r.Kind {
-			if more := memGB - l.MemGB; more > 0.25 {
+			// The hook's automatic request declares nothing; it must not second-guess a lease
+			// the agent took with its own figure.
+			if more := memGB - l.MemGB; more > 0.25 && (r.MemGB > 0 || !l.Declared) {
 				extraGB = max(extraGB, more)
 				continue
 			}
@@ -83,6 +85,11 @@ func (m *Manager) acquire(c api.Caller, r api.Req) (any, []Effect, error) {
 	}
 	if ok, why, pos := m.admit(want, now); !ok {
 		m.kickSweep() // sample fast while someone waits
+		if r.MemGB <= 0 {
+			why += fmt.Sprintf(". That was AgentRM's estimate (%.1f GB). If you know this needs less, ask with your own figure: "+
+				"agentrm acquire --kind %s --mem <GB> --wait (what past leases here really used is in %s)",
+				memGB, r.Kind, m.receiptsPath(cwd))
+		}
 		return &api.AcquireResp{Reason: why + ". " + m.holders(), Queue: pos}, nil, nil
 	}
 	l := m.grant(&want, now, "")
@@ -112,6 +119,14 @@ func (m *Manager) grant(w *model.Waiter, now time.Time, note string) *model.Leas
 	}
 	if s := m.st.Sessions[w.Session]; s != nil {
 		l.BaseFootprintMB = s.FootprintMB
+	}
+	if l.Kind == model.KGradle {
+		l.DaemonBaseMB = map[string]float64{}
+		for id, r := range m.st.Resources {
+			if r.Kind == model.RKGradle {
+				l.DaemonBaseMB[id] = r.MemMB
+			}
+		}
 	}
 	m.stampTask(l)
 	if m.lastBackfill {
@@ -345,7 +360,7 @@ func (m *Manager) updateFootprints(procs map[int]*sys.Proc, now time.Time) {
 			// count, by footprint, so a simulator, a Gradle daemon or a dev server the session
 			// already had is not charged to the build.
 			if s := m.st.Sessions[l.Session]; s != nil {
-				l.UsedMB = m.usedSince(trees[s.AgentPID], l.Created.Add(-2*time.Second))
+				l.UsedMB = m.usedSince(trees[s.AgentPID], l.Created.Add(-2*time.Second)) + m.daemonGrowthMB(l)
 				l.PeakMB = max(l.PeakMB, l.UsedMB)
 				m.checkOverrun(l, now)
 			}
@@ -431,4 +446,29 @@ func (m *Manager) lastCmd(session string) string {
 // inferred is a lease AgentRM recorded itself because a session's process tree grew.
 func inferred(l *model.Lease) bool {
 	return l.Kind == model.KHeavy && strings.HasPrefix(l.Purpose, "inferred:")
+}
+
+// daemonGrowthMB is a gradle lease's share of what the Gradle and Kotlin daemons grew by since
+// it was granted. A Gradle build runs inside those daemons, which are not in the agent's process
+// tree (launchd is their parent), so measuring only what the session started saw the small
+// gradlew launcher and charged builds 20 times what they "used". A daemon that did not exist at
+// the grant was started by the build and counts in full. Shared equally by gradle leases that
+// overlap, since a daemon cannot say whose build grew it.
+func (m *Manager) daemonGrowthMB(l *model.Lease) float64 {
+	if l.Kind != model.KGradle || l.DaemonBaseMB == nil {
+		return 0
+	}
+	grew := 0.0
+	for id, r := range m.st.Resources {
+		if r.Kind == model.RKGradle && r.Unseen == nil {
+			grew += max(0, r.MemMB-l.DaemonBaseMB[id])
+		}
+	}
+	n := 0
+	for _, o := range m.st.Leases {
+		if o.Kind == model.KGradle {
+			n++
+		}
+	}
+	return grew / float64(max(n, 1))
 }

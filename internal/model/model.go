@@ -153,9 +153,12 @@ type Lease struct {
 	UsedMB float64 `json:"used_mb,omitempty"`
 	// BaseFootprintMB is the session's process-tree memory when the lease was granted.
 	BaseFootprintMB float64 `json:"base_footprint_mb,omitempty"`
-	Declared        bool    `json:"declared,omitempty"` // the holder chose MemGB itself
-	HadResources    bool    `json:"had_resources,omitempty"`
-	Overran         bool    `json:"overran,omitempty"`
+	// DaemonBaseMB is what each Gradle and Kotlin daemon held when a gradle lease was granted. The
+	// build runs inside those daemons, not in a process it starts, so their growth is its use.
+	DaemonBaseMB map[string]float64 `json:"daemon_base_mb,omitempty"`
+	Declared     bool               `json:"declared,omitempty"` // the holder chose MemGB itself
+	HadResources bool               `json:"had_resources,omitempty"`
+	Overran      bool               `json:"overran,omitempty"`
 	// Until is an end time the holder declared; past it the lease is released, not renewed.
 	Until *time.Time `json:"until,omitempty"`
 	// Offered is when the lease was granted from the queue, until its session takes it up. A

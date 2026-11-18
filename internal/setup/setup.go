@@ -251,6 +251,10 @@ you run may be checked by it (and refused when the machine is short of memory).
   or a stack, a long build), run ` + "`agentrm acquire --kind <kind> --purpose \"<why>\"`" + `.
   Kinds: cluster compose docker-build cargo-build gradle xcode-build simulator emulator vm model
   loadtest server browser. Release it with ` + "`agentrm release <lease id>`" + ` when done.
+- You are charged the memory you ask for. Ask with your own figure, ` + "`--mem <GB>`" + `, taken from
+  what this project's past leases really used: AgentRM writes it to ` + "`~/.agentrm/receipts/<project>.txt`" + `
+  when each lease ends. Asking for far more than you use holds others back; using far more
+  than you asked means your figures are ignored for an hour.
 - If a command is refused by AgentRM, do not try to get around it. Tell the user what it said,
   or free something you hold. If it says you are queued, do not retry in a loop: run
   ` + "`agentrm acquire --kind <kind> --purpose \"<why>\" --wait`" + `, which returns when the lease is

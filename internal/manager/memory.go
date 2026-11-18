@@ -93,21 +93,18 @@ func (m *Manager) estimateGB(kind, cwd string) float64 {
 	return 1
 }
 
-// effectiveGB is the memory a request is charged. A requester may declare its own figure, but
-// never below what this kind really used, and a session caught using far more than it declared
-// loses the right to declare for an hour.
+// effectiveGB is the memory a request is charged. The agent knows its work and keeps the
+// receipts (receipts.go), so what it declares is what it is charged; AgentRM's estimate is only
+// for a request that declares nothing. The check is afterwards: real use is counted against
+// headroom as it runs whatever was declared, a far-off ask gets a receipt telling the agent
+// what to ask next time, and a session caught using far more than it declared (checkOverrun)
+// is charged at least the estimate for an hour.
 func (m *Manager) effectiveGB(kind, cwd string, declared float64, session string, now time.Time) float64 {
-	est := m.estimateGB(kind, cwd)
 	if declared <= 0 {
-		return est
+		return m.estimateGB(kind, cwd)
 	}
 	if s := m.st.Sessions[session]; s != nil && now.Before(s.DistrustUntil) {
-		return max(declared, est)
-	}
-	for _, key := range []string{kind + "@" + projectOf(cwd), kind} {
-		if mean := m.st.Learned[key]; mean > 0 {
-			return max(declared, mean/1024)
-		}
+		return max(declared, m.estimateGB(kind, cwd))
 	}
 	return declared
 }

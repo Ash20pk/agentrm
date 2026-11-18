@@ -59,6 +59,15 @@ that agent's lease; from your own process, it is yours.
 
 The CLI (`agentrm acquire --wait`, `agentrm yield`, …) is a thin client of the same API.
 
+**Memory figures and receipts.** A request that sets `mem_gb` is charged exactly that; AgentRM's
+own estimate is used only when it is left out. When a lease ends, AgentRM appends one line to
+`~/.agentrm/receipts/<project>.txt`: what was asked, what the work really used (footprint of what
+it started), and what to ask next time. Read it before asking. If the ask was far off (used under
+60% or over 125%), the session also gets the figure in its inbox. macOS cannot cap a process's
+memory, so a lease cannot stop an overrun: real use counts against what others are granted as it
+runs, the session is told at once, and for an hour its requests are charged at least AgentRM's
+estimate.
+
 A sketch of an orchestrator loop: before starting an agent's heavy step, `acquire` with
 `wait_seconds`; start the step when it returns granted; `release` when the step ends; answer
 `yield` questions from `/inbox` if the orchestrator knows the step is idle; and `end` the session

@@ -423,15 +423,17 @@ func TestEstimatesLearnPerProjectFromRealRuns(t *testing.T) {
 	}
 }
 
-func TestUnderDeclaringDoesNotPay(t *testing.T) {
+// What an agent declares is what it is charged, even below what AgentRM learned; only a
+// session caught overrunning loses that for an hour.
+func TestDeclaredFigureIsChargedUntilOverrun(t *testing.T) {
 	m, c := newTest(t, 8)
 	m.touchSession("s", "claude", "")
 	if got := m.effectiveGB("cargo-build", "", 0.5, "s", c.Now()); got != 0.5 {
 		t.Fatalf("no history: %.2f", got)
 	}
 	m.st.Learned["cargo-build"] = 2048
-	if got := m.effectiveGB("cargo-build", "", 0.5, "s", c.Now()); got != 2 {
-		t.Fatalf("declared below the learned mean: %.2f", got)
+	if got := m.effectiveGB("cargo-build", "", 0.5, "s", c.Now()); got != 0.5 {
+		t.Fatalf("declared below the learned mean was not charged as declared: %.2f", got)
 	}
 	delete(m.st.Learned, "cargo-build")
 	l := &model.Lease{ID: "L", Session: "s", Kind: "cargo-build", MemGB: 0.5, Declared: true, PeakMB: 2500}

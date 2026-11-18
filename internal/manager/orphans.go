@@ -264,6 +264,13 @@ func (m *Manager) prune(now time.Time) {
 			}
 		}
 	}
+	// Receipts and overrun notes are told once; a session that never came back to read one
+	// does not need it a day later (the receipts file keeps the figure).
+	for id, q := range m.st.Questions {
+		if (strings.HasPrefix(id, "receipt:") || strings.HasPrefix(id, "overran:")) && now.Sub(q.Created) > 24*time.Hour {
+			delete(m.st.Questions, id)
+		}
+	}
 	for key := range m.wouldDecided {
 		parts := strings.SplitN(key, ":", 2)
 		if len(parts) < 2 {

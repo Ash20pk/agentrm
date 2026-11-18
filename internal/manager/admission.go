@@ -547,6 +547,13 @@ func (m *Manager) checkOverrun(l *model.Lease, now time.Time) {
 	}
 	m.event("OVERRAN lease %s (%s) declared %.1f GB and used %.1f GB. Memory figures from %s are ignored until %s.",
 		l.ID, l.Kind, l.MemGB, l.PeakMB/1024, short(l.Session), now.Add(time.Hour).Format("15:04"))
+	// macOS cannot cap a process's memory, so the lease cannot stop it; the agent is told now,
+	// while it can still act, and its real use already counts against what others are granted.
+	m.st.Questions["overran:"+l.ID] = &model.Question{Created: now, For: l.Session,
+		Delivered: map[string]bool{}, Answers: map[string]string{},
+		Text: fmt.Sprintf("[agentrm] Your %s lease %s asked for %.1f GB and is using %.1f GB. Until %s your requests are "+
+			"charged at least AgentRM's estimate. Next time ask for about %.1f GB (agentrm acquire --kind %s --mem %.1f).",
+			l.Kind, l.ID, l.MemGB, l.PeakMB/1024, now.Add(time.Hour).Format("15:04"), suggestGB(l.PeakMB), l.Kind, suggestGB(l.PeakMB))}
 }
 
 // learn folds a finished lease's peak into the estimates for its kind and its project.
@@ -556,6 +563,7 @@ func (m *Manager) learn(l *model.Lease) {
 		kind = model.ResourceToLease[rk]
 	}
 	m.scoreCharge(l, kind)
+	m.writeReceipt(l, kind, m.now())
 	// Only leases that really ran something teach anything.
 	if kind == "" || l.PeakMB < minLearnMB || (model.LeaseToResource[kind] != "" && !l.HadResources) {
 		return
