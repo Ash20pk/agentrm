@@ -36,7 +36,7 @@ The Limits tab of the Activity window changes the common ones. Keys not listed a
 | Key | Default | Meaning |
 |---|---|---|
 | `dry_run` | true | Ask and report, but never pause or stop (except the levels turned on in `auto_stop`) |
-| `auto_stop` | {} | Levels that pause and stop on their own while `dry_run` is on, in order: `owner_gone`, `unclaimed`, `idle_lease`. `agentrm config --auto-stop owner_gone=on` |
+| `auto_stop` | {} | Levels that pause and stop on their own while `dry_run` is on, in order: `owner_gone`, `unclaimed`, `idle_lease`. `agentrm config --auto-stop owner_gone=on`. `engine_restart` (restart Docker Desktop when its VM holds memory no container uses) stands apart: off until you turn it on, even with `dry_run` off, and only once 5 of its decisions have been reviewed over 7 days |
 | `grace_minutes` | 10 | How long an orphan runs before it is paused |
 | `pause_minutes` | 30 | How long it stays paused before it is stopped; 0 stops directly |
 | `auto_thaw_on_connect` | true | Resume a paused server when something connects to it |

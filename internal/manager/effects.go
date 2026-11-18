@@ -107,6 +107,17 @@ func (m *Manager) applyEffects(results []EffectResult) {
 		case "stop":
 			if res.Err != nil {
 				m.event("STOP FAILED %s: %v", e.Res.ID, res.Err)
+				if discover.SelfRestarting(&e.Res) {
+					// Not tried again on every sweep: left alone as if it had restarted.
+					m.restartedAt[e.Res.ID] = &restartMark{at: now, sampled: true}
+				}
+				continue
+			}
+			if discover.SelfRestarting(&e.Res) {
+				m.restartedSelf(e.Res, e.Why, now)
+				delete(m.st.Resources, e.Res.ID)
+				delete(m.st.Questions, e.Res.ID)
+				m.activity.Forget(e.Res.ID)
 				continue
 			}
 			m.noteStopped(e.Res, now)

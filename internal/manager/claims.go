@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"agentrm/internal/api"
+	"agentrm/internal/discover"
 	"agentrm/internal/evidence"
 	"agentrm/internal/model"
 )
@@ -17,6 +18,9 @@ func (m *Manager) claim(c api.Caller, r api.Req) (any, []Effect, error) {
 	res := m.st.Resources[r.ResourceID]
 	if res == nil {
 		return nil, nil, fmt.Errorf("no running resource %q (see agentrm status)", r.ResourceID)
+	}
+	if discover.SelfRestarting(res) {
+		return nil, nil, fmt.Errorf("%s is not held itself; it is never restarted while anything uses it. Hold what you run in it instead", res.ID)
 	}
 	if op := m.pending[res.ID]; op == "stop" {
 		return nil, nil, fmt.Errorf("%s is being stopped right now; it can be restored with agentrm restore %s", res.ID, res.ID)

@@ -228,6 +228,21 @@ func (m *Manager) stopNow(c api.Caller, r api.Req) (any, []Effect, error) {
 	if c.Session == "detached" {
 		return nil, nil, fmt.Errorf("a detached process cannot stop anything")
 	}
+	if discover.SelfRestarting(res) {
+		if !c.Human {
+			return nil, nil, fmt.Errorf("%s is restarted only by you; an agent cannot", res.ID)
+		}
+		if busy := m.restartBlocker(res, m.now()); busy != "" {
+			return nil, nil, fmt.Errorf("not restarting %s: %s", res.ID, busy)
+		}
+		if err := m.privileged(c, "restart "+res.Name+" (gives back ~"+gb(res.MemMB)+")"); err != nil {
+			return nil, nil, err
+		}
+		m.pending[res.ID] = "stop"
+		why := "restarted by " + c.Session
+		m.decideAs("stop", res, why+" (by hand)", true)
+		return &api.StopResp{Restart: res.Restart}, []Effect{{Op: "stop", Res: *res, Why: why, By: c.Session}}, nil
+	}
 	if !c.Human && l == nil && res.StartedBy != c.Session {
 		// Nobody holds it, and this agent did not start it. An agent may stop only what AgentRM
 		// itself would stop: not something you started, not an app, a VM or another agent.

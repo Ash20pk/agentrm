@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"agentrm/internal/api"
+	"agentrm/internal/discover"
 	"agentrm/internal/evidence"
 	"agentrm/internal/model"
 	"agentrm/internal/shell"
@@ -92,6 +93,7 @@ type Manager struct {
 	returnProbes    []*returnProbe // stops whose effect on available memory is being measured
 	grantProbes     []*grantProbe  // recent grants, watched for the Mac starting to swap
 	cfgDirty        bool
+	restartedAt     map[string]*restartMark // what AgentRM restarted (it comes back by itself), and when
 
 	dirty    bool
 	saver    *store.Saver
@@ -125,7 +127,7 @@ func New(o Options) *Manager {
 		connSeen: map[string]map[string]bool{}, footBase: map[string]float64{}, wouldDecided: map[string]bool{},
 		missing: map[string]int{}, hookSeen: map[string]time.Time{}, claimRefused: map[string]bool{}, infos: newInfoCache(nil), stale: map[int]bool{}, selfPID: os.Getpid(),
 		parked: map[*model.Waiter][]chan *api.AcquireResp{}, backfilled: map[*model.Waiter]map[string]bool{},
-		kick: make(chan struct{}, 1), readFast: sys.ReadFast,
+		kick: make(chan struct{}, 1), readFast: sys.ReadFast, restartedAt: map[string]*restartMark{},
 	}
 	m.notify = o.Notify
 	if m.notify == nil {
@@ -435,7 +437,7 @@ func (m *Manager) holders() string {
 	}
 	var orphans []string
 	for _, r := range m.st.Resources {
-		if r.LeaseID == "" && r.MemMB > 200 {
+		if r.LeaseID == "" && r.MemMB > 200 && !discover.SelfRestarting(r) {
 			orphans = append(orphans, fmt.Sprintf("%s %.1f GB", r.ID, r.MemMB/1024))
 		}
 	}

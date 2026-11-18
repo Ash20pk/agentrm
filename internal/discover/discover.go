@@ -214,7 +214,8 @@ var databases = map[string]string{ // process name -> brew formula prefix
 }
 
 // Processes finds process-backed resources: Gradle and Kotlin daemons, dev servers, Android
-// emulators, VMs, local model servers, Homebrew databases and headless browsers.
+// emulators, VMs, local model servers, Homebrew databases, headless browsers and Docker
+// Desktop's own VM.
 func Processes(cfg model.Config, procs map[int]*sys.Proc) []*model.Resource {
 	var res []*model.Resource
 	sub := subtreeMB(procs)
@@ -258,6 +259,9 @@ func Processes(cfg model.Config, procs map[int]*sys.Proc) []*model.Resource {
 		case isHeadlessBrowser(a) && !isHeadlessBrowserParent(procs, p):
 			res = append(res, procRes(p, "browser", model.RKBrowser, "headless "+browserName(a), "", p.RSSMB+sub[p.PID]))
 		}
+	}
+	if r := dockerVM(procs); r != nil {
+		res = append(res, r)
 	}
 	// Listening dev servers.
 	for pid, ps := range sys.ListeningPorts() {
