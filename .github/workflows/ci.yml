@@ -30,7 +30,10 @@ jobs:
       - name: xcodegen
         run: brew install xcodegen && cd app && xcodegen generate -q
       - name: build (unsigned)
+        # pipefail: without it the exit status is tail's, and a failed build passes.
+        shell: bash
         run: |
+          set -euo pipefail
           cd app
           xcodebuild -project AgentRM.xcodeproj -scheme AgentRM -configuration Debug \
             CODE_SIGNING_ALLOWED=NO CODE_SIGN_IDENTITY="" -derivedDataPath build build | tail -20
