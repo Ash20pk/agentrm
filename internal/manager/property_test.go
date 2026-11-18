@@ -10,6 +10,7 @@ package manager
 //     request is granted or dropped, within a few sweeps.
 //  4. Leases and resources agree: a resource's lease exists and lists it.
 //  5. Nothing you started is paused or stopped by AgentRM.
+//  6. After a sweep, nothing stays paused for a prediction that is settled.
 
 import (
 	"fmt"
@@ -51,6 +52,11 @@ func newWorld(t *testing.T, seed int64) *world {
 	}
 	for i := 0; i < 4; i++ {
 		w.agents["s"+strconv.Itoa(i)] = 500 + i
+	}
+	// Predictions of every kind have earned the right to make room ahead, so that path runs too.
+	m.st.Accuracy = map[string]*model.Accuracy{}
+	for _, k := range kinds {
+		m.st.Accuracy["predict:"+k] = &model.Accuracy{N: 100, Actual: 100}
 	}
 	return w
 }
@@ -107,7 +113,7 @@ func (w *world) tail() []string {
 // step does one random thing.
 func (w *world) step(i int) {
 	m := w.m
-	switch op := w.rng.Intn(14); op {
+	switch op := w.rng.Intn(15); op {
 	case 0, 1, 2:
 		w.acquire(w.session())
 	case 3:
@@ -168,6 +174,17 @@ func (w *world) step(i int) {
 	case 10: // memory moves
 		m.mem.AvailableMB = max(512, m.mem.AvailableMB+float64(w.rng.Intn(4096)-2048))
 		w.log = append(w.log, fmt.Sprintf("mem %.1f GB", m.mem.AvailableMB/1024))
+	case 14: // a session runs something heavy: predictions are made, scored and acted on
+		// Mostly a fixed rhythm (compose, then a build), so predictions are confident.
+		s, kind := w.session(), "compose"
+		if m.predictState().Last[s] == "compose" {
+			kind = "cargo-build"
+		}
+		if w.rng.Intn(10) == 0 {
+			kind = kinds[w.rng.Intn(len(kinds))]
+		}
+		m.observeKind(s, "/src/app", kind, w.c.Now())
+		w.log = append(w.log, "runs "+kind+" "+s)
 	default: // time passes, with a sweep; sometimes something is used
 		w.c.Add(time.Duration(30+w.rng.Intn(300)) * time.Second)
 		var est map[string]bool
@@ -179,6 +196,12 @@ func (w *world) step(i int) {
 		}
 		w.sweep(est)
 		w.log = append(w.log, "sweep")
+		for _, r := range m.st.Resources {
+			// (A resume in flight counts: this world drops the effects requests return.)
+			if p := m.preps[r.PreparedFor]; r.PreparedFor != "" && r.PausedAt != nil && m.pending[r.ID] == "" && (p == nil || p.done != "") {
+				w.t.Fatalf("invariant 6: %s still paused for a settled prediction\n%v", r.ID, w.tail())
+			}
+		}
 	}
 	w.checkInvariants()
 }
