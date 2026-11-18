@@ -23,6 +23,9 @@ struct MenuView: View {
                 ForEach(store.failingSources, id: \.0) { src, why in
                     strip(color: Lamp.waiting.color, text: "Can't read \(src): \(why). Showing what it last reported.")
                 }
+                ForEach(s.leaks ?? []) { leak in
+                    strip(color: Lamp.nobody.color, text: leakText(leak))
+                }
                 meter(s, r)
                 gauges(s, r)
                 if !r.items.isEmpty { items(s, r) }
@@ -77,7 +80,9 @@ struct MenuView: View {
         VStack(alignment: .leading, spacing: 8) {
             LampLabel(lamp: Lamp.waiting.color, text: "Approval, expires \(Fmt.rel(a.expires))")
             Text(a.what).font(Face.body(17, .semibold)).fixedSize(horizontal: false, vertical: true)
-            Text("Asked from \(a.from ?? "a terminal"). If you didn't type it, an agent did.")
+            Text(a.path == "/leak"
+                 ? "AgentRM is asking: its memory keeps climbing and nothing explains it. Nothing happens unless you approve."
+                 : "Asked from \(a.from ?? "a terminal"). If you didn't type it, an agent did.")
                 .font(Face.body(12)).foregroundStyle(Color(hex: 0xC9C0A8)).fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 8) {
                 Spacer()
@@ -88,6 +93,18 @@ struct MenuView: View {
         .padding(12)
         .panel(Ink.amberPanel, stroke: Color(hex: 0x8A6A12))
         .shadow(color: Lamp.waiting.color.opacity(0.12), radius: 12)
+    }
+
+    // MARK: leaks
+
+    private func leakText(_ l: Leak) -> String {
+        var text = "Leaking: \(l.name ?? "a process")"
+        if let pid = l.pid { text += " (pid \(pid))" }
+        if let from = l.start_mb, let now = l.now_mb { text += ", \(Fmt.gb(from)) to \(Fmt.gb(now)) GB" }
+        if let since = l.since { text += " in \(Fmt.since(since))" }
+        if let rate = l.rate_mb_per_hour { text += String(format: ", +%.0f MB/h", rate) }
+        if l.dismissed == true { text += ". Left alone." }
+        return text
     }
 
     // MARK: meter

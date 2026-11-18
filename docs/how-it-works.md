@@ -166,6 +166,31 @@ collected as left behind. What is never paused or stopped automatically: VMs, th
 started, apps an agent launched, pinned and never-stop items; AgentRM asks about them instead. The Activity window's
 Collected tab lists each ended session with what it left and what happened to it.
 
+## Leak watch
+
+A long-lived dev process whose memory keeps climbing (a stuck tsserver or language server, a dev
+server that leaks, a Python process left running) holds more every hour and is never idle, so
+nothing above catches it. On each sweep AgentRM samples, every 5 minutes at most, the footprint of
+processes of 500 MB or more, keeping about two hours of samples per process (by PID and start
+time, so a reused PID starts afresh). A process is flagged as leaking when, over at least an hour
+and 12 samples, it grew by at least 500 MB and by half of where it started, the fitted trend
+accounts for most of that, at least four steps in five did not go down (dips under 2% count as
+flat), and it is still climbing in the second half of the window. A garbage collector's sawtooth,
+a cache filling once, or one jump is not a leak.
+
+Growth that something explains is not flagged: a process in the tree of a session holding a lease,
+a running build, a pinned, never-stop or leased resource, and kinds that are meant to grow (the
+Docker VM, emulators, simulators, browsers, Xcode, model servers, databases). AgentRM itself,
+agents, system and root processes, and apps are never watched; a language server an editor runs
+from inside its bundle is.
+
+A leak is only ever asked about: a `LEAK` event, a `LEAKING` line in `agentrm status`, and an
+approval in the app. Accepting restarts it if AgentRM knows how (a dev server or leftover whose
+command it recorded), else stops it with SIGTERM, start time checked. Only a person can accept, in
+the app or with `agentrm leak accept|dismiss LEAK` (from a terminal that waits for a click in the
+app). In dry run, and while everything is let through, leaks are reported and nothing is asked
+or done.
+
 ## Liveness by task
 
 An agent outlives its tasks: the dev server started for one branch is still running, unused,

@@ -48,3 +48,28 @@ func TestResumeWithoutAStartTimeThaws(t *testing.T) {
 		t.Fatalf("paused a process whose start was never recorded: %v", *sent)
 	}
 }
+
+// A restart for a leak: SIGTERM first, and nothing started beside a process that did not exit.
+func TestRestartWaitsForTheOldProcess(t *testing.T) {
+	start := time.Date(2026, 11, 16, 10, 0, 0, 0, time.UTC)
+	procs := map[int]*sys.Proc{300: {PID: 300, PPID: 1, Start: start}}
+	sent := fakeSignals(t, procs)
+	old := restartWait
+	restartWait = 300 * time.Millisecond
+	t.Cleanup(func() { restartWait = old })
+
+	if err := Restart(&model.Resource{ID: "srv:300", Kind: model.RKServer, PID: 300, ProcStart: start}); err == nil || len(*sent) != 0 {
+		t.Fatalf("restarted something with no known restart: %v %v", err, *sent)
+	}
+	r := &model.Resource{ID: "srv:300", Kind: model.RKServer, PID: 300, ProcStart: start, RestartArgv: []string{"/bin/true"}}
+	if err := Restart(r); err == nil {
+		t.Fatal("started again while the old process was still running")
+	}
+	term := false
+	for _, s := range *sent {
+		term = term || s == syscall.SIGTERM.String()+" 300"
+	}
+	if !term {
+		t.Fatalf("no SIGTERM: %v", *sent)
+	}
+}

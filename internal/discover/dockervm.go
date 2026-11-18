@@ -101,7 +101,7 @@ var (
 	quitWait    = 90 * time.Second
 	quitPoll    = 2 * time.Second
 	sleepFor    = time.Sleep
-	restartWait = 180 // seconds docker desktop restart may take
+	engineRestartWait = 180 // seconds docker desktop restart may take
 )
 
 // ErrDockerInUse: something runs in Docker, so its VM is not restarted.
@@ -125,7 +125,7 @@ func RestartDockerEngine() error {
 	if ids := strings.Fields(out); len(ids) > 0 {
 		return fmt.Errorf("%w: %d container(s) running; not restarting it", ErrDockerInUse, len(ids))
 	}
-	_, err = runDocker(time.Duration(restartWait+20)*time.Second, "desktop", "restart", "--timeout", fmt.Sprint(restartWait))
+	_, err = runDocker(time.Duration(engineRestartWait+20)*time.Second, "desktop", "restart", "--timeout", fmt.Sprint(engineRestartWait))
 	if err == nil {
 		return nil
 	}

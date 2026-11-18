@@ -179,6 +179,8 @@ type Status struct {
 	Accuracy map[string]*model.Accuracy `json:"accuracy,omitempty"`
 	// FailOpen is why AgentRM is letting everything through right now, if it is.
 	FailOpen string `json:"fail_open,omitempty"`
+	// Leaks are processes whose memory keeps climbing with nothing to explain it.
+	Leaks []*model.Leak `json:"leaks,omitempty"`
 }
 
 // TrustLevel is one auto-stop level, with the evidence for turning it on.

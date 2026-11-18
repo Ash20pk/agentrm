@@ -256,6 +256,31 @@ func Restore(r *model.Resource) error {
 	return fmt.Errorf("%s cannot be restored by AgentRM: %s", r.ID, r.Restart)
 }
 
+// restartWait is how long Restart waits for a process to exit after its SIGTERM.
+var restartWait = 10 * time.Second
+
+// Restart stops a process resource gracefully (SIGTERM to its tree, start time checked) and,
+// once it has exited, starts it again with the command, environment and directory it was
+// running with. A process that does not exit in time is not started a second time beside it.
+func Restart(r *model.Resource) error {
+	if !Restartable(r) || len(r.RestartArgv) == 0 {
+		return fmt.Errorf("%s has no known restart", r.ID)
+	}
+	if err := stopTree(r); err != nil {
+		return err
+	}
+	for deadline := time.Now().Add(restartWait); ; {
+		if p := quickProc(r.PID); p == nil || !sys.SameProcess(p, r.ProcStart) {
+			break
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s did not exit within %s of SIGTERM, so it was not started again", r.ID, restartWait)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return restartLeftover(r)
+}
+
 // Restartable says whether AgentRM may start a stopped process again from the command it was
 // running: leftovers and dev servers only. Never an agent (that would re-run `claude -p ...`
 // with nobody watching), a headless browser (its driver is gone), a Gradle or Kotlin daemon (the
