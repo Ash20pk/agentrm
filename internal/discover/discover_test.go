@@ -37,6 +37,7 @@ func TestProcessKinds(t *testing.T) {
 		41: {PID: 41, PPID: 40, Exe: "/Users/x/Library/Caches/ms-playwright/chromium-1/chrome-mac/Chromium.app/Contents/Frameworks/x/Helper", Args: "Chromium Helper --type=renderer --headless", RSSMB: 300},
 		50: {PID: 50, PPID: 1, Exe: "/Applications/Docker.app/Contents/MacOS/qemu-system-aarch64", Args: "qemu-system-aarch64 docker vm", RSSMB: 4000},
 	}
+	noFootprint(t, nil)
 	got := map[string]*model.Resource{}
 	for _, r := range Processes(model.DefaultConfig(), procs) {
 		got[r.ID] = r
@@ -58,6 +59,9 @@ func TestProcessKinds(t *testing.T) {
 	}
 	if got["vm:50"] != nil {
 		t.Error("Docker Desktop's own VM was listed as a VM to manage")
+	}
+	if r := got[DockerVMID]; r == nil || r.PID != 50 || r.Kind != model.RKDockerVM {
+		t.Errorf("Docker Desktop's own VM was not listed as itself: %+v", r)
 	}
 }
 

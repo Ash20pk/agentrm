@@ -416,6 +416,12 @@ func (m *Manager) reclaim(needMB float64, forSession string, now time.Time) stri
 			orphans = append(orphans, r)
 		}
 	}
+	for _, r := range m.st.Resources {
+		if discover.SelfRestarting(r) && r.Unseen == nil && !r.Pinned && !m.neverStop(r) && r.OrphanSince != nil &&
+			!m.dryFor(r) && r.MemMB >= selfRestartMinMB && m.restartBlocker(r, now) == "" && m.pending[r.ID] == "" {
+			orphans = append(orphans, r)
+		}
+	}
 	sort.Slice(orphans, func(i, j int) bool { return orphans[i].MemMB > orphans[j].MemMB })
 	for _, r := range orphans {
 		if freed >= needMB {

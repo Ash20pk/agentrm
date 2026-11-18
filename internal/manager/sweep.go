@@ -298,6 +298,11 @@ func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[
 	m.failed = found.Failed
 	seen := map[string]bool{}
 	for _, r := range found.Resources {
+		if r.Kind == model.RKDockerVM {
+			m.creditDockerVM(r, now)
+		}
+	}
+	for _, r := range found.Resources {
 		seen[r.ID] = true
 		old := m.st.Resources[r.ID]
 		if old != nil {
@@ -322,7 +327,11 @@ func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[
 		}
 		r.Pinned = m.st.Pinned[r.ID]
 		m.st.Resources[r.ID] = r
-		if r.LeaseID == "" {
+		if discover.SelfRestarting(r) {
+			// Nobody holds it: what runs in it (containers) is held instead. It is decided
+			// about on its own path (selfrestart.go).
+			r.LeaseID, r.StartedBy = "", ""
+		} else if r.LeaseID == "" {
 			// Ancestry and Docker events need no history, so they are tried on every sweep (and
 			// after a restart); what recent commands say only counts for something new.
 			m.attribute(r, procs, now, old == nil && m.firstDone)
@@ -348,7 +357,11 @@ func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[
 		if seen[id] || m.pending[id] != "" {
 			continue
 		}
-		m.noteGone(r, now)
+		if !discover.SelfRestarting(r) {
+			// Not for what comes back by itself: Docker's VM is gone while Docker restarts or
+			// is quit, and that says nothing about how long such things sit idle.
+			m.noteGone(r, now)
+		}
 		delete(m.st.Resources, id)
 		delete(m.st.Questions, id)
 		delete(m.st.Touches, id)

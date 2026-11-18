@@ -93,7 +93,7 @@ func runCLI(cmd string, args []string) int {
 	policy := fs.String("policy", "agentrm", "replay: agentrm or reaper")
 	cost := fs.String("cost", "", "yield: none, low or high")
 	days := fs.Int("days", 7, "receipt: how many days back")
-	autoStop := fs.String("auto-stop", "", "config: level=on|off (owner_gone, unclaimed, idle_lease)")
+	autoStop := fs.String("auto-stop", "", "config: level=on|off (owner_gone, unclaimed, idle_lease, engine_restart, xcode_helpers)")
 	restartSecs := fs.Int("restart-seconds", 0, "yield: how long bringing it back would take")
 	configFile := fs.String("config", "", "replay: a config.json to replay with (default: this Mac's)")
 	if err := fs.Parse(args); err != nil {

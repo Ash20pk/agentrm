@@ -38,6 +38,12 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 			// would only time out against the same engine. Nothing is decided until it is seen.
 			continue
 		}
+		if discover.SelfRestarting(r) {
+			if e := m.checkSelfRestarting(r, now); e != nil {
+				effects = append(effects, *e)
+			}
+			continue
+		}
 		if r.LeaseID != "" || r.Pinned || m.neverStop(r) {
 			if r.PausedAt != nil {
 				effects = append(effects, m.thawEffect(r, "it is held or pinned now"))
@@ -135,9 +141,17 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 
 // decide logs a pause, stop or reclaim decision for review.
 func (m *Manager) decide(action string, r *model.Resource, why string) {
+	m.decideAs(action, r, why, false)
+}
+
+// decideAs logs a decision; byHand is one a person took, which dry run does not hold back.
+func (m *Manager) decideAs(action string, r *model.Resource, why string, byHand bool) {
 	d := &model.Decision{ID: newID(), Time: m.now(), Action: action, Why: why, DryRun: m.cfg.DryRun}
 	if r != nil {
 		d.Category, d.DryRun = m.categoryOf(r), m.dryFor(r)
+	}
+	if byHand {
+		d.DryRun = false
 	}
 	if r != nil {
 		d.Resource, d.Name, d.MemMB = r.ID, r.Name, r.MemMB

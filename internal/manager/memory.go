@@ -13,6 +13,7 @@ package manager
 // Nothing outside this file should add up memory on its own.
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -132,4 +133,42 @@ func (m *Manager) usedSince(tree []*sys.Proc, t time.Time) float64 {
 		}
 	}
 	return total
+}
+
+// dockerVMIdleMB is what Docker Desktop's VM holds with nothing running, until it is measured
+// just after a restart (Apple silicon, Virtualization framework: 0.5 to 1 GB).
+const dockerVMIdleMB = 768
+
+// dockerVMIdle is the VM's idle size: learned, else the default.
+func (m *Manager) dockerVMIdle() float64 {
+	if v := m.st.DockerVMIdleMB; v > 0 {
+		return v
+	}
+	return dockerVMIdleMB
+}
+
+// creditDockerVM turns the VM's measured footprint into what restarting it gives back: all it
+// holds above its idle size. A few minutes after AgentRM restarted it, with nothing running,
+// its footprint is that idle size, and is learned. Must hold mu.
+func (m *Manager) creditDockerVM(r *model.Resource, now time.Time) {
+	full := r.MemMB
+	if mark := m.restartedAt[r.ID]; mark != nil && !mark.sampled {
+		since := now.Sub(mark.at)
+		switch {
+		case since > 15*time.Minute:
+			mark.sampled = true // too late: something may have run in it since
+		case since >= 3*time.Minute && m.dockerBusy(r, now) == "":
+			mark.sampled = true
+			sample := min(max(full, 256), 2048)
+			if old := m.st.DockerVMIdleMB; old > 0 {
+				m.st.DockerVMIdleMB = 0.7*old + 0.3*sample
+			} else {
+				m.st.DockerVMIdleMB = sample
+			}
+			m.event("LEARNED Docker Desktop's VM holds %.1f GB idle, just after a restart", sample/1024)
+		}
+	}
+	idle := m.dockerVMIdle()
+	r.MemMB = max(0, full-idle)
+	r.Detail = fmt.Sprintf("holds %.1f GB; about %.1f GB of it is what it needs idle", full/1024, idle/1024)
 }

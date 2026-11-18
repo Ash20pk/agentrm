@@ -19,6 +19,10 @@ func CanPause(r *model.Resource) bool {
 		return false
 	}
 	switch r.Kind {
+	case model.RKDockerVM: // a frozen engine hangs every docker command
+		return false
+	case model.RKXcodeHelper: // a frozen SourceKit hangs Xcode's editor
+		return false
 	case model.RKSimulator, model.RKDatabase: // simctl has no freeze; freezing a DB master alone leaves its workers
 		return false
 	case model.RKGradle:
@@ -31,9 +35,20 @@ func CanPause(r *model.Resource) bool {
 	return true
 }
 
-// CanAutoStop says whether AgentRM may stop a resource without the user. A VM is never
-// stopped automatically: for QEMU that is a hard power-off of a disk image.
-func CanAutoStop(r *model.Resource) bool { return r.Kind != model.RKVM && !r.AskOnly }
+// CanAutoStop says whether AgentRM may stop a resource without the user on the ordinary path
+// (asked, paused, stopped). A VM is never stopped automatically: for QEMU that is a hard
+// power-off of a disk image. What comes back by itself has a path of its own, with its own
+// trust level (manager/selfrestart.go), and is never stopped on this one.
+func CanAutoStop(r *model.Resource) bool {
+	return r.Kind != model.RKVM && !SelfRestarting(r) && !r.AskOnly
+}
+
+// SelfRestarting says whether a resource comes back by itself once stopped: Docker Desktop's VM
+// with its engine, an Xcode helper when Xcode next needs it. Such a thing is reclaimed, never
+// restored.
+func SelfRestarting(r *model.Resource) bool {
+	return r.Kind == model.RKDockerVM || r.Kind == model.RKXcodeHelper
+}
 
 // NoAutoStopWhy says why AgentRM leaves a resource to you.
 func NoAutoStopWhy(r *model.Resource) string {
@@ -42,6 +57,10 @@ func NoAutoStopWhy(r *model.Resource) string {
 		return "AgentRM never stops a VM on its own"
 	case r.Kind == model.RKStaleAgent:
 		return "AgentRM never stops an agent"
+	case r.Kind == model.RKDockerVM:
+		return "restarting Docker is yours to allow (its own auto-stop level, off until you turn it on)"
+	case r.Kind == model.RKXcodeHelper:
+		return "ending Xcode's helpers is yours to allow (its own auto-stop level, off until you turn it on)"
 	case r.AskOnly:
 		return "it is an app, and AgentRM never stops an app on its own"
 	}
@@ -62,7 +81,7 @@ func Pause(r *model.Resource) error {
 			}
 			return err
 		})
-	case model.RKSimulator, model.RKDatabase, model.RKGradle:
+	case model.RKSimulator, model.RKDatabase, model.RKGradle, model.RKDockerVM, model.RKXcodeHelper:
 		return fmt.Errorf("%s cannot be paused", r.Kind)
 	}
 	if r.PID <= 0 {
@@ -126,7 +145,7 @@ func Resume(r *model.Resource) error {
 			}
 			return nil
 		})
-	case model.RKSimulator, model.RKDatabase:
+	case model.RKSimulator, model.RKDatabase, model.RKDockerVM:
 		return nil
 	}
 	if r.PID <= 0 {
@@ -153,6 +172,9 @@ func Stop(r *model.Resource) error {
 	case model.RKSimulator:
 		_, err := sys.Run(30*time.Second, "xcrun", "simctl", "shutdown", r.UDID)
 		return err
+	case model.RKDockerVM:
+		// Never a signal to the VM's process: that is a power-off under a running engine.
+		return RestartDockerEngine()
 	case model.RKDatabase:
 		// Through brew, or launchd restarts it at once.
 		f := strings.TrimPrefix(r.Restart, "brew services start ")
@@ -200,6 +222,10 @@ func stopOllama() error {
 // Restore brings back something AgentRM stopped, where a command can do it.
 func Restore(r *model.Resource) error {
 	switch r.Kind {
+	case model.RKDockerVM:
+		return fmt.Errorf("%s comes back with Docker Desktop's engine; open Docker Desktop if it is not running", r.ID)
+	case model.RKXcodeHelper:
+		return fmt.Errorf("%s: Xcode starts it again when it needs it", r.ID)
 	case model.RKLeftover:
 		if !Restartable(r) {
 			return fmt.Errorf("%s is an app, and AgentRM does not start apps again: %s", r.ID, r.Restart)

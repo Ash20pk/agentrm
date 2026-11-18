@@ -16,6 +16,9 @@ type Config struct {
 	DryRun               bool    `json:"dry_run"`                // ask and notify, but never pause or stop anything
 	// AutoStop turns pausing and stopping on per level while dry_run is on: owner_gone, then
 	// unclaimed, then idle_lease (see manager/trust.go). dry_run false turns all of them on.
+	// engine_restart (restarting Docker Desktop to shrink its VM) and xcode_helpers (ending
+	// Xcode's idle helpers) stand apart: off until turned on here, whatever dry_run says, and
+	// can be turned on only once their record allows.
 	AutoStop      map[string]bool    `json:"auto_stop,omitempty"`
 	KindMemGB     map[string]float64 `json:"kind_mem_gb"`
 	ServerNames   []string           `json:"server_names"`   // listening processes treated as dev servers

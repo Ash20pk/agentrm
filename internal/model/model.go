@@ -22,6 +22,14 @@ const (
 	// RKStaleAgent is an agent process with no terminal or app above it that has not been
 	// heard from in hours. Only ever asked about: it may be someone's tmux session.
 	RKStaleAgent = "stale-agent"
+	// RKDockerVM is Docker Desktop's Linux VM itself. Containers that stop free memory inside
+	// it, and the VM keeps much of it; only restarting Docker gives it all back to macOS. It
+	// comes back by itself (with the engine), so it is never restored, and it is restarted only
+	// when nothing uses Docker.
+	RKDockerVM = "docker-vm"
+	// RKXcodeHelper is one of Xcode's helpers (SourceKitService, the build service,
+	// sourcekit-lsp) grown large and left idle. Xcode starts it again when it needs it.
+	RKXcodeHelper = "xcode-helper"
 )
 
 // Lease kinds.
@@ -343,6 +351,9 @@ type State struct {
 	// IdleGaps is, per resource kind, how long things sat idle before being used again, in
 	// minutes (-1: never used again). Learned stop timing works from it.
 	IdleGaps map[string][]float64 `json:"idle_gaps,omitempty"`
+	// DockerVMIdleMB is what Docker Desktop's VM holds just after a restart, with nothing
+	// running (learned; see manager/dockervm.go): restarting it gives back what it holds above.
+	DockerVMIdleMB float64 `json:"docker_vm_idle_mb,omitempty"`
 	// LastReceipt is when the weekly receipt was last sent.
 	LastReceipt time.Time `json:"last_receipt,omitempty"`
 }
