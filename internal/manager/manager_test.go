@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -768,25 +769,61 @@ func TestStatusEncodes(t *testing.T) {
 	}
 }
 
-// One test against a real process, to check the effects do what they say.
+// One test against a real process tree, to check the effects do what they say: `sh -c` with a
+// child, like `npm run dev` with vite under it. The child is paused and stopped with its parent.
 func TestPauseAndStopARealProcess(t *testing.T) {
-	cmd := exec.Command("sleep", "120")
+	cmd := exec.Command("/bin/sh", "-c", "sleep 60; :") // the `; :` keeps sh from exec'ing sleep
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
 	exited := make(chan struct{})
 	go func() { _ = cmd.Wait(); close(exited) }()
 	defer cmd.Process.Kill()
-	r := model.Resource{ID: "srv:test", Kind: model.RKServer, PID: cmd.Process.Pid}
-	state := func() string {
-		out, _ := exec.Command("ps", "-o", "state=", "-p", fmt.Sprint(cmd.Process.Pid)).Output()
+	pid := cmd.Process.Pid
+	child := 0
+	for i := 0; i < 100 && child == 0; i++ {
+		for _, p := range sys.ListProcs() {
+			if p.PPID == pid {
+				child = p.PID
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if child == 0 {
+		t.Fatal("sh started no child")
+	}
+	defer syscall.Kill(child, syscall.SIGKILL)
+	state := func(pid int) string {
+		out, _ := exec.Command("/bin/ps", "-o", "state=", "-p", fmt.Sprint(pid)).Output()
 		return strings.TrimSpace(string(out))
 	}
-	if err := Executor(Effect{Op: "pause", Res: r}); err != nil || !strings.HasPrefix(state(), "T") {
-		t.Fatalf("not frozen: %v %q", err, state())
+	frozen := func(pid int) bool { return strings.HasPrefix(state(pid), "T") }
+	p := sys.QuickProc(pid)
+	if p == nil || p.Start.IsZero() {
+		t.Fatalf("no start time for a live process: %+v", p)
 	}
-	if err := Executor(Effect{Op: "resume", Res: r}); err != nil || strings.HasPrefix(state(), "T") {
-		t.Fatalf("not thawed: %v %q", err, state())
+	r := model.Resource{ID: "srv:test", Kind: model.RKServer, PID: pid, ProcStart: p.Start}
+
+	// The PID is now someone else's (a start that does not match): nothing is signalled.
+	other := r
+	other.ProcStart = p.Start.Add(-time.Hour)
+	if err := Executor(Effect{Op: "pause", Res: other}); err == nil || frozen(pid) {
+		t.Fatalf("paused a process whose start does not match: %v %q", err, state(pid))
+	}
+	if err := Executor(Effect{Op: "stop", Res: other}); err == nil || state(pid) == "" {
+		t.Fatalf("stopped a process whose start does not match: %v", err)
+	}
+	unknown := r
+	unknown.ProcStart = time.Time{}
+	if err := Executor(Effect{Op: "stop", Res: unknown}); err == nil {
+		t.Fatal("signalled a PID with no recorded start")
+	}
+
+	if err := Executor(Effect{Op: "pause", Res: r}); err != nil || !frozen(pid) || !frozen(child) {
+		t.Fatalf("not frozen: %v parent %q child %q", err, state(pid), state(child))
+	}
+	if err := Executor(Effect{Op: "resume", Res: r}); err != nil || frozen(pid) || frozen(child) {
+		t.Fatalf("not thawed: %v parent %q child %q", err, state(pid), state(child))
 	}
 	_ = Executor(Effect{Op: "pause", Res: r})
 	now := time.Now()
@@ -798,6 +835,92 @@ func TestPauseAndStopARealProcess(t *testing.T) {
 	case <-exited:
 	case <-time.After(3 * time.Second):
 		t.Fatal("a frozen process was not stopped (TERM must be followed by CONT)")
+	}
+	for i := 0; i < 150 && syscall.Kill(child, 0) == nil; i++ {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if syscall.Kill(child, 0) == nil {
+		t.Fatalf("the child outlived its stopped parent: %q", state(child))
+	}
+	// Resuming what is gone is not an error: there is nothing left frozen.
+	if err := Executor(Effect{Op: "resume", Res: r}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A restore that fails keeps its record, so it can be tried again, and gives its lease back.
+func TestFailedRestoreKeepsItsRecord(t *testing.T) {
+	m, c := newTest(t, 8)
+	fakeEffects(t, map[string]bool{"restore": true})
+	st := &model.Stopped{Resource: model.Resource{ID: "left:9-1", Kind: model.RKLeftover, MemMB: 200}, StoppedAt: c.Now()}
+	m.st.Stopped = []*model.Stopped{st}
+	out, effs, err := m.restore(agent("s"), api.Req{ResourceID: "left:9-1"})
+	if err != nil || !out.(*api.AcquireResp).Granted || len(m.st.Stopped) != 0 {
+		t.Fatalf("restore was not started: %v %+v", err, out)
+	}
+	m.applyEffects(RunEffects(effs))
+	if len(m.st.Stopped) != 1 || m.st.Stopped[0].Resource.ID != "left:9-1" {
+		t.Fatalf("a failed restore lost the record of what was stopped: %+v", m.st.Stopped)
+	}
+	if len(m.st.Leases) != 0 {
+		t.Fatalf("a failed restore kept its lease: %+v", m.st.Leases)
+	}
+}
+
+// What a stop records for a restore comes with the resource, read while its process ran, and
+// only for what may be started again.
+func TestStopKeepsHowItWasStartedOnlyForRestartable(t *testing.T) {
+	m, c := newTest(t, 8)
+	start := c.Now().Add(-time.Hour)
+	m.infos = newInfoCache(func(pid int) (sys.ProcInfo, bool) {
+		return sys.ProcInfo{Argv: []string{"node", "server.js"}, Env: map[string]string{"PATH": "/x"}}, true
+	})
+	procs := map[int]*sys.Proc{
+		1:   {PID: 1, Exe: "/sbin/launchd"},
+		700: {PID: 700, PPID: 1, Exe: "/u/node", Args: "node server.js", Start: start},
+		701: {PID: 701, PPID: 1, Exe: "/u/claude", Args: "claude -p fix", Start: start},
+	}
+	m.infos.refresh(procs)
+	found := []*model.Resource{
+		{ID: "srv:700", Kind: model.RKServer, PID: 700},
+		{ID: "browser:701", Kind: model.RKBrowser, PID: 701},
+	}
+	m.keepRestartInfo(found, procs)
+	if !found[0].ProcStart.Equal(start) || len(found[0].RestartArgv) != 2 || found[0].RestartEnv[0] != "PATH=/x" {
+		t.Fatalf("a dev server did not keep how it was started: %+v", found[0])
+	}
+	if len(found[1].RestartArgv) != 0 || !found[1].ProcStart.Equal(start) {
+		t.Fatalf("a headless browser kept a command to re-run: %+v", found[1])
+	}
+	// The process is gone and its PID reused by the time the stop is recorded: what the stop
+	// recorded is what the resource carried, not what the new process at that PID runs.
+	m.infos = newInfoCache(func(int) (sys.ProcInfo, bool) {
+		return sys.ProcInfo{Argv: []string{"rm", "-rf", "x"}}, true
+	})
+	m.infos.refresh(map[int]*sys.Proc{700: {PID: 700, PPID: 1, Exe: "/bin/rm", Start: c.Now()}})
+	m.recordStopped(*found[0], "test", "", c.Now())
+	got := m.st.Stopped[0].Resource
+	if strings.Join(got.RestartArgv, " ") != "node server.js" || got.Restart != "agentrm restore srv:700" {
+		t.Fatalf("recorded %+v", got)
+	}
+	bare := model.Resource{ID: "srv:700", Kind: model.RKServer, PID: 700, ProcStart: start}
+	m.recordStopped(bare, "test", "", c.Now())
+	if got := m.st.Stopped[1].Resource; len(got.RestartArgv) != 0 {
+		t.Fatalf("took the command of whatever has the PID now: %+v", got.RestartArgv)
+	}
+}
+
+// On a clean shutdown nothing is left frozen: a daemon that is then disabled would never thaw it.
+func TestCloseResumesWhatWasPaused(t *testing.T) {
+	m, c := newTest(t, 8)
+	got := fakeEffects(t, nil)
+	r := addRes(m, "srv:5", model.RKServer, 300, "")
+	t0 := c.Now()
+	r.PausedAt = &t0
+	addRes(m, "srv:6", model.RKServer, 300, "")
+	m.Close()
+	if len(*got) != 1 || (*got)[0].Op != "resume" || (*got)[0].Res.ID != "srv:5" || r.PausedAt != nil {
+		t.Fatalf("shutdown left a paused process frozen: %+v", *got)
 	}
 }
 

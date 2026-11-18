@@ -7,12 +7,21 @@ import (
 	"time"
 )
 
+// System tools are run by absolute path: the daemon's PATH may hold user-writable directories
+// (Homebrew, ~/bin) ahead of /bin and /usr/sbin, and what these print decides what is stopped.
+const (
+	psPath      = "/bin/ps"
+	lsofPath    = "/usr/sbin/lsof"
+	netstatPath = "/usr/sbin/netstat"
+	vmStatPath  = "/usr/bin/vm_stat"
+)
+
 // ListProcs reads the whole process table.
 func ListProcs() map[int]*Proc {
 	// lstart is the absolute start time, in the C locale's fixed format. (Start computed from
 	// the elapsed time drifts by a second between samples, which makes one process look like
 	// a different one.)
-	out, err := Run(5*time.Second, "/usr/bin/env", "LC_ALL=C", "ps", "-axww", "-o", "pid=,ppid=,rss=,%cpu=,lstart=,args=")
+	out, err := Run(5*time.Second, "/usr/bin/env", "LC_ALL=C", psPath, "-axww", "-o", "pid=,ppid=,rss=,%cpu=,lstart=,args=")
 	if err != nil {
 		// A ps that failed or timed out may have printed part of the table. Part of a table
 		// reads as "those processes are gone", which ends live sessions: no table is better.
@@ -59,7 +68,7 @@ func Cwds(pids []int) map[int]string {
 	for i, p := range pids {
 		ps[i] = strconv.Itoa(p)
 	}
-	s, _ := Run(5*time.Second, "lsof", "-a", "-d", "cwd", "-Fpn", "-p", strings.Join(ps, ","))
+	s, _ := Run(5*time.Second, lsofPath, "-a", "-d", "cwd", "-Fpn", "-p", strings.Join(ps, ","))
 	pid := 0
 	for _, l := range strings.Split(s, "\n") {
 		switch {

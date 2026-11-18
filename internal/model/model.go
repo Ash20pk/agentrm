@@ -69,14 +69,17 @@ var AllKinds = []string{KCluster, KCompose, KDockerBuild, KCargoBuild, KGradle, 
 	KVM, KModel, KLoadtest, KServer, KBrowser}
 
 type Resource struct {
-	ID          string     `json:"id"`
-	Kind        string     `json:"kind"`
-	Source      string     `json:"source"` // which discovery source found it: docker, simctl, procs
-	Name        string     `json:"name"`
-	Detail      string     `json:"detail"`
-	MemMB       float64    `json:"mem_mb"`
-	Containers  []string   `json:"containers,omitempty"`
-	PID         int        `json:"pid,omitempty"`
+	ID         string   `json:"id"`
+	Kind       string   `json:"kind"`
+	Source     string   `json:"source"` // which discovery source found it: docker, simctl, procs
+	Name       string   `json:"name"`
+	Detail     string   `json:"detail"`
+	MemMB      float64  `json:"mem_mb"`
+	Containers []string `json:"containers,omitempty"`
+	PID        int      `json:"pid,omitempty"`
+	// ProcStart is when the process at PID started. A PID is reused once its process exits:
+	// a signal goes only to a process that still started at this time.
+	ProcStart   time.Time  `json:"proc_start,omitempty"`
 	UDID        string     `json:"udid,omitempty"`
 	Cwd         string     `json:"cwd,omitempty"` // where its process runs, when known
 	FirstSeen   time.Time  `json:"first_seen"`

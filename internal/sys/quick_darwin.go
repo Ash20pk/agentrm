@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -16,6 +17,9 @@ func QuickProc(pid int) *Proc {
 		return nil
 	}
 	p := &Proc{PID: pid, PPID: int(kp.Eproc.Ppid)}
+	if st := kp.Proc.P_starttime; st.Sec > 0 {
+		p.Start = time.Unix(st.Sec, 0) // to the second, like ps's lstart
+	}
 	comm := string(bytes.TrimRight(kp.Proc.P_comm[:], "\x00"))
 	p.Exe, p.Args = comm, comm
 	// kern.procargs2: int32 argc, the exec path, NUL padding, then argc NUL-terminated args.

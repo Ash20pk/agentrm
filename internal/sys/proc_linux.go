@@ -121,10 +121,9 @@ func ReadProcInfo(pid int) (ProcInfo, bool) {
 		return ProcInfo{}, false
 	}
 	var info ProcInfo
-	for _, a := range strings.Split(strings.TrimRight(string(cmd), "\x00"), "\x00") {
-		if a != "" {
-			info.Argv = append(info.Argv, a)
-		}
+	if len(cmd) > 0 {
+		// Each argument ends in a NUL; an empty argument is two NULs in a row and is kept.
+		info.Argv = strings.Split(strings.TrimSuffix(string(cmd), "\x00"), "\x00")
 	}
 	env, err := os.ReadFile(dir + "/environ")
 	if err != nil {

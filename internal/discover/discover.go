@@ -287,7 +287,7 @@ func Processes(cfg model.Config, procs map[int]*sys.Proc) []*model.Resource {
 
 func procRes(p *sys.Proc, prefix, kind, name, detail string, mb float64) *model.Resource {
 	return &model.Resource{ID: fmt.Sprintf("%s:%d", prefix, p.PID), Kind: kind, Name: name, Detail: detail,
-		PID: p.PID, MemMB: mb, CPU: p.CPU, Restart: "re-run the command that started it"}
+		PID: p.PID, ProcStart: p.Start, MemMB: mb, CPU: p.CPU, Restart: "re-run the command that started it"}
 }
 
 // subtreeMB is the memory of each process's descendants (not including itself).

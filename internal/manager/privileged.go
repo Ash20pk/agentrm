@@ -276,5 +276,7 @@ func (m *Manager) restore(c api.Caller, r api.Req) (any, []Effect, error) {
 		}
 	}
 	m.st.Stopped = out
-	return &api.AcquireResp{Granted: true, Lease: l}, []Effect{{Op: "restore", Res: res, Why: "restore", By: c.Session}}, nil
+	e := Effect{Op: "restore", Res: res, Why: "restore", By: c.Session, Stopped: st}
+	e.Res.LeaseID = l.ID // released again if the restore fails
+	return &api.AcquireResp{Granted: true, Lease: l}, []Effect{e}, nil
 }

@@ -16,6 +16,9 @@ type Effect struct {
 	Res model.Resource
 	Why string
 	By  string // who asked: "agentrm" or a session
+	// Stopped is the record a restore was taken from: put back if the restore fails, so that
+	// what was stopped can still be found and restored.
+	Stopped *model.Stopped
 }
 
 type EffectResult struct {
@@ -120,7 +123,14 @@ func (m *Manager) applyEffects(results []EffectResult) {
 			m.notify("Stopped "+e.Res.Name, "Freed ~"+gb(e.Res.MemMB)+". Restore: agentrm restore "+e.Res.ID)
 		case "restore":
 			if res.Err != nil {
-				m.event("RESTORE FAILED %s: %v", e.Res.ID, res.Err)
+				if e.Stopped != nil && !m.hasStopped(e.Stopped) {
+					m.st.Stopped = append(m.st.Stopped, e.Stopped)
+				}
+				if l := m.st.Leases[e.Res.LeaseID]; l != nil && len(l.Resources) == 0 {
+					m.dropLease(l, "the restore it was granted for failed")
+				}
+				delete(m.dockerOrigin, e.Res.ID)
+				m.event("RESTORE FAILED %s: %v. It is still listed as stopped.", e.Res.ID, res.Err)
 				continue
 			}
 			m.event("RESTORED %s (%s) for %s", e.Res.ID, e.Res.Name, e.By)
@@ -140,21 +150,35 @@ func (m *Manager) recordStopped(r model.Resource, why, by string, now time.Time)
 	if by == "" {
 		by = "agentrm"
 	}
-	// A process: keep how it was started, so a restore can start it again (the cache still has
-	// it until the next sweep notices it is gone).
-	if r.PID > 0 && len(r.RestartArgv) == 0 && m.infos != nil {
-		if info := m.infos.getPID(r.PID); len(info.Argv) > 0 {
-			r.RestartArgv, r.RestartEnv = info.Argv, info.EnvList()
-			if r.Restart == "" || strings.HasPrefix(r.Restart, "re-run") {
-				r.Restart = "agentrm restore " + r.ID
+	// A process AgentRM may start again: how it was started came with the resource, read
+	// while it ran (keepRestartInfo). Failing that, only from the process with this PID and
+	// start, never from whatever has the PID now.
+	if r.PID > 0 && discover.Restartable(&r) {
+		if len(r.RestartArgv) == 0 && m.infos != nil {
+			if info := m.infos.getStarted(r.PID, r.ProcStart); len(info.Argv) > 0 {
+				r.RestartArgv, r.RestartEnv = info.Argv, info.EnvList()
 			}
 		}
+		if len(r.RestartArgv) > 0 && (r.Restart == "" || strings.HasPrefix(r.Restart, "re-run")) {
+			r.Restart = "agentrm restore " + r.ID
+		}
+	} else {
+		r.RestartArgv, r.RestartEnv = nil, nil
 	}
 	r.PausedAt, r.OrphanSince, r.LeaseID, r.Urgent = nil, nil, "", false
 	m.st.Stopped = append(m.st.Stopped, &model.Stopped{Resource: r, StoppedAt: now, Why: why, By: by})
 	if len(m.st.Stopped) > 50 {
 		m.st.Stopped = m.st.Stopped[len(m.st.Stopped)-50:]
 	}
+}
+
+func (m *Manager) hasStopped(s *model.Stopped) bool {
+	for _, x := range m.st.Stopped {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 func gb(mb float64) string { return fmt.Sprintf("%.1f GB", mb/1024) }

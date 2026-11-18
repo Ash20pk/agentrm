@@ -2,7 +2,9 @@ package sys
 
 import (
 	"encoding/binary"
+	"os"
 	"testing"
+	"time"
 )
 
 func procargs(argv, env []string) []byte {
@@ -14,6 +16,27 @@ func procargs(argv, env []string) []byte {
 		b = append(append(b, s...), 0)
 	}
 	return append(b, 0, 0, 0)
+}
+
+// An empty argument is kept, and does not cut off the arguments or the environment after it.
+func TestParseProcArgsEmptyArgument(t *testing.T) {
+	info, ok := parseProcArgs(procargs([]string{"node", "", "server.js"}, []string{"PATH=/usr/bin", "NODE_ENV=dev"}))
+	if !ok || len(info.Argv) != 3 || info.Argv[1] != "" || info.Argv[2] != "server.js" {
+		t.Fatalf("argv: %q", info.Argv)
+	}
+	if info.Env["PATH"] != "/usr/bin" || info.Env["NODE_ENV"] != "dev" {
+		t.Fatalf("env lost after an empty argument: %v", info.Env)
+	}
+}
+
+func TestQuickProcHasStart(t *testing.T) {
+	p := QuickProc(os.Getpid())
+	if p == nil || p.Start.IsZero() || time.Since(p.Start) < 0 || time.Since(p.Start) > time.Hour {
+		t.Fatalf("no start time: %+v", p)
+	}
+	if lp := ListProcs()[os.Getpid()]; lp == nil || !SameProcess(lp, p.Start) {
+		t.Fatalf("QuickProc and ps disagree on when this process started: %+v %+v", lp, p)
+	}
 }
 
 func TestParseProcArgs(t *testing.T) {

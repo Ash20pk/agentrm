@@ -21,7 +21,10 @@ func ReadProcInfo(pid int) (ProcInfo, bool) {
 }
 
 // parseProcArgs reads kern.procargs2: argc, the executable path, padding, argv, then the
-// environment, each NUL-terminated.
+// environment, each NUL-terminated. An argument may be empty (two NULs in a row), so argv is
+// read as exactly argc strings; the environment ends at the first empty string, which no
+// variable can be. A process that rewrote its arguments (setproctitle: "postgres: checkpointer")
+// reads as what it wrote, which is not a command that can be run again.
 func parseProcArgs(b []byte) (ProcInfo, bool) {
 	if len(b) < 4 {
 		return ProcInfo{}, false
@@ -36,23 +39,36 @@ func parseProcArgs(b []byte) (ProcInfo, bool) {
 	for len(rest) > 0 && rest[0] == 0 {
 		rest = rest[1:]
 	}
-	var info ProcInfo
-	for len(rest) > 0 {
+	next := func() (string, bool) {
+		if len(rest) == 0 {
+			return "", false
+		}
 		j := bytes.IndexByte(rest, 0)
-		if j <= 0 {
-			break // the end of the strings area is a run of NULs
+		if j < 0 {
+			s := string(rest)
+			rest = nil
+			return s, true
 		}
 		s := string(rest[:j])
 		rest = rest[j+1:]
-		if len(info.Argv) < argc {
-			info.Argv = append(info.Argv, s)
-			continue
-		}
-		k, v, ok := strings.Cut(s, "=")
+		return s, true
+	}
+	var info ProcInfo
+	for len(info.Argv) < argc {
+		s, ok := next()
 		if !ok {
-			continue
+			break
 		}
-		info.addEnv(k, v)
+		info.Argv = append(info.Argv, s)
+	}
+	for {
+		s, ok := next()
+		if !ok || s == "" {
+			break // the end of the environment
+		}
+		if k, v, ok := strings.Cut(s, "="); ok {
+			info.addEnv(k, v)
+		}
 	}
 	return info, true
 }
