@@ -214,8 +214,8 @@ var databases = map[string]string{ // process name -> brew formula prefix
 }
 
 // Processes finds process-backed resources: Gradle and Kotlin daemons, dev servers, Android
-// emulators, VMs, local model servers, Homebrew databases, headless browsers and Docker
-// Desktop's own VM.
+// emulators, VMs, local model servers, Homebrew databases, headless browsers, Docker
+// Desktop's own VM and Xcode's helpers.
 func Processes(cfg model.Config, procs map[int]*sys.Proc) []*model.Resource {
 	var res []*model.Resource
 	sub := subtreeMB(procs)
@@ -258,6 +258,10 @@ func Processes(cfg model.Config, procs map[int]*sys.Proc) []*model.Resource {
 			res = append(res, r)
 		case isHeadlessBrowser(a) && !isHeadlessBrowserParent(procs, p):
 			res = append(res, procRes(p, "browser", model.RKBrowser, "headless "+browserName(a), "", p.RSSMB+sub[p.PID]))
+		case xcodeHelpers[base] != "":
+			if r := xcodeHelper(procs, p); r != nil {
+				res = append(res, r)
+			}
 		}
 	}
 	if r := dockerVM(procs); r != nil {
@@ -273,14 +277,15 @@ func Processes(cfg model.Config, procs map[int]*sys.Proc) []*model.Resource {
 		r.Ports = ps
 		res = append(res, r)
 	}
-	// Where dev servers and model servers run, for per-project estimates.
+	// Where dev servers and model servers run, for per-project estimates, and which project an
+	// Xcode helper serves.
 	var pids []int
 	for _, r := range res {
-		if r.Kind == model.RKServer || r.Kind == model.RKModel {
+		if r.Kind == model.RKServer || r.Kind == model.RKModel || r.Kind == model.RKXcodeHelper {
 			pids = append(pids, r.PID)
 		}
 	}
-	cwds := sys.Cwds(pids)
+	cwds := cwdsOf(pids)
 	for _, r := range res {
 		if c := cwds[r.PID]; c != "" && r.Cwd == "" {
 			r.Cwd = c

@@ -285,6 +285,7 @@ enum Kind {
         case "heavy": return "Heavy process"
         case "leftover-process": return "Left behind"
         case "docker-vm": return "Docker's VM"
+        case "xcode-helper": return "Xcode helper"
         default: return kind.capitalized
         }
     }

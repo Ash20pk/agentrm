@@ -27,6 +27,9 @@ const (
 	// comes back by itself (with the engine), so it is never restored, and it is restarted only
 	// when nothing uses Docker.
 	RKDockerVM = "docker-vm"
+	// RKXcodeHelper is one of Xcode's helpers (SourceKitService, the build service,
+	// sourcekit-lsp) grown large and left idle. Xcode starts it again when it needs it.
+	RKXcodeHelper = "xcode-helper"
 )
 
 // Lease kinds.

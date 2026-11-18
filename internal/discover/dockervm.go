@@ -18,8 +18,12 @@ import (
 // DockerVMID is the one resource that stands for Docker Desktop's VM.
 const DockerVMID = "docker-vm"
 
-// footprintOf reads a process's footprint (compressed pages included). Tests replace it.
-var footprintOf = sys.Footprint
+// footprintOf reads a process's footprint (compressed pages included), and cwdsOf where
+// processes run. Tests replace them.
+var (
+	footprintOf = sys.Footprint
+	cwdsOf      = sys.Cwds
+)
 
 // dockerVMProc finds the process that holds Docker Desktop's VM, or nil:
 //

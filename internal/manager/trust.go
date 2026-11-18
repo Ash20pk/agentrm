@@ -14,7 +14,7 @@ package manager
 // marked wrong turns that level off again at once.
 //
 // Some levels stand apart from that chain: restarting something that comes back by itself
-// (Docker Desktop's VM). They are off until you turn them on, even with dry run off, and can
+// (Docker Desktop's VM, Xcode's helpers). They are off until you turn them on, even with dry run off, and can
 // be turned on only once their own record allows it. Until then AgentRM only asks.
 
 import (
@@ -35,10 +35,15 @@ var trustLevels = []struct {
 	{"unclaimed", "Unclaimed things", "running with no lease, and nobody is known to own it", false},
 	{"idle_lease", "Idle leases", "its holder let it sit idle and did not answer when asked", false},
 	{catEngine, "Restart Docker's VM", "Docker Desktop's VM holds memory no container uses; restarting Docker gives it back", true},
+	{catXcode, "End Xcode's idle helpers", "SourceKit, the build service or a language server sits idle and large; Xcode starts it again when it needs it", true},
 }
 
-// catEngine is the level for restarting Docker Desktop to shrink its VM.
-const catEngine = "engine_restart"
+// catEngine is the level for restarting Docker Desktop to shrink its VM; catXcode for ending
+// Xcode's idle helpers.
+const (
+	catEngine = "engine_restart"
+	catXcode  = "xcode_helpers"
+)
 
 // optInLevel says whether a level stands apart from the chain and is off until turned on.
 func optInLevel(cat string) bool {
@@ -57,6 +62,8 @@ func (m *Manager) categoryOf(r *model.Resource) string {
 		return ""
 	case r.Kind == model.RKDockerVM:
 		return catEngine
+	case r.Kind == model.RKXcodeHelper:
+		return catXcode
 	case m.ownerGone(r) != nil:
 		return "owner_gone"
 	case r.ReleasedIdle:

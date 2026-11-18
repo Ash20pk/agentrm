@@ -10,12 +10,14 @@ import (
 	"agentrm/internal/sys"
 )
 
-// noFootprint keeps discovery away from the real kernel: footprints are what the table says.
+// noFootprint keeps discovery away from the real kernel: footprints are what the test says, and
+// no process's directory is read.
 func noFootprint(t *testing.T, fp map[int]float64) {
 	t.Helper()
-	old := footprintOf
+	oldFP, oldCwds := footprintOf, cwdsOf
 	footprintOf = func(pid int) (float64, bool) { v, ok := fp[pid]; return v, ok }
-	t.Cleanup(func() { footprintOf = old })
+	cwdsOf = func([]int) map[int]string { return nil }
+	t.Cleanup(func() { footprintOf, cwdsOf = oldFP, oldCwds })
 }
 
 func TestDockerVMUnderAppleVirtualization(t *testing.T) {

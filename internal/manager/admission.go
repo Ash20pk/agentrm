@@ -418,7 +418,7 @@ func (m *Manager) reclaim(needMB float64, forSession string, now time.Time) stri
 	}
 	for _, r := range m.st.Resources {
 		if discover.SelfRestarting(r) && r.Unseen == nil && !r.Pinned && !m.neverStop(r) && r.OrphanSince != nil &&
-			!m.dryFor(r) && r.MemMB >= dockerVMMinMB && m.restartBlocker(r, now) == "" && m.pending[r.ID] == "" {
+			!m.dryFor(r) && r.MemMB >= selfRestartMinMB && m.restartBlocker(r, now) == "" && m.pending[r.ID] == "" {
 			orphans = append(orphans, r)
 		}
 	}

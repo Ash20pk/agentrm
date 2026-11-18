@@ -21,6 +21,8 @@ func CanPause(r *model.Resource) bool {
 	switch r.Kind {
 	case model.RKDockerVM: // a frozen engine hangs every docker command
 		return false
+	case model.RKXcodeHelper: // a frozen SourceKit hangs Xcode's editor
+		return false
 	case model.RKSimulator, model.RKDatabase: // simctl has no freeze; freezing a DB master alone leaves its workers
 		return false
 	case model.RKGradle:
@@ -42,8 +44,11 @@ func CanAutoStop(r *model.Resource) bool {
 }
 
 // SelfRestarting says whether a resource comes back by itself once stopped: Docker Desktop's VM
-// with its engine. Such a thing is reclaimed, never restored.
-func SelfRestarting(r *model.Resource) bool { return r.Kind == model.RKDockerVM }
+// with its engine, an Xcode helper when Xcode next needs it. Such a thing is reclaimed, never
+// restored.
+func SelfRestarting(r *model.Resource) bool {
+	return r.Kind == model.RKDockerVM || r.Kind == model.RKXcodeHelper
+}
 
 // NoAutoStopWhy says why AgentRM leaves a resource to you.
 func NoAutoStopWhy(r *model.Resource) string {
@@ -54,6 +59,8 @@ func NoAutoStopWhy(r *model.Resource) string {
 		return "AgentRM never stops an agent"
 	case r.Kind == model.RKDockerVM:
 		return "restarting Docker is yours to allow (its own auto-stop level, off until you turn it on)"
+	case r.Kind == model.RKXcodeHelper:
+		return "ending Xcode's helpers is yours to allow (its own auto-stop level, off until you turn it on)"
 	case r.AskOnly:
 		return "it is an app, and AgentRM never stops an app on its own"
 	}
@@ -74,7 +81,7 @@ func Pause(r *model.Resource) error {
 			}
 			return err
 		})
-	case model.RKSimulator, model.RKDatabase, model.RKGradle, model.RKDockerVM:
+	case model.RKSimulator, model.RKDatabase, model.RKGradle, model.RKDockerVM, model.RKXcodeHelper:
 		return fmt.Errorf("%s cannot be paused", r.Kind)
 	}
 	if r.PID <= 0 {
@@ -217,6 +224,8 @@ func Restore(r *model.Resource) error {
 	switch r.Kind {
 	case model.RKDockerVM:
 		return fmt.Errorf("%s comes back with Docker Desktop's engine; open Docker Desktop if it is not running", r.ID)
+	case model.RKXcodeHelper:
+		return fmt.Errorf("%s: Xcode starts it again when it needs it", r.ID)
 	case model.RKLeftover:
 		if !Restartable(r) {
 			return fmt.Errorf("%s is an app, and AgentRM does not start apps again: %s", r.ID, r.Restart)
