@@ -94,7 +94,7 @@ func (m *Manager) trustLevels(now time.Time) []api.TrustLevel {
 		}
 		var first time.Time
 		for _, d := range m.st.Decisions {
-			if d.Category != lv.cat || d.Action == "reclaim" {
+			if d.Category != lv.cat || !collecting(d) {
 				continue
 			}
 			t.Decided++

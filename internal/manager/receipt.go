@@ -82,7 +82,7 @@ func (m *Manager) eventLines(since time.Time) []struct {
 func (m *Manager) makeReceipt(since, until time.Time) *api.Receipt {
 	r := &api.Receipt{Since: since, Until: until}
 	for _, d := range m.st.Decisions {
-		if d.Time.Before(since) || d.Time.After(until) || d.Action == "reclaim" {
+		if d.Time.Before(since) || d.Time.After(until) || !collecting(d) {
 			continue
 		}
 		switch {

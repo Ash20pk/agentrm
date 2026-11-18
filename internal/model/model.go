@@ -104,6 +104,11 @@ type Resource struct {
 	StartedBy   string     `json:"started_by,omitempty"`  // session that started it, when known
 	PausedAt    *time.Time `json:"paused_at,omitempty"`   // frozen since then, not yet stopped
 	Urgent      bool       `json:"urgent,omitempty"`      // a blocked request needs its memory: stop, do not freeze
+	// PreparedFor is the prediction it was paused ahead of (an ID the daemon keeps), and
+	// PreparedUntil when it is resumed if that does not change. A pause made on a prediction is
+	// never followed by a stop on the same prediction (see manager/prepare.go).
+	PreparedFor   string     `json:"prepared_for,omitempty"`
+	PreparedUntil *time.Time `json:"prepared_until,omitempty"`
 	// Unseen is the time its source last failed to answer (Docker hung): what is shown is the
 	// last view, not the current one, and nothing is paused, stopped or counted on from it.
 	Unseen  *time.Time `json:"unseen,omitempty"`

@@ -7,8 +7,10 @@ package manager
 //   - an expected end for every lease (status shows it), and a "probably finished" mark once
 //     a lease has outlived nine in ten of its kind and is idle;
 //   - an early start on making room: when the likely next request of a session would not fit,
-//     holders are asked what yielding would cost before the request arrives (asked only;
-//     nothing is taken on a guess);
+//     holders are asked what yielding would cost before the request arrives, and, once
+//     predictions of that kind have earned it, unclaimed things are paused ahead of it
+//     (prepare.go: reversible only, undone if the request does not come; nothing is stopped
+//     on a guess);
 //   - lifetimes for backfilling the queue (admission.go).
 //
 // The predictor keeps score against the obvious baseline, the project's most frequent kind, so
@@ -75,6 +77,7 @@ func (m *Manager) observeKind(session, cwd, kind string, now time.Time) {
 	p := m.predictState()
 	project := projectOf(cwd)
 	prev := p.Last[session]
+	m.predictionArrived(session, kind, now)
 	if guess, _, n := m.predictNext(project, prev); n >= minSamples {
 		p.Total++
 		if guess == kind {
@@ -102,9 +105,11 @@ func (m *Manager) prepareFor(session, project, after string, now time.Time) {
 		return
 	}
 	need := m.estimateGB(next, project) * 1024
+	m.notePrediction(session, next, after, prob, n, need, now)
 	if need <= m.headroomMB() {
 		return
 	}
+	m.kickSweep() // the sweep decides whether to make room ahead (prepare.go)
 	deadline := now.Add(minutes(m.cfg.PressureGraceMinutes))
 	asked := 0
 	for _, l := range m.st.Leases {

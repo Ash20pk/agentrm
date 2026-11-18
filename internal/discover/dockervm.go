@@ -97,10 +97,10 @@ var (
 	runDocker   = func(timeout time.Duration, args ...string) (string, error) {
 		return sys.Run(timeout, "docker", args...)
 	}
-	runCommand  = sys.Run
-	quitWait    = 90 * time.Second
-	quitPoll    = 2 * time.Second
-	sleepFor    = time.Sleep
+	runCommand        = sys.Run
+	quitWait          = 90 * time.Second
+	quitPoll          = 2 * time.Second
+	sleepFor          = time.Sleep
 	engineRestartWait = 180 // seconds docker desktop restart may take
 )
 

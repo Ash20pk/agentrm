@@ -219,9 +219,18 @@ learned stop timing below.
   first-order Markov chain over the kinds commands classify to) and how long each kind of lease
   lives. Every lease gets an expected end; one that has outlived nine in ten of its kind and is
   idle is marked probably finished. When a session's likely next request would not fit,
-  holders are asked what yielding would cost before it arrives (asked only: nothing is taken on
-  a guess). `agentrm status` shows how the predictor does against the obvious baseline, the
-  project's most frequent kind.
+  holders are asked what yielding would cost before it arrives, and room is made ahead of it:
+  unclaimed things idle for `pressure_idle_minutes` are paused, cheapest first (what an ended
+  session left, then the longest idle). Only paused, never stopped, on a guess; dry run, the
+  trust levels, pins, never-stop and things you started apply as to any automatic pause, and
+  nothing held by a lease is touched. Each prediction is scored (`predict:<kind>` on the
+  ACCURACY line: did the request come within 10 minutes), and nothing is paused for a kind
+  until at least 5 of its predictions were scored and 70% came true; below that AgentRM only
+  logs what it would have paused. What was paused is resumed (UNPREPARED) when the request does
+  not come within the window, or once the work it made room for is done (at most 30 minutes).
+  A paused process still holds its memory until macOS compresses or swaps it out, so a pause
+  gives back less than a stop would, and later. `agentrm status` shows
+  how the predictor does against the obvious baseline, the project's most frequent kind.
 - **When to stop.** Waiting costs the memory held for as long as it is held; stopping something
   then needed costs its restart time. Per resource kind, AgentRM records how long things sat
   idle before being used again (and which never were), and picks the wait that minimises the

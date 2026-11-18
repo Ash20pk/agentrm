@@ -266,6 +266,7 @@ func (m *Manager) sweepWith(procs map[int]*sys.Proc, found discover.Result, mem 
 	m.weeklyReceipt(now)
 	effects := m.checkOrphans(now)
 	m.grantWaiters(now, true)
+	effects = append(effects, m.tendPrepared(now)...)
 	for id, s := range m.st.Sessions {
 		if now.Sub(s.LastSeen) > 24*time.Hour && s.FootprintMB == 0 {
 			delete(m.st.Sessions, id)
@@ -318,6 +319,7 @@ func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[
 				r.Owner, r.OwnerGoneAt = old.Owner, old.OwnerGoneAt
 			}
 			r.PausedAt, r.Urgent, r.ReleasedIdle = old.PausedAt, old.Urgent, old.ReleasedIdle && r.LeaseID == ""
+			r.PreparedFor, r.PreparedUntil = old.PreparedFor, old.PreparedUntil
 			if r.Cwd == "" {
 				r.Cwd = old.Cwd
 			}

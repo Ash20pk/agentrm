@@ -19,6 +19,9 @@ type Effect struct {
 	// Stopped is the record a restore was taken from: put back if the restore fails, so that
 	// what was stopped can still be found and restored.
 	Stopped *model.Stopped
+	// Prepared is the prediction a pause or resume is made for (its ID), when it is one: a pause
+	// ahead of a likely request, or undoing one (prepare.go).
+	Prepared string
 }
 
 type EffectResult struct {
@@ -78,12 +81,25 @@ func (m *Manager) applyEffects(results []EffectResult) {
 				m.event("RESUME FAILED %s: %v", e.Res.ID, res.Err)
 				continue
 			}
+			delete(m.connSeen, e.Res.ID)
+			if r != nil && e.Prepared != "" && r.PreparedFor == e.Prepared {
+				// Undoing a pause made on a prediction: its unclaimed clock goes on where it was,
+				// so making room ahead never delays (or restarts the questions about) collection.
+				r.PausedAt, r.PreparedFor, r.PreparedUntil = nil, "", nil
+				m.event("UNPREPARED %s (%s): %s", e.Res.ID, e.Res.Name, e.Why)
+				continue
+			}
 			if r != nil {
 				r.PausedAt, r.OrphanSince, r.Urgent = nil, nil, false
+				r.PreparedFor, r.PreparedUntil = "", nil
 			}
-			delete(m.connSeen, e.Res.ID)
 			m.event("RESUMED %s (%s): %s", e.Res.ID, e.Res.Name, e.Why)
 		case "pause":
+			if res.Err != nil && e.Prepared != "" {
+				// Nothing is stopped on a prediction, not even when a pause fails.
+				m.event("PREPARE FAILED %s: %v; left running", e.Res.ID, res.Err)
+				continue
+			}
 			if res.Err != nil {
 				m.event("PAUSE FAILED %s: %v; it will be stopped instead", e.Res.ID, res.Err)
 				if r != nil {
@@ -100,6 +116,10 @@ func (m *Manager) applyEffects(results []EffectResult) {
 				// Claimed while it was being paused: thaw it again at once.
 				Thaw := Effect{Op: "resume", Res: *r, Why: "claimed while it was being paused"}
 				go func() { m.afterAsync(RunEffects([]Effect{Thaw})) }()
+				continue
+			}
+			if e.Prepared != "" {
+				m.prepared(r, e, now)
 				continue
 			}
 			hold := minutes(m.cfg.PauseMinutes)

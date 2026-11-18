@@ -101,6 +101,12 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 		if r.Urgent || blocked {
 			why += ", and a request was waiting for memory"
 		}
+		if r.PreparedUntil != nil && !direct {
+			// Paused ahead of a predicted request: that pause is not the start of its pause period,
+			// and it is resumed when the prediction is settled (prepare.go). Only a request really
+			// waiting takes it further, as it would anything unclaimed this long.
+			continue
+		}
 		switch {
 		case r.PausedAt == nil && !direct:
 			if m.dryFor(r) {
@@ -223,7 +229,7 @@ func (m *Manager) review(c api.Caller, r api.Req) (any, []Effect, error) {
 func (m *Manager) reviewSummary(all bool) *api.ReviewResp {
 	out := &api.ReviewResp{FalseRate: -1}
 	for _, d := range m.st.Decisions {
-		if d.Verdict != "" && d.Action != "reclaim" {
+		if d.Verdict != "" && collecting(d) {
 			out.Reviewed++
 			if d.Verdict == "wrong" {
 				out.Wrong++

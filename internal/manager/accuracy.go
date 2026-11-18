@@ -16,7 +16,10 @@ import (
 //   - return:<source>: what reclaim counted on a stop giving back against what available memory
 //     actually rose by;
 //   - admission: whether the Mac started swapping hard within grantWatch of a grant (Under
-//     counts those: memory that was not there after all).
+//     counts those: memory that was not there after all);
+//   - predict:<kind>: whether a request predicted for a session arrived within prepareWindow
+//     (Predicted counts predictions, Actual those that came). It decides whether making room
+//     ahead of that kind is allowed at all (prepare.go).
 //
 // `agentrm status` shows the result, so a figure that drifts from reality is visible within a
 // day instead of being discovered when it blocks work.
@@ -111,6 +114,9 @@ func AccuracyLine(acc map[string]*model.Accuracy) string {
 		case strings.HasPrefix(key, "return:") && a.Predicted > 0:
 			parts = append(parts, fmt.Sprintf("%s stops gave back %.0f%% of what was counted (n=%d)",
 				strings.TrimPrefix(key, "return:"), 100*a.Actual/a.Predicted, a.N))
+		case strings.HasPrefix(key, "predict:"):
+			parts = append(parts, fmt.Sprintf("%s predicted ahead came %d/%d (%.0f%%)",
+				strings.TrimPrefix(key, "predict:"), int(a.Actual), a.N, 100*a.Actual/float64(a.N)))
 		case key == "admission":
 			parts = append(parts, fmt.Sprintf("grants followed by heavy swapping %d/%d", a.Under, a.N))
 		}

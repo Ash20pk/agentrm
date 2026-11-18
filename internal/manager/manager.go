@@ -90,8 +90,9 @@ type Manager struct {
 	self            sys.SelfUsage
 	tamper          tamperState
 	dockerEventsErr string
-	returnProbes    []*returnProbe // stops whose effect on available memory is being measured
-	grantProbes     []*grantProbe  // recent grants, watched for the Mac starting to swap
+	returnProbes    []*returnProbe   // stops whose effect on available memory is being measured
+	grantProbes     []*grantProbe    // recent grants, watched for the Mac starting to swap
+	preps           map[string]*prep // open predictions of a session's next heavy request (prepare.go)
 	cfgDirty        bool
 	restartedAt     map[string]*restartMark   // what AgentRM restarted (it comes back by itself), and when
 	leakTracks      map[procKey]*leakTrack    // large processes watched for leaks (leaks.go)
@@ -130,7 +131,7 @@ func New(o Options) *Manager {
 		connSeen: map[string]map[string]bool{}, footBase: map[string]float64{}, wouldDecided: map[string]bool{},
 		missing: map[string]int{}, hookSeen: map[string]time.Time{}, claimRefused: map[string]bool{}, infos: newInfoCache(nil), stale: map[int]bool{}, selfPID: os.Getpid(),
 		parked: map[*model.Waiter][]chan *api.AcquireResp{}, backfilled: map[*model.Waiter]map[string]bool{},
-		kick: make(chan struct{}, 1), readFast: sys.ReadFast, restartedAt: map[string]*restartMark{},
+		kick: make(chan struct{}, 1), readFast: sys.ReadFast, restartedAt: map[string]*restartMark{}, preps: map[string]*prep{},
 	}
 	m.notify = o.Notify
 	if m.notify == nil {
