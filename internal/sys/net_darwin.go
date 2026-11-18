@@ -31,7 +31,7 @@ func PeerPID(c net.Conn) int {
 // EstablishedPorts lists every local or remote port in an ESTABLISHED TCP connection owned by
 // a process.
 func EstablishedPorts() map[string]bool {
-	out, _ := Run(5*time.Second, "lsof", "-nP", "-iTCP", "-sTCP:ESTABLISHED", "-Fn")
+	out, _ := Run(5*time.Second, lsofPath, "-nP", "-iTCP", "-sTCP:ESTABLISHED", "-Fn")
 	ports := map[string]bool{}
 	for _, l := range strings.Split(out, "\n") {
 		if !strings.HasPrefix(l, "n") {
@@ -48,7 +48,7 @@ func EstablishedPorts() map[string]bool {
 
 // ListeningPorts maps each pid to the TCP ports it listens on.
 func ListeningPorts() map[int][]string {
-	out, err := Run(5*time.Second, "lsof", "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn")
+	out, err := Run(5*time.Second, lsofPath, "-nP", "-iTCP", "-sTCP:LISTEN", "-Fpn")
 	ports := map[int][]string{}
 	if err != nil && out == "" {
 		return ports
@@ -82,7 +82,7 @@ func ConnTuples(ports []string) map[string]map[string]bool {
 	if len(want) == 0 {
 		return out
 	}
-	s, _ := Run(5*time.Second, "netstat", "-an", "-p", "tcp")
+	s, _ := Run(5*time.Second, netstatPath, "-an", "-p", "tcp")
 	for _, l := range strings.Split(s, "\n") {
 		f := strings.Fields(l)
 		if len(f) < 6 || f[5] != "ESTABLISHED" {

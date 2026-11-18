@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"agentrm/internal/api"
+	"agentrm/internal/discover"
 	"agentrm/internal/model"
 	"agentrm/internal/sys"
 	"agentrm/internal/trace"
@@ -97,6 +98,17 @@ func (c *infoCache) refresh(procs map[int]*sys.Proc) {
 			delete(c.m, k)
 		}
 	}
+}
+
+// getStarted is the entry for the process that has pid and started at start: never another
+// process that has the PID since. Empty if that process was never read, or start is unknown.
+func (c *infoCache) getStarted(pid int, start time.Time) sys.ProcInfo {
+	if c.direct || start.IsZero() {
+		return sys.ProcInfo{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.m[procKey{pid, start.Unix()}]
 }
 
 func (c *infoCache) get(p *sys.Proc) sys.ProcInfo {
@@ -599,11 +611,14 @@ func (m *Manager) withLeftovers(found []*model.Resource, procs map[int]*sys.Proc
 			if r.Cwd == "" {
 				r.Cwd = lo.Cwd
 			}
+			if len(r.RestartArgv) == 0 && len(lo.Argv) > 0 {
+				r.RestartArgv, r.RestartEnv = lo.Argv, lo.Env
+			}
 			r.AskOnly = r.AskOnly || lo.AskOnly
 			continue
 		}
 		r := &model.Resource{ID: "left:" + key, Kind: model.RKLeftover, Source: "procs",
-			Name: filepath.Base(p.Exe), Detail: trunc(p.Args, 90), PID: p.PID, MemMB: m.treeSize(p, children, procs, m.procMB), CPU: p.CPU,
+			Name: filepath.Base(p.Exe), Detail: trunc(p.Args, 90), PID: p.PID, ProcStart: p.Start, MemMB: m.treeSize(p, children, procs, m.procMB), CPU: p.CPU,
 			Cwd: lo.Cwd, StartedBy: lo.Session, AskOnly: lo.AskOnly, RestartArgv: lo.Argv, RestartEnv: lo.Env,
 			Restart: "agentrm restore left:" + key}
 		if gone != nil {
@@ -622,9 +637,33 @@ func (m *Manager) withLeftovers(found []*model.Resource, procs map[int]*sys.Proc
 		kind := sys.AgentKind(p)
 		found = append(found, &model.Resource{ID: "agent:" + strconv.Itoa(pid), Kind: model.RKStaleAgent, Source: "procs",
 			Name: agentTitle(kind), Detail: fmt.Sprintf("no terminal, not heard from in %dh+: %s", staleAgentHours, trunc(p.Args, 60)),
-			PID: pid, MemMB: m.treeSize(p, children, procs, m.procMB), CPU: p.CPU, AskOnly: true, Restart: "start the agent again"})
+			PID: pid, ProcStart: p.Start, MemMB: m.treeSize(p, children, procs, m.procMB), CPU: p.CPU, AskOnly: true, Restart: "start the agent again"})
 	}
+	m.keepRestartInfo(found, procs)
 	return found
+}
+
+// keepRestartInfo notes, on each process-backed resource, the start of its process and, for
+// those AgentRM may start again, the command and environment it was started with. They are
+// read now, while the process runs and its PID is still its own, so that a stop decided later
+// carries them on the resource and never has to look a PID up after the process is gone.
+// Must hold mu.
+func (m *Manager) keepRestartInfo(found []*model.Resource, procs map[int]*sys.Proc) {
+	for _, r := range found {
+		p := procs[r.PID]
+		if r.PID <= 0 || p == nil {
+			continue
+		}
+		if r.ProcStart.IsZero() {
+			r.ProcStart = p.Start
+		}
+		if len(r.RestartArgv) > 0 || !discover.Restartable(r) || m.infos == nil || !sys.SameProcess(p, r.ProcStart) {
+			continue
+		}
+		if info := m.infos.get(p); len(info.Argv) > 0 {
+			r.RestartArgv, r.RestartEnv = info.Argv, info.EnvList()
+		}
+	}
 }
 
 // LeftoverCwds lists leftovers whose working directory is not known yet. Must hold mu.

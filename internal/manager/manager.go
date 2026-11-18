@@ -249,8 +249,9 @@ func (m *Manager) applyRecording() {
 // between two reads (by a config change, under mu, while a sweep runs outside it).
 func (m *Manager) recorder() *trace.Writer { return m.recP.Load() }
 
-// Close writes the state and marks a clean shutdown.
+// Close thaws what AgentRM froze, writes the state and marks a clean shutdown.
 func (m *Manager) Close() {
+	m.resumePaused()
 	if rec := m.recP.Swap(nil); rec != nil {
 		rec.Close()
 	}
@@ -261,6 +262,24 @@ func (m *Manager) Close() {
 	m.tamperCleanShutdown()
 	if c, ok := m.evlog.(io.Closer); ok {
 		_ = c.Close()
+	}
+}
+
+// resumePaused thaws everything AgentRM paused. A frozen process stays frozen until something
+// sends it SIGCONT, and once the daemon is gone (quit, disabled, uninstalled) nothing would:
+// a dev server would hang every request on its port forever. What is still unclaimed is paused
+// again by the next daemon, after a fresh grace period.
+func (m *Manager) resumePaused() {
+	m.mu.Lock()
+	var effects []Effect
+	for _, r := range m.st.Resources {
+		if r.PausedAt != nil && m.pending[r.ID] == "" {
+			effects = append(effects, m.thawEffect(r, "AgentRM is shutting down, and leaves nothing frozen behind"))
+		}
+	}
+	m.mu.Unlock()
+	if len(effects) > 0 {
+		m.afterAsync(RunEffects(effects))
 	}
 }
 

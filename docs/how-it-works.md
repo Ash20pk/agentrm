@@ -90,11 +90,21 @@ nothing is lost, and claiming it, pinning it, running a command that uses it, or
 its port resumes it instantly. After `pause_minutes` more it is **stopped**: containers are
 stopped (not removed), simulators shut down, Homebrew services stopped through `brew`, processes
 get SIGTERM, Ollama models are unloaded. Everything stopped is listed and can be restored with
-`agentrm restore`, through admission like any request.
+`agentrm restore`, through admission like any request. A restore that fails stays listed.
+
+A process is paused and stopped with its whole tree, the way its memory is counted: `npm run dev`
+is npm, a shell and vite, and freezing npm alone would leave vite serving. The tree is frozen
+parent first, so nothing respawns what is being stopped, then sent SIGTERM, then thawed children
+first. Nothing is signalled on a PID alone: the process is read again right before, and must
+still have the start time AgentRM recorded, or the PID is now someone else's and is left alone.
+Containers of a group are paused and stopped one by one, so one already paused or gone does not
+fail the rest. Gradle and Kotlin daemons are never paused (a frozen daemon holds its locks and
+every other build waits on it); they are stopped, and the next build starts its own.
 
 If a request is waiting for memory the pause is skipped, because a paused process still holds
 its memory. VMs are never stopped automatically (for QEMU that is a hard power-off); they are
-paused where possible and you are asked.
+paused where possible and you are asked. When the daemon shuts down cleanly it thaws everything
+it paused first: a daemon that is then quit, disabled or uninstalled would never thaw it.
 
 Every pause and stop decision, taken or (in dry run) not, is kept for `agentrm review`, where you
 mark it right or wrong. That is the evidence for turning auto-stop on.
@@ -135,7 +145,10 @@ same agent process takes over its leases and what it started. Then:
   session instead of being listed twice. Leftovers are sized by their footprint (what Activity
   Monitor shows, compressed memory included), not by `ps`'s resident size, which an idle
   process macOS has compressed makes look small. AgentRM records each one's command line,
-  directory and environment (secrets removed), so `agentrm restore left:<pid>` starts it again.
+  directory and environment (secrets removed), so `agentrm restore left:<pid>` starts it again,
+  with the program looked up on the PATH it had, never on AgentRM's. Only leftovers and dev
+  servers are started again this way; never an agent, a headless browser, a Gradle daemon or an
+  app, and never a process that rewrote its own command line (`postgres: writer`).
 
 Sweeping is the usual staged, reversible path, timed by the evidence:
 
