@@ -36,10 +36,7 @@ func (m *Manager) Run(ctx context.Context) {
 			case <-t.C:
 				m.persist()
 				if n++; n%10 == 0 {
-					m.mu.Lock()
-					rec := m.rec
-					m.mu.Unlock()
-					if rec != nil {
+					if rec := m.recorder(); rec != nil {
 						rec.Flush()
 					}
 				}
@@ -78,9 +75,9 @@ func (m *Manager) Run(ctx context.Context) {
 		case pid := <-exits:
 			// An agent exited: end its sessions now, with a table read after the exit.
 			procs := sys.ListProcs()
-			if m.rec != nil {
+			if rec := m.recorder(); rec != nil {
 				now := m.now()
-				m.rec.Write(trace.Frame{T: now, Exit: pid, ExitTab: m.rec.Procs(now, procs, m.traceOwner, m.footprint)})
+				rec.Write(trace.Frame{T: now, Exit: pid, ExitTab: rec.Procs(now, procs, m.traceOwner, m.footprint)})
 			}
 			m.AgentExited(pid, procs)
 		}
@@ -131,9 +128,9 @@ func (m *Manager) needsFast() bool {
 func (m *Manager) FastTick() {
 	procs := sys.ListProcs()
 	mem := sys.ReadMem()
-	if m.rec != nil {
+	if rec := m.recorder(); rec != nil {
 		now := m.now()
-		m.rec.Write(trace.Frame{T: now, Fast: &trace.Sweep{Procs: m.rec.Procs(now, procs, m.traceOwner, m.footprint), Mem: mem}})
+		rec.Write(trace.Frame{T: now, Fast: &trace.Sweep{Procs: rec.Procs(now, procs, m.traceOwner, m.footprint), Mem: mem}})
 	}
 	m.fastWith(procs, mem)
 }
@@ -232,7 +229,8 @@ func (m *Manager) Sweep() {
 
 // recordSweep writes a sweep's inputs to the trace, if one is being kept.
 func (m *Manager) recordSweep(procs map[int]*sys.Proc, found discover.Result, mem sys.MemStats, est map[string]bool, cwds map[int]string) {
-	if m.rec == nil {
+	rec := m.recorder()
+	if rec == nil {
 		return
 	}
 	m.infos.refresh(procs) // so the trace has each process's owner from its first frame
@@ -241,7 +239,7 @@ func (m *Manager) recordSweep(procs map[int]*sys.Proc, found discover.Result, me
 	for src, err := range found.Failed {
 		failed[src] = err.Error()
 	}
-	m.rec.Write(trace.Frame{T: now, Sweep: &trace.Sweep{Procs: m.rec.Procs(now, procs, m.traceOwner, m.footprint),
+	rec.Write(trace.Frame{T: now, Sweep: &trace.Sweep{Procs: rec.Procs(now, procs, m.traceOwner, m.footprint),
 		Found: found.Resources, Failed: failed, Mem: mem, Est: est, Cwds: cwds}})
 }
 
@@ -548,13 +546,13 @@ func (m *Manager) followDocker(ctx context.Context) error {
 		if s := originFromProcs(procs, names); s != "" {
 			m.mu.Lock()
 			m.dockerOrigin[id] = origin{session: m.resolveOrigin(s), at: m.now()}
-			if m.rec != nil {
+			if rec := m.recorder(); rec != nil {
 				f := trace.Frame{T: m.now()}
 				f.Origin = &struct {
 					ID      string `json:"id"`
 					Session string `json:"session"`
 				}{id, m.dockerOrigin[id].session}
-				m.rec.Write(f)
+				rec.Write(f)
 			}
 			m.mu.Unlock()
 		}

@@ -20,7 +20,7 @@ func recordScenario(t *testing.T, usedAt time.Duration) string {
 	dir := t.TempDir()
 	m, c := newTest(t, 8)
 	fakeEffects(t, nil)
-	m.rec = trace.NewWriter(dir, 3)
+	m.recP.Store(trace.NewWriter(dir, 3))
 	t0 := c.Now()
 	fakeInfos(m, map[int]sys.ProcInfo{700: {Agent: "claude", Session: "s", AgentPID: 500, Argv: []string{"node", "server.js"}}})
 	agentUp := func() map[int]*sys.Proc {
@@ -52,7 +52,7 @@ func recordScenario(t *testing.T, usedAt time.Duration) string {
 		if c.Now().Sub(t0) >= 5*time.Minute {
 			delete(procs, 500)
 			if c.Now().Sub(t0) == 5*time.Minute {
-				m.rec.Write(trace.Frame{T: c.Now(), Exit: 500, ExitTab: m.rec.Procs(c.Now(), procs, m.traceOwner, nil)})
+				m.recorder().Write(trace.Frame{T: c.Now(), Exit: 500, ExitTab: m.recorder().Procs(c.Now(), procs, m.traceOwner, nil)})
 				m.AgentExited(500, procs)
 			}
 		}
@@ -62,7 +62,7 @@ func recordScenario(t *testing.T, usedAt time.Duration) string {
 		}
 		step(procs, est)
 	}
-	m.rec.Close()
+	m.recorder().Close()
 	if len(m.st.Decisions) == 0 {
 		t.Fatal("the live run (dry run) decided nothing: the scenario is wrong")
 	}

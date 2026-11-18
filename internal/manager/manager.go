@@ -14,9 +14,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"agentrm/internal/api"
@@ -76,7 +78,7 @@ type Manager struct {
 	exits           *sys.ExitWatcher           // the kernel's word that an agent exited; nil in tests
 	stale           map[int]bool               // agent processes with no terminal, silent for hours
 	selfPID         int
-	rec             *trace.Writer                             // what the daemon sees, for replay; nil unless recording
+	recP            atomic.Pointer[trace.Writer]              // what the daemon sees, for replay; nil unless recording (read without mu)
 	onDecide        func(*model.Decision)                     // replay watches decisions as they are taken
 	onGrant         func(needMB, headroomMB float64)          // tests check every grant fits
 	backfilled      map[*model.Waiter]map[string]bool         // head of the queue -> sessions that went ahead of it
@@ -234,18 +236,21 @@ func (m *Manager) persist() {
 // in New.
 func (m *Manager) applyRecording() {
 	switch {
-	case m.cfg.RecordTrace && m.rec == nil && m.dir != "":
-		m.rec = trace.NewWriter(trace.Dir(m.dir), max(1, m.cfg.TraceDays))
-	case !m.cfg.RecordTrace && m.rec != nil:
-		m.rec.Close()
-		m.rec = nil
+	case m.cfg.RecordTrace && m.recorder() == nil && m.dir != "":
+		m.recP.Store(trace.NewWriter(trace.Dir(m.dir), max(1, m.cfg.TraceDays)))
+	case !m.cfg.RecordTrace && m.recorder() != nil:
+		m.recP.Swap(nil).Close()
 	}
 }
 
+// recorder is the trace writer, or nil. Read it once into a local: recording can be turned off
+// between two reads (by a config change, under mu, while a sweep runs outside it).
+func (m *Manager) recorder() *trace.Writer { return m.recP.Load() }
+
 // Close writes the state and marks a clean shutdown.
 func (m *Manager) Close() {
-	if m.rec != nil {
-		m.rec.Close()
+	if rec := m.recP.Swap(nil); rec != nil {
+		rec.Close()
 	}
 	m.persist()
 	if m.saver != nil {
@@ -340,8 +345,8 @@ var readOnly = map[string]bool{"/status": true, "/whoami": true, "/approval": tr
 
 // handleFacts serves a request from a caller already traced (live, or from a trace).
 func (m *Manager) handleFacts(ctx context.Context, path string, h handler, facts facts, req api.Req) (any, error) {
-	if m.rec != nil && !readOnly[path] {
-		m.rec.Write(trace.Frame{T: m.now(), Request: &trace.Request{Path: path, Req: req, Facts: trace.Facts{
+	if rec := m.recorder(); rec != nil && !readOnly[path] {
+		rec.Write(trace.Frame{T: m.now(), Request: &trace.Request{Path: path, Req: req, Facts: trace.Facts{
 			PID: facts.pid, AgentPID: facts.agentPID, Agent: facts.agent, GUI: facts.gui, App: facts.app, ViaApp: facts.viaApp}}})
 	}
 	m.mu.Lock()
@@ -354,6 +359,10 @@ func (m *Manager) handleFacts(ctx context.Context, path string, h handler, facts
 		return nil, &ErrNeedsApproval{Approval: a}
 	}
 	m.dirty = true
+	// The response is encoded after the lock is released, while sweeps change the state it
+	// points into: concurrent map iteration and write is a fatal error in Go, not a recoverable
+	// one. So the caller gets a copy taken now.
+	resp = snapshot(resp)
 	var parked chan *api.AcquireResp
 	if a, ok := resp.(*api.AcquireResp); ok && path == "/acquire" && err == nil && req.WaitSeconds > 0 && !a.Granted && a.Queue > 0 {
 		parked = m.park(caller.Session, req.Kind)
@@ -455,3 +464,21 @@ func remove(xs []string, x string) []string {
 }
 
 func minutes(n int) time.Duration { return time.Duration(n) * time.Minute }
+
+// snapshot deep-copies a response through its JSON form, so nothing in it aliases the state.
+// The JSON form is all a client ever sees, so nothing is lost.
+func snapshot(v any) any {
+	rv := reflect.ValueOf(v)
+	if v == nil || rv.Kind() != reflect.Pointer || rv.IsNil() {
+		return v
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return v
+	}
+	out := reflect.New(rv.Elem().Type())
+	if json.Unmarshal(b, out.Interface()) != nil {
+		return v
+	}
+	return out.Interface()
+}

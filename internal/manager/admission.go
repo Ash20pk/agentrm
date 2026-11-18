@@ -421,12 +421,15 @@ func (m *Manager) awaitGrant(ctx context.Context, ch chan *api.AcquireResp, c ap
 	if got != nil {
 		m.takeUp(m.st.Leases[got.Lease.ID])
 		m.dirty = true
-		return got, nil
+		return snapshot(got), nil
 	}
 	// Time is up, or the request left the queue some other way: answer as of now.
 	r.WaitSeconds = 0
 	out, _, err := m.acquire(c, r)
 	m.dirty = true
+	if out != nil {
+		out = snapshot(out).(*api.AcquireResp) // encoded after the deferred unlock
+	}
 	return out, err
 }
 

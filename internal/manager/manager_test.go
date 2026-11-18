@@ -768,6 +768,37 @@ func TestStatusEncodes(t *testing.T) {
 	}
 }
 
+// The app polls /status every few seconds while sweeps change the state. The response used to
+// point into the live maps and was encoded after the lock was released: "concurrent map
+// iteration and map write", a fatal error that killed the daemon. Run with -race.
+func TestStatusIsEncodedFromACopy(t *testing.T) {
+	m, _ := newTest(t, 8)
+	acquire(t, m, agent("a"), "cluster", 1)
+	h := m.routes()["/status"]
+	f := facts{pid: 1, gui: true, app: "AgentRM.app", viaApp: true}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 300; i++ {
+			m.mu.Lock()
+			id := fmt.Sprintf("srv:%d", i)
+			m.st.Resources[id] = &model.Resource{ID: id, Kind: model.RKServer, Source: "procs"}
+			delete(m.st.Resources, fmt.Sprintf("srv:%d", i-1))
+			m.mu.Unlock()
+		}
+	}()
+	for i := 0; i < 100; i++ {
+		out, err := m.handleFacts(context.Background(), "/status", h, f, api.Req{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := json.Marshal(out); err != nil {
+			t.Fatal(err)
+		}
+	}
+	<-done
+}
+
 // One test against a real process, to check the effects do what they say.
 func TestPauseAndStopARealProcess(t *testing.T) {
 	cmd := exec.Command("sleep", "120")

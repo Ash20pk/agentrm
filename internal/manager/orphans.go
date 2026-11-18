@@ -140,8 +140,8 @@ func (m *Manager) decide(action string, r *model.Resource, why string) {
 	if m.onDecide != nil {
 		m.onDecide(d)
 	}
-	if m.rec != nil {
-		m.rec.Write(trace.Frame{T: d.Time, Decision: d})
+	if rec := m.recorder(); rec != nil {
+		rec.Write(trace.Frame{T: d.Time, Decision: d})
 	}
 	if len(m.st.Decisions) > 500 {
 		m.st.Decisions = m.st.Decisions[len(m.st.Decisions)-500:]
