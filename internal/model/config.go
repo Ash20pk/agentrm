@@ -24,15 +24,16 @@ type Config struct {
 	// ExtraPatterns adds command regexes per lease kind, e.g. {"compose": ["my-stack\\.sh\\s+start"]}.
 	ExtraPatterns map[string][]string `json:"extra_patterns"`
 
-	IdleMinutes          int     `json:"idle_minutes"`           // a held resource unused this long gets its holder asked
-	ClaimWindowMinutes   int     `json:"claim_window_minutes"`   // a claim is verified if the session used the resource this recently
-	UnverifiedTTLMinutes int     `json:"unverified_ttl_minutes"` // lifetime of a claim with no evidence behind it
-	MinDiskGB            float64 `json:"min_disk_gb"`            // refuse disk-heavy leases below this free space on /
-	MaxLoadPerCore       float64 `json:"max_load_per_core"`      // refuse builds above this 1-minute load per core
-	MaxSessionShare      float64 `json:"max_session_share"`      // while others wait, one session may hold at most this share of usable memory
-	RequireAppApproval   bool    `json:"require_app_approval"`   // privileged actions from a terminal need a click in the app
-	AutoThawOnConnect    bool    `json:"auto_thaw_on_connect"`   // resume a paused server when something tries to connect to it
-	LogLevel             string  `json:"log_level"`              // debug, info, warn, error
+	IdleMinutes          int     `json:"idle_minutes"`               // a held resource unused this long gets its holder asked
+	ClaimWindowMinutes   int     `json:"claim_window_minutes"`       // a claim is verified if the session used the resource this recently
+	UnverifiedTTLMinutes int     `json:"unverified_ttl_minutes"`     // lifetime of a claim with no evidence behind it
+	MinDiskGB            float64 `json:"min_disk_gb"`                // refuse disk-heavy leases below this free space on /
+	MaxLoadPerCore       float64 `json:"max_load_per_core"`          // refuse builds above this 1-minute load per core
+	MaxSessionShare      float64 `json:"max_session_share"`          // while others wait, one session may hold at most this share of usable memory
+	MaxWaitMinutes       int     `json:"max_wait_minutes,omitempty"` // a queued request is granted after this long unless the Mac is swapping (0: 15, -1: never)
+	RequireAppApproval   bool    `json:"require_app_approval"`       // privileged actions from a terminal need a click in the app
+	AutoThawOnConnect    bool    `json:"auto_thaw_on_connect"`       // resume a paused server when something tries to connect to it
+	LogLevel             string  `json:"log_level"`                  // debug, info, warn, error
 
 	// The collector (see docs/how-it-works.md, "Garbage collection").
 	OwnerGoneGraceMinutes int     `json:"owner_gone_grace_minutes"` // unclaimed, and the agent that started or held it has exited

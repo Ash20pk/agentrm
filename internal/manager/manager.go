@@ -313,6 +313,7 @@ func (m *Manager) routes() map[string]handler {
 		"/priority": m.setPriority,
 		"/review":   m.review,
 		"/approve":  m.approve,
+		"/bypass":   m.bypass,
 		"/approval": m.approvalStatus,
 		"/whoami": func(c api.Caller, r api.Req) (any, []Effect, error) {
 			return c, nil, nil
@@ -402,7 +403,7 @@ func (m *Manager) status(c api.Caller, r api.Req) (any, []Effect, error) {
 		Sessions: m.st.Sessions, Questions: m.st.Questions, LastSweep: m.lastSweep, Events: m.events,
 		Learned: m.st.Learned, Stopped: m.st.Stopped, Approvals: m.st.Approvals, Sources: src,
 		Self: m.self, StartedAt: m.started, Notes: m.notes, Prediction: m.predictionScore(),
-		TrustLevels: m.trustLevels(m.now()), Accuracy: m.st.Accuracy,
+		TrustLevels: m.trustLevels(m.now()), Accuracy: m.st.Accuracy, FailOpen: m.failOpen(m.now()),
 	}, nil, nil
 }
 

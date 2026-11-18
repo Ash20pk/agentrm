@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -44,6 +45,7 @@ Measuring policies (see docs/replay.md)
   agentrm compare [TRACE] [--config FILE]      AgentRM and a parent-PID reaper on the same trace
 
 Acting (pinning, settings and overriding others ask for approval in the app)
+  agentrm bypass [MINUTES|off]                 let everything through for a while (default 60 min)
   agentrm stop RESOURCE                        stop something now (it can be restored)
   agentrm resume RESOURCE | --all              thaw something AgentRM paused
   agentrm restore RESOURCE | --last            bring back something AgentRM stopped
@@ -297,6 +299,30 @@ func runCLI(cmd string, args []string) int {
 		}
 	case "setup":
 		err = runSetup(arg(0), arg(1), *uninstall, *asJSON)
+	case "bypass":
+		// agentrm bypass [MINUTES|off]: let everything through for a while (default an hour).
+		n := 60
+		switch a := arg(0); a {
+		case "", "on":
+		case "off", "0":
+			n = 0
+		default:
+			v, perr := strconv.Atoi(a)
+			if perr != nil || v < 0 {
+				return fail(fmt.Errorf("agentrm bypass [MINUTES|off]"))
+			}
+			n = v
+		}
+		req.UntilMinutes = n
+		var r api.BypassResp
+		if err = api.Call("/bypass", req, &r); err == nil {
+			if r.Until.IsZero() {
+				fmt.Println("AgentRM is managing memory again")
+			} else {
+				fmt.Printf("everything is let through until %s; nothing is paused or stopped automatically. End it early: agentrm bypass off\n",
+					r.Until.Format("15:04"))
+			}
+		}
 	case "collect":
 		var r api.CountResp
 		if err = callApproved("/collect", req, &r); err == nil {
@@ -510,6 +536,9 @@ func printStatus(showStopped bool) error {
 	}
 	fmt.Printf("DAEMON   %s · %s · itself %.0f MB, %.1f%% CPU, last sweep %.0f ms\n", st.DaemonVersion,
 		swept, st.Self.RSSMB, st.Self.CPUPercent, st.Self.SweepMS)
+	if st.FailOpen != "" {
+		fmt.Println("OPEN    ", st.FailOpen+": every request is granted, nothing is paused or stopped")
+	}
 	if line := manager.AccuracyLine(st.Accuracy); line != "" {
 		fmt.Println("ACCURACY", line)
 	}

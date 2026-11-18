@@ -40,6 +40,7 @@ var kinds = []string{"cluster", "compose", "server", "cargo-build", "docker-buil
 func newWorld(t *testing.T, seed int64) *world {
 	m, c := newTest(t, 8)
 	m.cfg.DryRun = false
+	m.cfg.MaxWaitMinutes = -1 // invariant 2 is about admission; the wait limit grants on purpose
 	m.notify = func(string, string) {}
 	w := &world{t: t, m: m, c: c, rng: rand.New(rand.NewSource(seed)), agents: map[string]int{},
 		running: map[string]*model.Resource{}, effects: fakeEffects(t, nil)}

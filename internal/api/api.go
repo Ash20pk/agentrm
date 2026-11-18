@@ -111,6 +111,11 @@ type ClaimResp struct {
 	Note     string       `json:"note,omitempty"`
 }
 
+// BypassResp says until when everything is let through (zero: it is not).
+type BypassResp struct {
+	Until time.Time `json:"until,omitempty"`
+}
+
 type CountResp struct {
 	N    int    `json:"n"`
 	Note string `json:"note,omitempty"`
@@ -172,6 +177,8 @@ type Status struct {
 	TrustLevels   []TrustLevel               `json:"trust_levels,omitempty"`
 	// Accuracy is each kind of prediction against what really happened.
 	Accuracy map[string]*model.Accuracy `json:"accuracy,omitempty"`
+	// FailOpen is why AgentRM is letting everything through right now, if it is.
+	FailOpen string `json:"fail_open,omitempty"`
 }
 
 // TrustLevel is one auto-stop level, with the evidence for turning it on.

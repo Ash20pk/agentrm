@@ -76,6 +76,11 @@ func (m *Manager) acquire(c api.Caller, r api.Req) (any, []Effect, error) {
 	want := model.Waiter{Session: c.Session, Agent: c.Agent, Kind: r.Kind, NeedMB: memGB * 1024,
 		Purpose: r.Purpose, Cmd: trunc(r.Cmd, 200), Cwd: cwd, Via: r.Via,
 		TTLMinutes: r.TTLMinutes, UntilMinutes: r.UntilMinutes, Declared: r.MemGB > 0}
+	if why := m.failOpen(now); why != "" {
+		l := m.grant(&want, now, " ("+why+")")
+		m.dropWaiter(c.Session, r.Kind)
+		return &api.AcquireResp{Granted: true, Lease: l}, nil, nil
+	}
 	if ok, why, pos := m.admit(want, now); !ok {
 		m.kickSweep() // sample fast while someone waits
 		return &api.AcquireResp{Reason: why + ". " + m.holders(), Queue: pos}, nil, nil

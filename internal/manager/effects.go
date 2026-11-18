@@ -154,10 +154,17 @@ func gb(mb float64) string { return fmt.Sprintf("%.1f GB", mb/1024) }
 func (m *Manager) gateAuto(effects []Effect) []Effect {
 	out := effects[:0]
 	for _, e := range effects {
-		if e.By == "agentrm" && (e.Op == "pause" || e.Op == "stop") && m.dryFor(&e.Res) {
-			delete(m.pending, e.Res.ID)
-			m.event("DRYRUN blocked an automatic %s of %s that a decision path let through", e.Op, e.Res.ID)
-			continue
+		if e.By == "agentrm" && (e.Op == "pause" || e.Op == "stop") {
+			if why := m.failOpen(m.now()); why != "" {
+				delete(m.pending, e.Res.ID)
+				m.event("HELD automatic %s of %s: %s", e.Op, e.Res.ID, why)
+				continue
+			}
+			if m.dryFor(&e.Res) {
+				delete(m.pending, e.Res.ID)
+				m.event("DRYRUN blocked an automatic %s of %s that a decision path let through", e.Op, e.Res.ID)
+				continue
+			}
 		}
 		out = append(out, e)
 	}

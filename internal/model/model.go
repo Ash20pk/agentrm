@@ -321,6 +321,9 @@ type State struct {
 	Trees map[string]map[int]TreeProc `json:"trees,omitempty"`
 	// Yields are recent answers to "what would giving it up cost you?" (the newest 200).
 	Yields []*Yield `json:"yields,omitempty"`
+	// BypassUntil: you let everything through until then (agentrm bypass): every request is
+	// granted and nothing is paused or stopped automatically.
+	BypassUntil *time.Time `json:"bypass_until,omitempty"`
 	// Accuracy compares each kind of prediction with what really happened (see
 	// manager/accuracy.go).
 	Accuracy map[string]*Accuracy `json:"accuracy,omitempty"`

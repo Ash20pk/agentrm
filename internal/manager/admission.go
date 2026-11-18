@@ -253,6 +253,16 @@ func (m *Manager) grantWaiters(now time.Time, press bool) {
 			m.noteBackfill(w.Session, m.waiters, now)
 			m.lastBackfill = true
 		}
+		note := fmt.Sprintf(" (from the queue, after %s)", now.Sub(w.Since).Round(time.Second))
+		switch why := m.failOpen(now); {
+		case ok:
+		case why != "":
+			ok, note = true, " (from the queue: "+why+")"
+		case m.waitedEnough(w, now):
+			// Estimates said no for long enough; the Mac itself is not short. Let it run.
+			ok, note = true, fmt.Sprintf(" (waited %s, the most a request waits while the Mac is not swapping)",
+				now.Sub(w.Since).Round(time.Minute))
+		}
 		if !ok {
 			if press && now.Sub(w.Pressed) >= time.Minute {
 				w.Pressed = now
@@ -260,7 +270,7 @@ func (m *Manager) grantWaiters(now time.Time, press bool) {
 			}
 			continue
 		}
-		l := m.grant(w, now, fmt.Sprintf(" (from the queue, after %s)", now.Sub(w.Since).Round(time.Second)))
+		l := m.grant(w, now, note)
 		t := now
 		l.Offered = &t
 		by := now.Add(m.grantHold())
