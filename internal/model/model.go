@@ -299,6 +299,10 @@ type Approval struct {
 	Path    string         `json:"path"`
 	From    string         `json:"from"` // the terminal app it came from
 	State   string         `json:"state"`
+	// Vault is set for an agent's request for access to an account: approving it needs the
+	// account's secret, which only the app has, so only the app's vault answer approves it.
+	Vault *VaultAsk `json:"vault,omitempty"`
+	Error string    `json:"error,omitempty"` // why an approved request failed
 }
 
 // Leak is a process whose memory footprint kept climbing for an hour or more with nothing to
@@ -389,6 +393,10 @@ type State struct {
 	DockerVMIdleMB float64 `json:"docker_vm_idle_mb,omitempty"`
 	// LastReceipt is when the weekly receipt was last sent.
 	LastReceipt time.Time `json:"last_receipt,omitempty"`
+	// VaultAccounts are the accounts agents may ask for, by name, without their secrets (the
+	// app keeps those in the Keychain). VaultGrants are the access given, newest last (200).
+	VaultAccounts map[string]*VaultAccount `json:"vault_accounts,omitempty"`
+	VaultGrants   []*VaultGrant            `json:"vault_grants,omitempty"`
 }
 
 // Decision is one pause or stop decision (taken, or that would have been taken in dry run),

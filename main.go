@@ -48,6 +48,8 @@ func main() {
 			}
 		}
 		hook.Run(event, agent)
+	case "vault":
+		os.Exit(runVault(os.Args[2:]))
 	case "mcp":
 		if err := mcp.Serve(os.Stdin, os.Stdout, version); err != nil {
 			fmt.Fprintln(os.Stderr, "agentrm mcp:", err)

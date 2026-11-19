@@ -34,6 +34,7 @@ func (m *Manager) Run(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				m.vaultTick()
 				m.persist()
 				if n++; n%10 == 0 {
 					if rec := m.recorder(); rec != nil {

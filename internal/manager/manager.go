@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -99,6 +100,15 @@ type Manager struct {
 	leakProcs       map[int]*sys.Proc         // the process table the leak watch last saw
 	procUID         func(pid int) (int, bool) // who a process runs as; nil in tests
 
+	// The vault (vault.go): live credentials, in memory only, and the API-key proxy.
+	vaultLive   map[string]*vaultLive // grant ID -> credential
+	vaultTok    map[string]string     // proxy token -> grant ID
+	vaultClient *http.Client          // nil: the default; tests point it at fakes
+	vaultWG     sync.WaitGroup        // revocations in flight
+	proxyOnce   sync.Once
+	proxyBase   string
+	proxyErr    error
+
 	dirty    bool
 	saver    *store.Saver
 	evlog    io.Writer
@@ -132,6 +142,7 @@ func New(o Options) *Manager {
 		missing: map[string]int{}, hookSeen: map[string]time.Time{}, claimRefused: map[string]bool{}, infos: newInfoCache(nil), stale: map[int]bool{}, selfPID: os.Getpid(),
 		parked: map[*model.Waiter][]chan *api.AcquireResp{}, backfilled: map[*model.Waiter]map[string]bool{},
 		kick: make(chan struct{}, 1), readFast: sys.ReadFast, restartedAt: map[string]*restartMark{}, preps: map[string]*prep{},
+		vaultLive: map[string]*vaultLive{}, vaultTok: map[string]string{},
 	}
 	m.notify = o.Notify
 	if m.notify == nil {
@@ -181,6 +192,7 @@ func New(o Options) *Manager {
 		}
 	}
 	m.st.AgentSessions = kept
+	m.vaultRestarted(now())
 	m.tamperInit()
 	for _, n := range m.notes {
 		m.log.Warn(n)
@@ -305,8 +317,12 @@ func OSANotify(title, msg string) {
 
 type handler func(c api.Caller, r api.Req) (any, []Effect, error)
 
-// errApproval asks the dispatcher to hold a privileged request for a click in the app.
-type errApproval struct{ what string }
+// errApproval asks the dispatcher to hold a privileged request for a click in the app. a is set
+// when the handler made the approval itself (a vault request).
+type errApproval struct {
+	what string
+	a    *model.Approval
+}
 
 func (e *errApproval) Error() string { return e.what }
 
@@ -314,6 +330,9 @@ func (e *errApproval) Error() string { return e.what }
 type ErrNeedsApproval struct{ Approval *model.Approval }
 
 func (e *ErrNeedsApproval) Error() string {
+	if v := e.Approval.Vault; v != nil {
+		return fmt.Sprintf("asked the person for %s (vault request %s); they approve it with Touch ID in AgentRM", v.Account, e.Approval.ID)
+	}
 	return fmt.Sprintf("%s needs your approval in the AgentRM app (approval %s); click Approve there",
 		e.Approval.What, e.Approval.ID)
 }
@@ -343,6 +362,11 @@ func (m *Manager) routes() map[string]handler {
 		"/bypass":   m.bypass,
 		"/approval": m.approvalStatus,
 		"/leak":     m.leakAct,
+		// The vault. Its answer (with the secret) is served apart: see HandleCtx.
+		"/vault/request":  m.vaultRequest,
+		"/vault/list":     m.vaultList,
+		"/vault/revoke":   m.vaultRevokeReq,
+		"/vault/accounts": m.vaultSetAccounts,
 		"/whoami": func(c api.Caller, r api.Req) (any, []Effect, error) {
 			return c, nil, nil
 		},
@@ -358,24 +382,28 @@ func (m *Manager) Handle(path string, peerPID int, req api.Req) (any, error) {
 // HandleCtx is Handle for a caller that may go away: ctx ends when its connection does. Only a
 // request that waits (acquire with WaitSeconds) looks at it.
 func (m *Manager) HandleCtx(ctx context.Context, path string, peerPID int, req api.Req) (any, error) {
+	if path == "/vault/answer" {
+		// It carries a secret: never traced, and it mints outside the lock.
+		return m.vaultAnswer(ctx, gatherFacts(peerPID), req)
+	}
 	h, ok := m.routes()[path]
 	if !ok {
 		return nil, fmt.Errorf("unknown request %s", path)
 	}
 	facts := gatherFacts(peerPID)
 	req.Repo, req.Branch = "", ""
-	if req.Cwd != "" && (path == "/touch" || path == "/acquire" || path == "/renew" || path == "/claim") {
+	if req.Cwd != "" && (path == "/touch" || path == "/acquire" || path == "/renew" || path == "/claim" || path == "/vault/request") {
 		req.Repo, req.Branch = sys.GitHead(req.Cwd) // a file read: outside the lock
 	}
 	return m.handleFacts(ctx, path, h, facts, req)
 }
 
 // readOnly requests change nothing and are not recorded.
-var readOnly = map[string]bool{"/status": true, "/whoami": true, "/approval": true, "/receipt": true}
+var readOnly = map[string]bool{"/status": true, "/whoami": true, "/approval": true, "/receipt": true, "/vault/list": true}
 
 // handleFacts serves a request from a caller already traced (live, or from a trace).
 func (m *Manager) handleFacts(ctx context.Context, path string, h handler, facts facts, req api.Req) (any, error) {
-	if rec := m.recorder(); rec != nil && !readOnly[path] {
+	if rec := m.recorder(); rec != nil && !readOnly[path] && !strings.HasPrefix(path, "/vault/") {
 		rec.Write(trace.Frame{T: m.now(), Request: &trace.Request{Path: path, Req: req, Facts: trace.Facts{
 			PID: facts.pid, AgentPID: facts.agentPID, Agent: facts.agent, GUI: facts.gui, App: facts.app, AppPID: facts.appPID, ViaApp: facts.viaApp}}})
 	}
@@ -384,7 +412,10 @@ func (m *Manager) handleFacts(ctx context.Context, path string, h handler, facts
 	resp, effects, err := h(caller, req)
 	var ea *errApproval
 	if errors.As(err, &ea) {
-		a := m.newApproval(path, req, caller, ea.what)
+		a := ea.a
+		if a == nil {
+			a = m.newApproval(path, req, caller, ea.what)
+		}
 		m.mu.Unlock()
 		return nil, &ErrNeedsApproval{Approval: a}
 	}
@@ -432,7 +463,7 @@ func (m *Manager) status(c api.Caller, r api.Req) (any, []Effect, error) {
 		Learned: m.st.Learned, Stopped: m.st.Stopped, Approvals: m.st.Approvals, Sources: src,
 		Self: m.self, StartedAt: m.started, Notes: m.notes, Prediction: m.predictionScore(),
 		TrustLevels: m.trustLevels(m.now()), Accuracy: m.st.Accuracy, FailOpen: m.failOpen(m.now()),
-		Leaks: m.leakList(),
+		Leaks: m.leakList(), VaultAccounts: m.vaultAccountList(), VaultGrants: m.st.VaultGrants,
 	}, nil, nil
 }
 

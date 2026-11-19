@@ -389,8 +389,9 @@ func (m *Manager) endSession(s *model.Session, why string, now time.Time) {
 		marked++
 		mb += r.MemMB
 	}
-	// A session that ended waits for nothing.
+	// A session that ended waits for nothing, and holds no access.
 	m.dropWaitersOf(s.ID)
+	m.vaultEndSession(s.ID, "its session ended: "+why, now)
 	m.event("ENDED session %s (%s): %s. Released %d lease(s); %d thing(s) it started or held (%.1f GB) are now collected.",
 		short(s.ID), s.Agent, why, n, marked, mb/1024)
 	if marked > 0 {

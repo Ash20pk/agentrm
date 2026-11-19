@@ -54,6 +54,11 @@ Acting (pinning, settings and overriding others ask for approval in the app)
   agentrm priority SESSION urgent|normal       an urgent session goes first in the queue
   agentrm config [--dry-run=true|false] [--grace MIN] [--headroom GB] [--idle MIN] [--pause MIN]
 
+Vault (short-lived access to accounts; see agentrm vault)
+  agentrm vault list                           accounts you may ask for, and your grants
+  agentrm vault run ACCOUNT --purpose "why" -- COMMAND   run with access, approved with Touch ID
+  agentrm vault revoke GRANT | --all           end access early
+
 Setup
   agentrm setup claude|codex|gemini|cursor|path|shim [--uninstall]
                                                an agent's hooks, the CLI link, or the PATH shim

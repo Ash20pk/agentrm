@@ -67,6 +67,9 @@ func (m *Manager) approve(c api.Caller, r api.Req) (any, []Effect, error) {
 		m.event("DENIED %s: %s", a.ID, a.What)
 		return &api.ApprovalResp{Approval: a}, nil, nil
 	}
+	if a.Vault != nil {
+		return nil, nil, fmt.Errorf("a vault request is approved with Touch ID in the AgentRM app (it needs the account's secret)")
+	}
 	var req api.Req
 	b, _ := json.Marshal(a.Request)
 	_ = json.Unmarshal(b, &req)
@@ -91,7 +94,7 @@ func (m *Manager) approvalStatus(c api.Caller, r api.Req) (any, []Effect, error)
 	if a.State == "pending" && m.now().After(a.Expires) {
 		a.State = "expired"
 	}
-	return &api.ApprovalResp{Approval: a}, nil, nil
+	return &api.ApprovalResp{Approval: a, Error: a.Error}, nil, nil
 }
 
 func (m *Manager) pin(c api.Caller, r api.Req) (any, []Effect, error) {
