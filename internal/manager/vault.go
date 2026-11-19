@@ -403,12 +403,34 @@ func (m *Manager) vaultSetAccounts(c api.Caller, r api.Req) (any, []Effect, erro
 		}
 	}
 	m.st.VaultAccounts = next
+	m.vaultAnnounce(now)
 	m.revokeLater(rs)
 	if len(changed) > 0 {
 		sort.Strings(changed)
 		m.event("VAULT accounts changed: %s", strings.Join(changed, ", "))
 	}
 	return &api.VaultListResp{Accounts: m.vaultAccountList(), Grants: m.st.VaultGrants}, nil, nil
+}
+
+// vaultAnnounce tells each session once, in its inbox, which accounts it may ask for: an agent
+// that does not know the vault exists asks the person for the secret instead. Must hold mu.
+func (m *Manager) vaultAnnounce(now time.Time) {
+	const key = "vault:accounts"
+	if len(m.st.VaultAccounts) == 0 {
+		delete(m.st.Questions, key)
+		return
+	}
+	var names []string
+	for _, a := range m.vaultAccountList() {
+		names = append(names, a.Name+" ("+a.Kind+")")
+	}
+	if m.st.Questions == nil {
+		m.st.Questions = map[string]*model.Question{}
+	}
+	m.st.Questions[key] = &model.Question{Created: now, Delivered: map[string]bool{}, Answers: map[string]string{},
+		Text: "AgentRM's vault can give you short-lived access to: " + strings.Join(names, ", ") +
+			". If your task needs one, run `agentrm vault run <account> --purpose \"<why>\" -- <command>` (see `agentrm vault list` for scopes); " +
+			"the person approves it with Touch ID. Never ask the person to paste these secrets into the chat."}
 }
 
 // ensureProxy starts the API-key proxy on a loopback port, once.

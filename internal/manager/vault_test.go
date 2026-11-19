@@ -319,6 +319,27 @@ func TestVaultMintFailureIsReported(t *testing.T) {
 	}
 }
 
+// Each session is told once which accounts it may ask for.
+func TestVaultAnnouncedOnce(t *testing.T) {
+	m, _ := vaultTest(t, loginAcct)
+	inbox := func(s string) []string {
+		out, _, _ := m.inbox(agent(s), api.Req{})
+		return out.(*api.InboxResp).Questions
+	}
+	if q := inbox("s1"); len(q) != 1 || !strings.Contains(q[0], "staging-admin (password)") {
+		t.Fatalf("inbox %v", q)
+	}
+	if q := inbox("s1"); len(q) != 0 {
+		t.Fatal("told twice")
+	}
+	if _, _, err := m.vaultSetAccounts(you, api.Req{}); err != nil {
+		t.Fatal(err)
+	}
+	if q := inbox("s2"); len(q) != 0 {
+		t.Fatalf("an empty vault announced: %v", q)
+	}
+}
+
 func TestVaultRestartEndsGrants(t *testing.T) {
 	m, c := vaultTest(t, loginAcct)
 	g := grantFor(t, m, agent("s1"), api.Req{Account: "staging-admin"}, map[string]string{"password": "p"})

@@ -76,7 +76,12 @@ struct MenuView: View {
 
     // MARK: approval
 
+    @ViewBuilder
     private func approval(_ a: Approval) -> some View {
+        if let ask = a.vault { VaultApprovalCard(approval: a, ask: ask) } else { plainApproval(a) }
+    }
+
+    private func plainApproval(_ a: Approval) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             LampLabel(lamp: Lamp.waiting.color, text: "Approval, expires \(Fmt.rel(a.expires))")
             Text(a.what).font(Face.body(17, .semibold)).fixedSize(horizontal: false, vertical: true)

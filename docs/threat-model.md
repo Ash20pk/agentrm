@@ -98,6 +98,44 @@ What this does not guarantee:
 - **On Linux there is no app**: no caller is the app. Terminals and editors are recognised by
   the base name of `/proc/<pid>/exe`, which an agent can copy under any name.
 
+## The vault
+
+The vault ([vault.md](vault.md)) changes what AgentRM holds: secrets. Where they are, and who
+can reach them:
+
+- **At rest, in the login Keychain, in items the AgentRM app created.** The Keychain trusts the
+  app that made an item, so the app reads them without a prompt and anything else, including an
+  agent running `security find-generic-password` or a copy of the `agentrm` binary, makes macOS
+  ask you. This is the one boundary in AgentRM that holds against a process running as you.
+- **On approval, only.** The app reads an account's secret after Touch ID (or your password),
+  for one request it shows you, and passes it to the daemon on the helper's stdin (never argv,
+  which other processes can read). The daemon accepts it only from the app (`ViaApp`, above).
+- **In the daemon's memory, while a grant lasts.** It mints the short-lived credential, keeps
+  it, and forgets it when the grant ends. Nothing secret is written to `state.json`, traces,
+  events, the log or `agentrm status`; tests check this. A daemon restart ends every grant.
+- **In the agent's command.** `vault run` hands GitHub and AWS credentials and passwords to the
+  command it runs, so the agent can print them (`vault run x -- env`). That is the point of
+  making them short-lived and narrow: a GitHub token is one hour and some repos at most, an
+  AWS session is one role. Only API keys stay out of reach: the agent gets a proxy token, and
+  the proxy on `127.0.0.1` puts the key on requests. Any local process with a live proxy token
+  can use it until the grant ends.
+
+What approving protects against, and what it does not:
+
+- An agent cannot approve its own request: answering needs the app, and the app needs Touch ID.
+  Editing or adding an account needs Touch ID too, so a driven UI cannot point an API key's
+  account at another server and then ask for it.
+- One session's grant is not another's: grants are bound to the session the kernel says is
+  asking (see "Who acts").
+- A denied request cannot be repeated for a few minutes, so an agent cannot keep asking until
+  you click the wrong button.
+- **Approving is trusting the purpose the agent wrote.** The approval shows what it will get and
+  where the request comes from; it cannot show what the agent will do with it. Keep each
+  account's own limits tight (the GitHub App's permissions, the IAM user's roles): they are the
+  ceiling no approval can raise.
+- **AWS sessions and seen passwords cannot be taken back.** Revoking ends the grant in AgentRM;
+  an AWS session works until it expires, and a password until you change it.
+
 ## The privileged helper (decision D7, not built)
 
 The only real enforcement is to take the decisions out of the user's reach: a root-owned helper

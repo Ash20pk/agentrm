@@ -30,6 +30,13 @@ may do less than a person.
 Agents without hooks (Aider, OpenCode, older versions) are covered by the PATH shim
 (`agentrm setup shim`) and the MCP server (`agentrm mcp`).
 
+## Accounts: the vault
+
+An agent that needs GitHub, an API key, AWS or a login asks the vault instead of the person:
+`agentrm vault list`, then `agentrm vault run <account> --purpose "<why>" -- <command>`. The
+person approves with Touch ID; the command runs with short-lived access. Each session is told
+once, in its inbox, which accounts exist. See [vault.md](vault.md).
+
 ## The lease API, for orchestrators
 
 Tools that run several agents (Conductor, Claude Squad, a CI runner, your own scripts) can take

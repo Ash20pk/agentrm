@@ -6,7 +6,7 @@ import SwiftUI
 /// the decisions to review, what was stopped, setup and limits.
 struct ActivityView: View {
     enum Tab: String, CaseIterable {
-        case now = "Now", collected = "Collected", week = "Week", decisions = "Decisions", stopped = "Stopped", setup = "Setup", limits = "Limits"
+        case now = "Now", collected = "Collected", week = "Week", decisions = "Decisions", stopped = "Stopped", vault = "Vault", setup = "Setup", limits = "Limits"
     }
 
     let updater: SPUUpdater
@@ -48,6 +48,7 @@ struct ActivityView: View {
                 case .week: WeekTab()
                 case .decisions: DecisionsTab()
                 case .stopped: StoppedTab()
+                case .vault: VaultTab()
                 case .setup: SetupTab(updater: updater)
                 case .limits: LimitsTab()
                 }

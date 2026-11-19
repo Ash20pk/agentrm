@@ -245,7 +245,14 @@ final class Store: ObservableObject {
     func claim(_ id: String, purpose: String, hours: Int) {
         act(["claim", id, "--purpose", purpose, "--ttl", String(hours * 60)])
     }
-    func answer(_ approvalID: String, approve: Bool) { act([approve ? "approve" : "deny", approvalID]) }
+    func answer(_ approvalID: String, approve: Bool) {
+        // A vault request needs the account's secret: Touch ID, then the Keychain (Vault.swift).
+        if approve, let a = status?.approvals?[approvalID], a.vault != nil {
+            approveVault(a)
+            return
+        }
+        act([approve ? "approve" : "deny", approvalID])
+    }
     func mark(_ d: Decision, right: Bool) {
         Task {
             _ = try? await CLI.run(["review", "mark", d.id, right ? "right" : "wrong"])

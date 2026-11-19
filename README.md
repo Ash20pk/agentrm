@@ -18,6 +18,10 @@ say why, and clean up after yourself.**
   lost; using it resumes it), then stopped. Everything stopped can be restored.
 - **You stay in charge.** Pinning, settings and overriding an agent from a terminal need a click
   in the app. Tampering (a killed daemon, edited files, removed hooks) is reported.
+- **A vault for accounts.** An agent that needs GitHub, an API key, AWS or a login asks
+  (`agentrm vault run <account> --purpose "why" -- <command>`); you approve with Touch ID; it
+  gets access that expires by itself, scoped to what it asked. Secrets stay in your Keychain,
+  and an API key never reaches the agent at all.
 - **A menu-bar app** with memory, swap, headroom, leases, what is running, approvals, and a
   history of every decision for you to review.
 
@@ -54,6 +58,8 @@ agentrm collect                    # stop now what ended sessions left (restorab
 agentrm leak accept leak-1a2b3c4d  # restart (or stop) a process whose memory keeps climbing
 agentrm receipt                    # the week: freed, found, waited, restored
 agentrm compare                    # AgentRM against a parent-PID reaper, on your recorded traces
+agentrm vault list                 # accounts agents may ask for, and live grants
+agentrm vault run github-openbox --scope contents:write --purpose "push the fix" -- git push
 ```
 
 ## Docs
@@ -63,6 +69,7 @@ agentrm compare                    # AgentRM against a parent-PID reaper, on you
 - [Agents and the lease API](docs/agents.md): Claude Code, Codex, Gemini CLI, Cursor; orchestrators
 - [Traces and replay](docs/replay.md): measuring a policy on real days
 - [Design](docs/design.md): garbage collection for what coding agents leave behind
+- [The vault](docs/vault.md): short-lived, approved access to accounts for agents
 - [Configuration](docs/config.md): every setting and file
 - [Troubleshooting](docs/troubleshooting.md)
 - [Threat model](docs/threat-model.md): what it defends against, and what it does not

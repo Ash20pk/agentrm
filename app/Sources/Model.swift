@@ -114,6 +114,72 @@ struct Approval: Codable, Identifiable {
     var from: String?
     var state: String
     var path: String?
+    /// Set for an agent asking the vault for access to an account (approved with Touch ID).
+    var vault: VaultAsk?
+    var error: String?
+}
+
+/// An account in the vault, without its secret (that is in the Keychain). Mirrors
+/// internal/model/vault.go; nil fields are left out when sent back.
+struct VaultAccount: Codable, Identifiable, Hashable {
+    var name: String
+    var kind: String
+    var note: String?
+    var max_minutes: Int?
+    var scopes: [String]?
+    var app_id: String?
+    var installation_id: String?
+    var repos: [String]?
+    var permissions: [String: String]?
+    var api_url: String?
+    var header: String?
+    var prefix: String?
+    var key_env: String?
+    var base_env: String?
+    var region: String?
+    var external_id: String?
+    var username: String?
+    var url: String?
+    var user_env: String?
+    var pass_env: String?
+    var id: String { name }
+}
+
+/// What an agent asked the vault for.
+struct VaultAsk: Codable, Hashable {
+    var account: String
+    var kind: String
+    var scope: String
+    var repos: [String]?
+    var minutes: Int
+    var purpose: String
+    var reveal: Bool?
+    var session: String
+    var agent: String
+    var repo: String?
+}
+
+/// Access given (a record: never the secret).
+struct VaultGrant: Codable, Identifiable {
+    var id: String
+    var account: String
+    var kind: String
+    var scope: String
+    var repos: [String]?
+    var minutes: Int
+    var purpose: String
+    var reveal: Bool?
+    var session: String
+    var agent: String
+    var repo: String?
+    var created: Date
+    var expires: Date
+    var ended: Date?
+    var end_reason: String?
+    var uses: Int?
+    var last_used: Date?
+    var note: String?
+    var live: Bool { ended == nil && expires > Date() }
 }
 
 /// A process whose memory keeps climbing with nothing to explain it (status "leaks"; absent
@@ -168,10 +234,13 @@ struct Status: Codable {
     var prediction: String?
     var trust_levels: [TrustLevel]?
     var leaks: [Leak]?
+    var vault_accounts: [VaultAccount]?
+    var vault_grants: [VaultGrant]?
 
     enum CodingKeys: String, CodingKey {
         case mem, headroom_mb, pending_mb, swap_rate_mb_min, waiters, config, leases, resources, sessions,
-             events, last_sweep, daemon_version, sources, stopped, approvals, notes, prediction, trust_levels, leaks, fail_open
+             events, last_sweep, daemon_version, sources, stopped, approvals, notes, prediction, trust_levels, leaks, fail_open,
+             vault_accounts, vault_grants
         case selfUsage = "self"
     }
 }
@@ -255,7 +324,9 @@ enum CLI {
     }
 
     /// Runs the helper off the main thread and returns stdout.
-    static func run(_ args: [String], timeout: TimeInterval = 15) async throws -> Data {
+    /// `input` is written to the helper's stdin and closed: the way a secret reaches it, never argv
+    /// (any process can read another's arguments).
+    static func run(_ args: [String], timeout: TimeInterval = 15, input: Data? = nil) async throws -> Data {
         try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 let p = Process()
@@ -264,11 +335,17 @@ enum CLI {
                 let out = Pipe(), err = Pipe()
                 p.standardOutput = out
                 p.standardError = err
+                let inPipe = input.map { _ in Pipe() }
+                if let inPipe { p.standardInput = inPipe }
                 do {
                     try p.run()
                 } catch {
                     cont.resume(throwing: error)
                     return
+                }
+                if let inPipe, let input {
+                    inPipe.fileHandleForWriting.write(input)
+                    try? inPipe.fileHandleForWriting.close()
                 }
                 let killer = DispatchWorkItem { if p.isRunning { p.terminate() } }
                 DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)

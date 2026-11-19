@@ -259,6 +259,10 @@ you run may be checked by it (and refused when the machine is short of memory).
   or free something you hold. If it says you are queued, do not retry in a loop: run
   ` + "`agentrm acquire --kind <kind> --purpose \"<why>\" --wait`" + `, which returns when the lease is
   yours, then run the command again.
+- If a task needs an account (GitHub, an API key, AWS, a login), do not ask the user to paste a
+  secret: ` + "`agentrm vault list`" + ` shows what you may ask for, and
+  ` + "`agentrm vault run <account> --purpose \"<why>\" -- <command>`" + ` runs the command with
+  short-lived access once the user approves it.
 - At the start of each task run ` + "`agentrm inbox`" + ` and answer every question:
   ` + "`agentrm claim <resource> --purpose \"<why>\"`" + ` for what you use, ` + "`agentrm disown <resource>`" + ` for what you don't.
 `
