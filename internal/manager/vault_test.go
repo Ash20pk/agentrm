@@ -340,6 +340,60 @@ func TestVaultAnnouncedOnce(t *testing.T) {
 	}
 }
 
+// An account narrowed while a request waits: approving the old ask must fail.
+func TestVaultNarrowedAccountFailsPending(t *testing.T) {
+	acct := model.VaultAccount{Name: "aws", Kind: model.VaultAWS, Scopes: []string{"arn:aws:iam::1:role/admin", "arn:aws:iam::1:role/read"}}
+	m, _ := vaultTest(t, acct)
+	a, _ := ask(t, m, agent("s1"), api.Req{Account: "aws", Scope: "admin"})
+	acct.Scopes = []string{"arn:aws:iam::1:role/read"}
+	if _, _, err := m.vaultSetAccounts(you, api.Req{VaultAccounts: []model.VaultAccount{acct}}); err != nil {
+		t.Fatal(err)
+	}
+	if a.State != "failed" {
+		t.Fatalf("a request for a removed role still waits: %s", a.State)
+	}
+	if err := answer(t, m, a, true, map[string]string{"access_key_id": "x", "secret_access_key": "y"}); err != nil {
+		t.Fatal(err) // answering a failed request does nothing
+	}
+	if len(m.st.VaultGrants) != 0 {
+		t.Fatal("granted a role the account no longer allows")
+	}
+}
+
+// After a denial the session cannot ask again for that account in another form either, and
+// cannot keep many requests open.
+func TestVaultAskingLimits(t *testing.T) {
+	gh := model.VaultAccount{Name: "gh", Kind: model.VaultGitHub, AppID: "1", InstallationID: "2"}
+	m, _ := vaultTest(t, loginAcct, gh)
+	a, _ := ask(t, m, agent("s1"), api.Req{Account: "gh", Scope: "contents:read"})
+	_ = answer(t, m, a, false, nil)
+	if _, _, err := m.vaultRequest(agent("s1"), api.Req{Account: "gh", Scope: "issues:read", Purpose: "x"}); err == nil {
+		t.Fatal("asked again for a denied account in another form")
+	}
+	for i, scope := range []string{"contents:read", "issues:read", "pull_requests:read"} {
+		_, _, err := m.vaultRequest(agent("s2"), api.Req{Account: "gh", Scope: scope, Purpose: "x"})
+		var ea *errApproval
+		if !errors.As(err, &ea) {
+			t.Fatalf("request %d: %v", i, err)
+		}
+	}
+	if _, _, err := m.vaultRequest(agent("s2"), api.Req{Account: "staging-admin", Purpose: "x"}); err == nil || !strings.Contains(err.Error(), "waiting") {
+		t.Fatalf("a fourth open request: %v", err)
+	}
+}
+
+// What you were granted is not handed to the next caller that passes for you.
+func TestVaultYouAskedEveryTime(t *testing.T) {
+	m, _ := vaultTest(t, loginAcct)
+	a, _ := ask(t, m, terminal, api.Req{Account: "staging-admin"})
+	if err := answer(t, m, a, true, map[string]string{"password": "p"}); err != nil {
+		t.Fatal(err)
+	}
+	if again, got := ask(t, m, terminal, api.Req{Account: "staging-admin"}); again == nil || got != nil {
+		t.Fatal("your grant was handed out again without asking")
+	}
+}
+
 func TestVaultRestartEndsGrants(t *testing.T) {
 	m, c := vaultTest(t, loginAcct)
 	g := grantFor(t, m, agent("s1"), api.Req{Account: "staging-admin"}, map[string]string{"password": "p"})

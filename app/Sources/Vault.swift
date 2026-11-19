@@ -106,7 +106,8 @@ extension Store {
             throw CLI.Failure(message: "Not saved: authentication was cancelled.")
         }
         let renamedFrom = old.flatMap { $0 == acct.name ? nil : $0 }
-        let isNew = !VaultKeychain.has(acct.name)
+        // What the Keychain held, to put back if the daemon refuses the account.
+        let previous = try? VaultKeychain.read(acct.name)
         if let material {
             try VaultKeychain.save(acct.name, material)
         } else if let from = renamedFrom {
@@ -117,7 +118,7 @@ extension Store {
         do {
             try await syncVaultAccounts(list)
         } catch {
-            if isNew && (material != nil || renamedFrom != nil) { VaultKeychain.delete(acct.name) }
+            if let previous { try? VaultKeychain.save(acct.name, previous) } else if material != nil || renamedFrom != nil { VaultKeychain.delete(acct.name) }
             throw error
         }
         if let from = renamedFrom { VaultKeychain.delete(from) }

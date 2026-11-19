@@ -127,8 +127,17 @@ What approving protects against, and what it does not:
   account at another server and then ask for it.
 - One session's grant is not another's: grants are bound to the session the kernel says is
   asking (see "Who acts").
-- A denied request cannot be repeated for a few minutes, so an agent cannot keep asking until
-  you click the wrong button.
+- After a denial the session cannot ask for that account again, in any form, for a few
+  minutes, and no session may have more than three requests open: an agent cannot keep asking
+  until you click the wrong button.
+- A request waiting for you is checked again against the account when you approve, and after
+  the credential is made: narrowing or removing an account fails what was asked under the old
+  limits.
+- Grants to you (a terminal) are never reused: anything that passes for a person would share
+  them, so each request from a terminal asks again.
+- Variables `vault run` sets are never kept in AgentRM's restart records, whatever their names.
+- Revoking an API key's grant refuses new requests through the proxy at once; a request already
+  streaming finishes.
 - **Approving is trusting the purpose the agent wrote.** The approval shows what it will get and
   where the request comes from; it cannot show what the agent will do with it. Keep each
   account's own limits tight (the GitHub App's permissions, the IAM user's roles): they are the

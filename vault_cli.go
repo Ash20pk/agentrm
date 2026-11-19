@@ -15,6 +15,7 @@ import (
 
 	"agentrm/internal/api"
 	"agentrm/internal/model"
+	"agentrm/internal/sys"
 )
 
 const vaultUsage = `agentrm vault — short-lived access to accounts, approved by a person
@@ -211,14 +212,20 @@ func execWith(command []string, g *api.VaultResp) error {
 		drop[k] = true
 	}
 	var env []string
+	drop[sys.VaultVarsEnv] = true
 	for _, kv := range os.Environ() {
 		if k, _, _ := strings.Cut(kv, "="); !drop[k] {
 			env = append(env, kv)
 		}
 	}
+	names := make([]string, 0, len(g.Env))
 	for k, v := range g.Env {
 		env = append(env, k+"="+v)
+		names = append(names, k)
 	}
+	sort.Strings(names)
+	// So AgentRM never keeps them when it records how to restart this command.
+	env = append(env, sys.VaultVarsEnv+"="+strings.Join(names, ","))
 	return syscall.Exec(path, command, env)
 }
 

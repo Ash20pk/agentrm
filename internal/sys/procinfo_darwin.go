@@ -70,5 +70,6 @@ func parseProcArgs(b []byte) (ProcInfo, bool) {
 			info.addEnv(k, v)
 		}
 	}
+	info.finish()
 	return info, true
 }

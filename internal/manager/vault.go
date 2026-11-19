@@ -34,6 +34,8 @@ const (
 	// cannot keep the notification coming.
 	vaultDeniedQuiet = 2 * time.Minute
 	vaultKeepGrants  = 200
+	// A session may have this many vault requests open at once.
+	vaultMaxPending = 3
 )
 
 // vaultLive is a grant's credential, in memory only.
@@ -107,7 +109,9 @@ func (m *Manager) vaultRequest(c api.Caller, r api.Req) (any, []Effect, error) {
 		return nil, nil, err
 	}
 	now := m.now()
-	for i := len(m.st.VaultGrants) - 1; i >= 0; i-- {
+	// You are not one process: anything that passes for a person (a terminal an agent drives
+	// with AppleScript) would share your grants. So yours are asked for every time.
+	for i := len(m.st.VaultGrants) - 1; i >= 0 && !c.Human; i-- {
 		g := m.st.VaultGrants[i]
 		live := m.vaultLive[g.ID]
 		if live == nil || !g.Live(now) || !vault.Covers(g, &ask) {
@@ -119,17 +123,29 @@ func (m *Manager) vaultRequest(c api.Caller, r api.Req) (any, []Effect, error) {
 		m.dirty = true
 		return &api.VaultResp{Grant: g, Env: live.cred.Env, Unset: live.cred.Unset}, nil, nil
 	}
+	open := 0
 	for _, a := range m.st.Approvals {
-		if a.Vault == nil || a.Vault.Session != ask.Session || a.Vault.Account != ask.Account {
+		if a.Vault == nil || a.Vault.Session != ask.Session {
+			continue
+		}
+		waiting := (a.State == "pending" && now.Before(a.Expires)) || a.State == "minting"
+		if waiting {
+			open++
+		}
+		if a.Vault.Account != ask.Account {
 			continue
 		}
 		same := a.Vault.Scope == ask.Scope && slices.Equal(a.Vault.Repos, ask.Repos) && a.Vault.Reveal == ask.Reveal
 		switch {
-		case a.State == "pending" && now.Before(a.Expires) && same:
+		case waiting && same:
 			return nil, nil, &errApproval{what: a.What, a: a}
-		case a.State == "denied" && now.Sub(a.Created) < vaultDeniedQuiet+vaultApprovalTTL && same:
+		// Denied: not asked again for this account, whatever the ask, for a while.
+		case a.State == "denied" && now.Sub(a.Created) < vaultDeniedQuiet+vaultApprovalTTL:
 			return nil, nil, fmt.Errorf("access to %s was denied in AgentRM a moment ago; ask the person in the chat before asking again", ask.Account)
 		}
+	}
+	if open >= vaultMaxPending {
+		return nil, nil, fmt.Errorf("this session already has %d vault requests waiting for the person; wait for their answer", open)
 	}
 	who := fmt.Sprintf("%s session %s", agentTitle(c.Agent), short(c.Session))
 	if ask.Repo != "" {
@@ -176,6 +192,15 @@ func (m *Manager) vaultAnswer(ctx context.Context, f facts, r api.Req) (any, err
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	now := m.now()
+	// While the token was being made (outside the lock) the account may have been changed or
+	// removed, or the approval ended: then what was made is thrown away.
+	if err == nil {
+		cur := m.vaultAccount(acct.Name)
+		if cur == nil || !reflect.DeepEqual(*cur, acct) || a.State != "minting" {
+			m.revokeLater([]*vaultRevoke{{acct: acct, cred: cred, grant: "(discarded)"}})
+			err = fmt.Errorf("the account %s was changed while access was being made; ask again", acct.Name)
+		}
+	}
 	if err != nil {
 		a.State, a.Error = "failed", err.Error()
 		m.event("VAULT could not give %s to session %s: %v", ask.Account, short(ask.Session), err)
@@ -205,7 +230,8 @@ func (m *Manager) vaultAnswer(ctx context.Context, f facts, r api.Req) (any, err
 	if s := m.st.Sessions[ask.Session]; s != nil && s.EndedAt != nil {
 		m.revokeLater([]*vaultRevoke{m.vaultEnd(g, "its session had ended", now)})
 	}
-	return &api.ApprovalResp{Approval: a, Result: g}, nil
+	// Encoded after the lock is released, while ticks and the proxy change the grant.
+	return snapshot(&api.ApprovalResp{Approval: a, Result: g}), nil
 }
 
 // vaultAnswerCheck finds the approval being answered. done is the response when there is
@@ -239,7 +265,13 @@ func (m *Manager) vaultAnswerCheck(c api.Caller, r api.Req) (a *model.Approval, 
 	if len(r.Material) == 0 {
 		return a, acct, ask, nil, fmt.Errorf("no secret came with the approval of %s", a.Vault.Account)
 	}
+	// The account may have been narrowed since the agent asked: the ask must still fit it.
 	ask = *a.Vault
+	again := ask
+	if err := vault.Normalize(p, &again); err != nil || again.Scope != ask.Scope || !slices.Equal(again.Repos, ask.Repos) || again.Minutes != ask.Minutes {
+		a.State, a.Error = "failed", "the account's limits changed since it was asked; ask again"
+		return a, acct, ask, nil, errors.New(a.Error)
+	}
 	if r.TTLMinutes > 0 && r.TTLMinutes < ask.Minutes { // you may give less time than asked
 		ask.Minutes = r.TTLMinutes
 		if ask.Kind == model.VaultAWS {
@@ -338,6 +370,26 @@ func (m *Manager) vaultRestarted(now time.Time) {
 	}
 }
 
+// VaultClose ends every grant and revokes what can be, waiting a few seconds at most: the
+// daemon is stopping, and its memory (where the credentials are) goes with it.
+func (m *Manager) vaultClose() {
+	m.mu.Lock()
+	var rs []*vaultRevoke
+	for _, g := range m.st.VaultGrants {
+		if g.Ended == nil {
+			rs = append(rs, m.vaultEnd(g, "AgentRM stopped", m.now()))
+		}
+	}
+	m.revokeLater(rs)
+	m.mu.Unlock()
+	done := make(chan struct{})
+	go func() { m.vaultWG.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+	}
+}
+
 // vaultRevokeReq: an agent may revoke its own grants, you any.
 func (m *Manager) vaultRevokeReq(c api.Caller, r api.Req) (any, []Effect, error) {
 	if r.GrantID == "" && !r.All {
@@ -390,6 +442,11 @@ func (m *Manager) vaultSetAccounts(c api.Caller, r api.Req) (any, []Effect, erro
 	for name, old := range m.st.VaultAccounts {
 		if nw := next[name]; nw == nil || !reflect.DeepEqual(old, nw) {
 			changed = append(changed, name)
+			for _, a := range m.st.Approvals {
+				if a.Vault != nil && a.Vault.Account == name && (a.State == "pending" || a.State == "minting") {
+					a.State, a.Error = "failed", "the account was changed or removed; ask again"
+				}
+			}
 			for _, g := range m.st.VaultGrants {
 				if g.Account == name && g.Ended == nil {
 					rs = append(rs, m.vaultEnd(g, "the account was changed or removed", now))

@@ -43,6 +43,8 @@ final class Store: ObservableObject {
     }
 
     init() {
+        // Writing a secret to a helper that already exited must fail the write, not kill the app.
+        signal(SIGPIPE, SIG_IGN)
         loginItemStatus = service.status
         notifications.store = self
         notifications.install()

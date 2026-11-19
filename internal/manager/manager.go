@@ -271,6 +271,7 @@ func (m *Manager) recorder() *trace.Writer { return m.recP.Load() }
 // Close thaws what AgentRM froze, writes the state and marks a clean shutdown.
 func (m *Manager) Close() {
 	m.resumePaused()
+	m.vaultClose()
 	if rec := m.recP.Swap(nil); rec != nil {
 		rec.Close()
 	}

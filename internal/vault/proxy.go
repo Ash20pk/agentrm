@@ -42,7 +42,25 @@ func NewProxy(lookup Lookup) http.Handler {
 			proxyError(w, http.StatusForbidden, "AgentRM vault: this grant is read-only (GET); ask for --scope full to "+r.Method)
 			return
 		}
-		r.Header.Del(header)
+		if base := strings.TrimRight(route.Upstream.Path, "/"); base != "" && r.URL.Path != base && !strings.HasPrefix(r.URL.Path, base+"/") {
+			proxyError(w, http.StatusForbidden, "AgentRM vault: this grant is for "+route.Upstream.String()+" only")
+			return
+		}
+		// Every header carrying the token goes, so it never reaches the API.
+		for name, vals := range r.Header {
+			for _, v := range vals {
+				if strings.Contains(v, ProxyTokenPrefix) || name == header {
+					r.Header.Del(name)
+					break
+				}
+				if b, ok := strings.CutPrefix(v, "Basic "); ok {
+					if raw, err := base64.StdEncoding.DecodeString(b); err == nil && strings.Contains(string(raw), ProxyTokenPrefix) {
+						r.Header.Del(name)
+						break
+					}
+				}
+			}
+		}
 		rp := &httputil.ReverseProxy{
 			Rewrite: func(pr *httputil.ProxyRequest) {
 				pr.Out.URL.Scheme, pr.Out.URL.Host = route.Upstream.Scheme, route.Upstream.Host

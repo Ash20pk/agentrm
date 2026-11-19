@@ -259,11 +259,18 @@ func TestProxyPutsTheKeyOn(t *testing.T) {
 	if code := do("GET", "", ""); code != 401 {
 		t.Fatalf("no token got %d", code)
 	}
+	// Two copies of the token: neither reaches the API.
+	req, _ := http.NewRequest("GET", p.URL+"/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("X-Api-Key", tok)
+	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != 200 || gotXAPI != "" {
+		t.Fatalf("second copy: %v %q", err, gotXAPI)
+	}
 	readOnly = true
 	if code := do("POST", "Authorization", "Bearer "+tok); code != 403 {
 		t.Fatalf("a read-only grant could POST: %d", code)
 	}
-	if uses != 4 {
+	if uses != 5 {
 		t.Fatalf("uses %d", uses)
 	}
 }
@@ -291,5 +298,29 @@ func TestCheckAccount(t *testing.T) {
 	c, err := Mint(context.Background(), good, Material{"key": "sk"}, model.VaultAsk{}, Opts{ProxyBase: "http://127.0.0.1:9"})
 	if err != nil || c.Env["OPENAI_BASE_URL"] != "http://127.0.0.1:9/v1" || !strings.HasPrefix(c.Env["OPENAI_API_KEY"], ProxyTokenPrefix) || c.ProxyKey != "sk" {
 		t.Fatalf("%v %+v", err, c)
+	}
+}
+
+// A grant for an API under a path reaches only that path.
+func TestProxyStaysUnderTheBasePath(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer up.Close()
+	u, _ := url.Parse(up.URL + "/v1")
+	tok := NewProxyToken()
+	p := httptest.NewServer(NewProxy(func(string) (Route, string, bool) {
+		return Route{Upstream: u, Key: "k"}, "", true
+	}))
+	defer p.Close()
+	for path, want := range map[string]int{"/v1/models": 200, "/v1": 200, "/admin/keys": 403, "/v10/x": 403} {
+		req, _ := http.NewRequest("GET", p.URL+path, nil)
+		req.Header.Set("Authorization", "Bearer "+tok)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != want {
+			t.Errorf("%s: %d, want %d", path, resp.StatusCode, want)
+		}
 	}
 }

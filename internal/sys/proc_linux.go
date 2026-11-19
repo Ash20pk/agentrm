@@ -145,6 +145,7 @@ func ReadProcInfo(pid int) (ProcInfo, bool) {
 			info.addEnv(k, v)
 		}
 	}
+	info.finish()
 	return info, true
 }
 
