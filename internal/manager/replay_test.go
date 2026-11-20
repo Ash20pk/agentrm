@@ -20,7 +20,8 @@ func recordScenario(t *testing.T, usedAt time.Duration) string {
 	dir := t.TempDir()
 	m, c := newTest(t, 8)
 	fakeEffects(t, nil)
-	m.recP.Store(trace.NewWriter(dir, 3))
+	// Kept for good: the writer prunes by the wall clock, and this clock is fixed in the past.
+	m.recP.Store(trace.NewWriter(dir, 36500))
 	t0 := c.Now()
 	fakeInfos(m, map[int]sys.ProcInfo{700: {Agent: "claude", Session: "s", AgentPID: 500, Argv: []string{"node", "server.js"}}})
 	agentUp := func() map[int]*sys.Proc {
