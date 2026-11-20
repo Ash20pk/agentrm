@@ -31,6 +31,17 @@ func vaultTest(t *testing.T, accts ...model.VaultAccount) (*Manager, *clock) {
 	return m, c
 }
 
+// vaultAgent is an agent caller with a process of its own: one per session name here.
+func vaultAgent(s string) api.Caller {
+	c := agent(s)
+	c.AgentPID = 1000
+	for _, r := range s {
+		c.AgentPID = c.AgentPID*31 + int(r)%1000
+	}
+	c.AgentPID = 1000 + c.AgentPID%100000
+	return c
+}
+
 var loginAcct = model.VaultAccount{Name: "staging-admin", Kind: model.VaultPassword, Username: "ash", MaxMinutes: 60}
 
 // ask makes a vault request and returns the approval it is waiting on, or the grant.
@@ -52,13 +63,22 @@ func ask(t *testing.T, m *Manager, c api.Caller, r api.Req) (*model.Approval, *a
 
 func answer(t *testing.T, m *Manager, a *model.Approval, approve bool, material map[string]string) error {
 	t.Helper()
-	_, err := m.vaultAnswer(context.Background(), appFacts, api.Req{ApprovalID: a.ID, Approve: &approve, Material: material})
+	// The app sends the account as saved in its Keychain: here, the daemon's own copy.
+	var saved []model.VaultAccount
+	if a.Vault != nil {
+		m.mu.Lock()
+		if p := m.vaultAccount(a.Vault.Account); p != nil {
+			saved = []model.VaultAccount{*p}
+		}
+		m.mu.Unlock()
+	}
+	_, err := m.vaultAnswer(context.Background(), appFacts, api.Req{ApprovalID: a.ID, Approve: &approve, Material: material, VaultAccounts: saved})
 	return err
 }
 
 func TestVaultAskApproveReuse(t *testing.T) {
 	m, c := vaultTest(t, loginAcct)
-	s1 := agent("s1")
+	s1 := vaultAgent("s1")
 	a, _ := ask(t, m, s1, api.Req{Account: "staging-admin"})
 	if a == nil || a.Vault == nil || a.State != "pending" || !strings.Contains(a.What, "the login") {
 		t.Fatalf("no approval asked: %+v", a)
@@ -89,7 +109,7 @@ func TestVaultAskApproveReuse(t *testing.T) {
 		t.Fatalf("grant record %+v", got.Grant)
 	}
 	// Another session is asked about separately.
-	if other, _ := ask(t, m, agent("s2"), api.Req{Account: "staging-admin"}); other == nil {
+	if other, _ := ask(t, m, vaultAgent("s2"), api.Req{Account: "staging-admin"}); other == nil {
 		t.Fatal("another session got this session's grant")
 	}
 	// Showing the secret is a separate ask.
@@ -110,7 +130,7 @@ func TestVaultAskApproveReuse(t *testing.T) {
 // Nothing secret reaches the state file, events, approvals or the status.
 func TestVaultSecretNeverStored(t *testing.T) {
 	m, _ := vaultTest(t, loginAcct)
-	a, _ := ask(t, m, agent("s1"), api.Req{Account: "staging-admin"})
+	a, _ := ask(t, m, vaultAgent("s1"), api.Req{Account: "staging-admin"})
 	if err := answer(t, m, a, true, map[string]string{"password": "s3cr3t-value"}); err != nil {
 		t.Fatal(err)
 	}
@@ -127,15 +147,15 @@ func TestVaultSecretNeverStored(t *testing.T) {
 
 func TestVaultDenyQuiet(t *testing.T) {
 	m, c := vaultTest(t, loginAcct)
-	a, _ := ask(t, m, agent("s1"), api.Req{Account: "staging-admin"})
+	a, _ := ask(t, m, vaultAgent("s1"), api.Req{Account: "staging-admin"})
 	if err := answer(t, m, a, false, nil); err != nil || a.State != "denied" {
 		t.Fatalf("%v %s", err, a.State)
 	}
-	if _, _, err := m.vaultRequest(agent("s1"), api.Req{Account: "staging-admin", Purpose: "again"}); err == nil || !strings.Contains(err.Error(), "denied") {
+	if _, _, err := m.vaultRequest(vaultAgent("s1"), api.Req{Account: "staging-admin", Purpose: "again"}); err == nil || !strings.Contains(err.Error(), "denied") {
 		t.Fatalf("asked you again right after a denial: %v", err)
 	}
 	c.t = c.t.Add(10 * time.Minute)
-	if a2, _ := ask(t, m, agent("s1"), api.Req{Account: "staging-admin"}); a2 == nil {
+	if a2, _ := ask(t, m, vaultAgent("s1"), api.Req{Account: "staging-admin"}); a2 == nil {
 		t.Fatal("never allowed to ask again")
 	}
 }
@@ -145,16 +165,16 @@ func TestVaultRefusals(t *testing.T) {
 	if _, _, err := m.vaultRequest(api.Caller{Agent: "detached", Session: "detached"}, api.Req{Account: "staging-admin", Purpose: "x"}); err == nil {
 		t.Fatal("a detached process asked the vault")
 	}
-	if _, _, err := m.vaultRequest(agent("s1"), api.Req{Account: "nope", Purpose: "x"}); err == nil || !strings.Contains(err.Error(), "staging-admin") {
+	if _, _, err := m.vaultRequest(vaultAgent("s1"), api.Req{Account: "nope", Purpose: "x"}); err == nil || !strings.Contains(err.Error(), "staging-admin") {
 		t.Fatalf("unknown account: %v", err)
 	}
-	if _, _, err := m.vaultRequest(agent("s1"), api.Req{Account: "staging-admin"}); err == nil {
+	if _, _, err := m.vaultRequest(vaultAgent("s1"), api.Req{Account: "staging-admin"}); err == nil {
 		t.Fatal("asked without saying why")
 	}
 	if _, _, err := m.vaultSetAccounts(terminal, api.Req{}); err == nil {
 		t.Fatal("accounts changed from a terminal")
 	}
-	if _, _, err := m.vaultSetAccounts(agent("s1"), api.Req{}); err == nil {
+	if _, _, err := m.vaultSetAccounts(vaultAgent("s1"), api.Req{}); err == nil {
 		t.Fatal("accounts changed by an agent")
 	}
 }
@@ -177,10 +197,10 @@ func grantFor(t *testing.T, m *Manager, c api.Caller, r api.Req, material map[st
 
 func TestVaultEndsWithSessionAndRevoke(t *testing.T) {
 	m, c := vaultTest(t, loginAcct)
-	g1 := grantFor(t, m, agent("s1"), api.Req{Account: "staging-admin"}, map[string]string{"password": "p"})
-	g2 := grantFor(t, m, agent("s2"), api.Req{Account: "staging-admin"}, map[string]string{"password": "p"})
+	g1 := grantFor(t, m, vaultAgent("s1"), api.Req{Account: "staging-admin"}, map[string]string{"password": "p"})
+	g2 := grantFor(t, m, vaultAgent("s2"), api.Req{Account: "staging-admin"}, map[string]string{"password": "p"})
 	// An agent cannot revoke another session's grant; you can.
-	if _, _, err := m.vaultRevokeReq(agent("s2"), api.Req{GrantID: g1.Grant.ID}); err == nil {
+	if _, _, err := m.vaultRevokeReq(vaultAgent("s2"), api.Req{GrantID: g1.Grant.ID}); err == nil {
 		t.Fatal("an agent revoked another session's grant")
 	}
 	if _, _, err := m.vaultRevokeReq(terminal, api.Req{GrantID: g2.Grant.ID}); err != nil {
@@ -201,7 +221,7 @@ func TestVaultEndsWithSessionAndRevoke(t *testing.T) {
 
 func TestVaultAccountChangeEndsGrants(t *testing.T) {
 	m, _ := vaultTest(t, loginAcct)
-	g := grantFor(t, m, agent("s1"), api.Req{Account: "staging-admin"}, map[string]string{"password": "p"})
+	g := grantFor(t, m, vaultAgent("s1"), api.Req{Account: "staging-admin"}, map[string]string{"password": "p"})
 	changed := loginAcct
 	changed.Username = "someone-else"
 	if _, _, err := m.vaultSetAccounts(you, api.Req{VaultAccounts: []model.VaultAccount{changed}}); err != nil {
@@ -224,7 +244,7 @@ func TestVaultAPIKeyThroughProxy(t *testing.T) {
 	acct := model.VaultAccount{Name: "openai", Kind: model.VaultAPIKey, APIURL: up.URL + "/v1",
 		KeyEnv: "OPENAI_API_KEY", BaseEnv: "OPENAI_BASE_URL", Scopes: []string{"read", "full"}}
 	m, c := vaultTest(t, acct)
-	g := grantFor(t, m, agent("s1"), api.Req{Account: "openai", Scope: "read"}, map[string]string{"key": "sk-real-key"})
+	g := grantFor(t, m, vaultAgent("s1"), api.Req{Account: "openai", Scope: "read"}, map[string]string{"key": "sk-real-key"})
 	tok, base := g.Env["OPENAI_API_KEY"], g.Env["OPENAI_BASE_URL"]
 	if strings.Contains(tok, "sk-real") || !strings.HasSuffix(base, "/v1") {
 		t.Fatalf("env %v", g.Env)
@@ -277,18 +297,18 @@ func TestVaultGitHubRevokedOnEnd(t *testing.T) {
 	defer gh.Close()
 	acct := model.VaultAccount{Name: "gh", Kind: model.VaultGitHub, AppID: "1", InstallationID: "2", APIURL: gh.URL}
 	m, _ := vaultTest(t, acct)
-	g := grantFor(t, m, agent("s1"), api.Req{Account: "gh", Scope: "contents:write", Repos: []string{"agentrm"}}, map[string]string{"private_key": pemKey})
+	g := grantFor(t, m, vaultAgent("s1"), api.Req{Account: "gh", Scope: "contents:write", Repos: []string{"agentrm"}}, map[string]string{"private_key": pemKey})
 	if g.Env["GH_TOKEN"] != "ghs_live" {
 		t.Fatalf("env %v", g.Env)
 	}
 	// A narrower ask from the same session is covered; a wider one asks you.
-	if _, again := ask(t, m, agent("s1"), api.Req{Account: "gh", Scope: "contents:read", Repos: []string{"agentrm"}}); again == nil {
+	if _, again := ask(t, m, vaultAgent("s1"), api.Req{Account: "gh", Scope: "contents:read", Repos: []string{"agentrm"}}); again == nil {
 		t.Fatal("a narrower ask was not covered")
 	}
-	if wider, _ := ask(t, m, agent("s1"), api.Req{Account: "gh", Scope: "contents:write,pull_requests:write", Repos: []string{"agentrm"}}); wider == nil {
+	if wider, _ := ask(t, m, vaultAgent("s1"), api.Req{Account: "gh", Scope: "contents:write,pull_requests:write", Repos: []string{"agentrm"}}); wider == nil {
 		t.Fatal("a wider ask was covered")
 	}
-	if _, _, err := m.vaultRevokeReq(agent("s1"), api.Req{GrantID: g.Grant.ID}); err != nil {
+	if _, _, err := m.vaultRevokeReq(vaultAgent("s1"), api.Req{GrantID: g.Grant.ID}); err != nil {
 		t.Fatal(err)
 	}
 	m.vaultWG.Wait()
@@ -308,12 +328,12 @@ func TestVaultMintFailureIsReported(t *testing.T) {
 	key, _ := rsa.GenerateKey(rand.Reader, 2048)
 	pemKey := string(pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)}))
 	m, _ := vaultTest(t, model.VaultAccount{Name: "gh", Kind: model.VaultGitHub, AppID: "1", InstallationID: "2", APIURL: gh.URL})
-	a, _ := ask(t, m, agent("s1"), api.Req{Account: "gh", Repos: []string{"nope"}})
+	a, _ := ask(t, m, vaultAgent("s1"), api.Req{Account: "gh", Repos: []string{"nope"}})
 	err := answer(t, m, a, true, map[string]string{"private_key": pemKey})
 	if err == nil || !strings.Contains(err.Error(), "does not exist") || a.State != "failed" {
 		t.Fatalf("%v, state %s", err, a.State)
 	}
-	st, _, _ := m.approvalStatus(agent("s1"), api.Req{ApprovalID: a.ID})
+	st, _, _ := m.approvalStatus(vaultAgent("s1"), api.Req{ApprovalID: a.ID})
 	if st.(*api.ApprovalResp).Error == "" {
 		t.Fatal("the waiting agent is not told why")
 	}
@@ -323,7 +343,7 @@ func TestVaultMintFailureIsReported(t *testing.T) {
 func TestVaultAnnouncedOnce(t *testing.T) {
 	m, _ := vaultTest(t, loginAcct)
 	inbox := func(s string) []string {
-		out, _, _ := m.inbox(agent(s), api.Req{})
+		out, _, _ := m.inbox(vaultAgent(s), api.Req{})
 		return out.(*api.InboxResp).Questions
 	}
 	if q := inbox("s1"); len(q) != 1 || !strings.Contains(q[0], "staging-admin (password)") {
@@ -344,7 +364,7 @@ func TestVaultAnnouncedOnce(t *testing.T) {
 func TestVaultNarrowedAccountFailsPending(t *testing.T) {
 	acct := model.VaultAccount{Name: "aws", Kind: model.VaultAWS, Scopes: []string{"arn:aws:iam::1:role/admin", "arn:aws:iam::1:role/read"}}
 	m, _ := vaultTest(t, acct)
-	a, _ := ask(t, m, agent("s1"), api.Req{Account: "aws", Scope: "admin"})
+	a, _ := ask(t, m, vaultAgent("s1"), api.Req{Account: "aws", Scope: "admin"})
 	acct.Scopes = []string{"arn:aws:iam::1:role/read"}
 	if _, _, err := m.vaultSetAccounts(you, api.Req{VaultAccounts: []model.VaultAccount{acct}}); err != nil {
 		t.Fatal(err)
@@ -365,19 +385,19 @@ func TestVaultNarrowedAccountFailsPending(t *testing.T) {
 func TestVaultAskingLimits(t *testing.T) {
 	gh := model.VaultAccount{Name: "gh", Kind: model.VaultGitHub, AppID: "1", InstallationID: "2"}
 	m, _ := vaultTest(t, loginAcct, gh)
-	a, _ := ask(t, m, agent("s1"), api.Req{Account: "gh", Scope: "contents:read"})
+	a, _ := ask(t, m, vaultAgent("s1"), api.Req{Account: "gh", Scope: "contents:read"})
 	_ = answer(t, m, a, false, nil)
-	if _, _, err := m.vaultRequest(agent("s1"), api.Req{Account: "gh", Scope: "issues:read", Purpose: "x"}); err == nil {
+	if _, _, err := m.vaultRequest(vaultAgent("s1"), api.Req{Account: "gh", Scope: "issues:read", Purpose: "x"}); err == nil {
 		t.Fatal("asked again for a denied account in another form")
 	}
 	for i, scope := range []string{"contents:read", "issues:read", "pull_requests:read"} {
-		_, _, err := m.vaultRequest(agent("s2"), api.Req{Account: "gh", Scope: scope, Purpose: "x"})
+		_, _, err := m.vaultRequest(vaultAgent("s2"), api.Req{Account: "gh", Scope: scope, Purpose: "x"})
 		var ea *errApproval
 		if !errors.As(err, &ea) {
 			t.Fatalf("request %d: %v", i, err)
 		}
 	}
-	if _, _, err := m.vaultRequest(agent("s2"), api.Req{Account: "staging-admin", Purpose: "x"}); err == nil || !strings.Contains(err.Error(), "waiting") {
+	if _, _, err := m.vaultRequest(vaultAgent("s2"), api.Req{Account: "staging-admin", Purpose: "x"}); err == nil || !strings.Contains(err.Error(), "waiting") {
 		t.Fatalf("a fourth open request: %v", err)
 	}
 }
@@ -396,7 +416,7 @@ func TestVaultYouAskedEveryTime(t *testing.T) {
 
 func TestVaultRestartEndsGrants(t *testing.T) {
 	m, c := vaultTest(t, loginAcct)
-	g := grantFor(t, m, agent("s1"), api.Req{Account: "staging-admin"}, map[string]string{"password": "p"})
+	g := grantFor(t, m, vaultAgent("s1"), api.Req{Account: "staging-admin"}, map[string]string{"password": "p"})
 	m.vaultRestarted(c.Now())
 	if m.vaultGrant(g.Grant.ID).Ended == nil {
 		t.Fatal("a grant survived a restart in the record")
@@ -419,7 +439,7 @@ func TestVaultRevokeCutsAStream(t *testing.T) {
 	defer up.Close()
 	acct := model.VaultAccount{Name: "openai", Kind: model.VaultAPIKey, APIURL: up.URL + "/v1"}
 	m, _ := vaultTest(t, acct)
-	g := grantFor(t, m, agent("s1"), api.Req{Account: "openai"}, map[string]string{"key": "sk-real-key"})
+	g := grantFor(t, m, vaultAgent("s1"), api.Req{Account: "openai"}, map[string]string{"key": "sk-real-key"})
 	req, _ := http.NewRequest("GET", g.Env["AGENTRM_API_BASE"]+"/stream", nil)
 	req.Header.Set("Authorization", "Bearer "+g.Env["AGENTRM_API_KEY"])
 	resp, err := http.DefaultClient.Do(req)
@@ -448,5 +468,95 @@ func TestVaultRevokeCutsAStream(t *testing.T) {
 	case <-upstreamDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the request to the API was left open")
+	}
+}
+
+// The daemon's copy of an account lives in state.json, which anything running as you can edit
+// while the daemon is stopped. The secret is used only with the settings saved in the app.
+func TestVaultRefusesAnAccountEditedOutsideTheApp(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer up.Close()
+	saved := model.VaultAccount{Name: "openai", Kind: model.VaultAPIKey, APIURL: "https://api.openai.com/v1"}
+	m, _ := vaultTest(t, saved)
+	m.mu.Lock()
+	m.st.VaultAccounts["openai"].APIURL = up.URL + "/v1" // edited in state.json
+	m.mu.Unlock()
+	a, _ := ask(t, m, vaultAgent("s1"), api.Req{Account: "openai"})
+	yes := true
+	_, err := m.vaultAnswer(context.Background(), appFacts, api.Req{ApprovalID: a.ID, Approve: &yes,
+		Material: map[string]string{"key": "sk-real"}, VaultAccounts: []model.VaultAccount{saved}})
+	if err == nil || a.State != "failed" || !strings.Contains(a.Error, "not the ones saved in the app") {
+		t.Fatalf("an edited account was used: %v, %s %s", err, a.State, a.Error)
+	}
+	// An app that sends no settings is refused too.
+	b, _ := ask(t, m, vaultAgent("s2"), api.Req{Account: "openai"})
+	if _, err := m.vaultAnswer(context.Background(), appFacts, api.Req{ApprovalID: b.ID, Approve: &yes,
+		Material: map[string]string{"key": "sk-real"}}); err == nil {
+		t.Fatal("approved without the app's copy of the account")
+	}
+}
+
+// A grant goes again only to the agent process it was given to. A session's name is the
+// agent's word: another agent taking it (the person's "you", or a session whose agent exited)
+// is asked like anyone else.
+func TestVaultGrantStaysWithItsAgentProcess(t *testing.T) {
+	m, _ := vaultTest(t, loginAcct)
+	first := vaultAgent("s1")
+	grantFor(t, m, first, api.Req{Account: "staging-admin"}, map[string]string{"password": "hunter2"})
+	thief := first
+	thief.AgentPID = 77777
+	if a, g := ask(t, m, thief, api.Req{Account: "staging-admin"}); g != nil || a == nil {
+		t.Fatalf("another agent process under the same session name got the grant: %+v", g)
+	}
+	// Yours: an agent naming itself "you" never gets what you were given.
+	mine, _ := ask(t, m, terminal, api.Req{Account: "staging-admin"})
+	if err := answer(t, m, mine, true, map[string]string{"password": "hunter2"}); err != nil {
+		t.Fatal(err)
+	}
+	imp := api.Caller{Agent: "claude", Session: "you", AgentPID: 4242}
+	if a, g := ask(t, m, imp, api.Req{Account: "staging-admin"}); g != nil || a == nil {
+		t.Fatalf("an agent calling itself you got your grant: %+v", g)
+	}
+}
+
+// A hook cannot rename its agent's session to "you".
+func TestHookCannotClaimYou(t *testing.T) {
+	m, _ := newTest(t, 8)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	req := api.Req{Via: "hook", Agent: "claude", Session: "you"}
+	c := m.resolve(facts{pid: 901, agentPID: 900, agent: "claude"}, &req)
+	if c.Session == "you" || c.Human {
+		t.Fatalf("a hook made its agent the person: %+v", c)
+	}
+}
+
+// A new session name per request gets round neither a denial nor the cap on waiting requests.
+func TestVaultLimitsFollowTheAgentProcess(t *testing.T) {
+	m, _ := vaultTest(t, loginAcct)
+	c := vaultAgent("s1")
+	a, _ := ask(t, m, c, api.Req{Account: "staging-admin"})
+	if err := answer(t, m, a, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	c.Session = "s1-renamed"
+	if _, _, err := m.vaultRequest(c, api.Req{Account: "staging-admin", Purpose: "again"}); err == nil || !strings.Contains(err.Error(), "denied") {
+		t.Fatalf("a renamed session asked again right after a denial: %v", err)
+	}
+}
+
+// /clear starts a new conversation in the same agent process: the old one's grants end.
+func TestVaultGrantsEndWhenTheSessionIsCleared(t *testing.T) {
+	m, _ := vaultTest(t, loginAcct)
+	c := vaultAgent("s1")
+	m.mu.Lock()
+	m.learnSession(c.AgentPID, "s1", "claude")
+	m.mu.Unlock()
+	g := grantFor(t, m, c, api.Req{Account: "staging-admin"}, map[string]string{"password": "hunter2"})
+	m.mu.Lock()
+	m.learnSession(c.AgentPID, "s2", "claude") // /clear
+	m.mu.Unlock()
+	if gr := m.vaultGrant(g.Grant.ID); gr.Ended == nil || !strings.Contains(gr.EndReason, "cleared") {
+		t.Fatalf("the cleared session's grant lives on: %+v", gr)
 	}
 }

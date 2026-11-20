@@ -44,7 +44,9 @@ func ServeLocked(ctx context.Context, m *manager.Manager, lock *store.DaemonLock
 		return err
 	}
 	_ = os.Chmod(sock, 0o600) // only this user can talk to the daemon
-	srv := &http.Server{Handler: Handler(m), ConnContext: sys.WithPeer, ReadHeaderTimeout: 5 * time.Second}
+	// IdleTimeout: a connection kept open between requests is how a process outlives its
+	// identity check (see sys.PeerFrom); none needs to idle for long.
+	srv := &http.Server{Handler: Handler(m), ConnContext: sys.WithPeer, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

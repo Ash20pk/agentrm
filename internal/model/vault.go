@@ -64,7 +64,11 @@ type VaultAsk struct {
 	Reveal  bool   `json:"reveal,omitempty"`
 	Session string `json:"session"`
 	Agent   string `json:"agent"`
-	Repo    string `json:"repo,omitempty"` // the project it asked from
+	// AgentPID is the agent process that asked. A grant is reused only by that same process:
+	// a session's name is the agent's word (its hooks send it), and could be claimed by
+	// another agent once the first is gone.
+	AgentPID int    `json:"agent_pid,omitempty"`
+	Repo     string `json:"repo,omitempty"` // the project it asked from
 	Cwd     string `json:"cwd,omitempty"`
 }
 

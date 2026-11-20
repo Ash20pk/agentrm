@@ -353,6 +353,8 @@ func (m *Manager) handOver(from, to string) {
 		// Handed back to a session that was cleared before (it is the one talking): live again.
 		nw.EndedAt, nw.EndReason = nil, ""
 	}
+	// A cleared conversation's vault grants end with it: the new one asks for its own.
+	m.vaultEndSession(from, "its session was cleared", m.now())
 	if old := m.st.Sessions[from]; old != nil {
 		now := m.now()
 		old.EndedAt, old.EndReason = &now, "cleared: continued as "+short(to)

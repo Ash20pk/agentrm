@@ -9,7 +9,9 @@ package manager
 // logged, traced or put in an event.
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -106,17 +108,19 @@ func (m *Manager) vaultRequest(c api.Caller, r api.Req) (any, []Effect, error) {
 		return nil, nil, fmt.Errorf("no vault account %q; %s", r.Account, m.vaultNames())
 	}
 	ask := model.VaultAsk{Scope: r.Scope, Repos: r.Repos, Minutes: r.TTLMinutes, Purpose: strings.TrimSpace(r.Purpose),
-		Reveal: r.Reveal, Session: c.Session, Agent: c.Agent, Repo: r.Repo, Cwd: r.Cwd}
+		Reveal: r.Reveal, Session: c.Session, Agent: c.Agent, AgentPID: c.AgentPID, Repo: r.Repo, Cwd: r.Cwd}
 	if err := vault.Normalize(acct, &ask); err != nil {
 		return nil, nil, err
 	}
 	now := m.now()
 	// You are not one process: anything that passes for a person (a terminal an agent drives
-	// with AppleScript) would share your grants. So yours are asked for every time.
-	for i := len(m.st.VaultGrants) - 1; i >= 0 && !c.Human; i-- {
+	// with AppleScript) would share your grants. So yours are asked for every time. An agent's
+	// grant goes again only to the agent process it was given to (see VaultAsk.AgentPID); an
+	// agent with no process of its own (inside an app) is asked every time too.
+	for i := len(m.st.VaultGrants) - 1; i >= 0 && !c.Human && c.AgentPID > 0; i-- {
 		g := m.st.VaultGrants[i]
 		live := m.vaultLive[g.ID]
-		if live == nil || !g.Live(now) || !vault.Covers(g, &ask) {
+		if live == nil || !g.Live(now) || g.AgentPID != c.AgentPID || !vault.Covers(g, &ask) {
 			continue
 		}
 		t := now
@@ -125,9 +129,11 @@ func (m *Manager) vaultRequest(c api.Caller, r api.Req) (any, []Effect, error) {
 		m.dirty = true
 		return &api.VaultResp{Grant: g, Env: live.cred.Env, Unset: live.cred.Unset}, nil, nil
 	}
+	// Waiting requests and denials count against the agent process as well as the session: a
+	// session's name is the agent's word, and a fresh one per request would get round both.
 	open := 0
 	for _, a := range m.st.Approvals {
-		if a.Vault == nil || a.Vault.Session != ask.Session {
+		if a.Vault == nil || (a.Vault.Session != ask.Session && (c.AgentPID == 0 || a.Vault.AgentPID != c.AgentPID)) {
 			continue
 		}
 		waiting := (a.State == "pending" && now.Before(a.Expires)) || a.State == "minting"
@@ -266,6 +272,15 @@ func (m *Manager) vaultAnswerCheck(c api.Caller, r api.Req) (a *model.Approval, 
 	}
 	if len(r.Material) == 0 {
 		return a, acct, ask, nil, fmt.Errorf("no secret came with the approval of %s", a.Vault.Account)
+	}
+	// The app sends the account as you saved it (it keeps it in the Keychain, with the secret).
+	// The daemon's copy lives in state.json, which anything running as you can edit while the
+	// daemon is stopped: to send the key to another address, or to widen what may be asked.
+	// The secret is used only with the settings you saved.
+	if len(r.VaultAccounts) != 1 || !sameAccount(&r.VaultAccounts[0], p) {
+		a.State, a.Error = "failed", "the settings of "+p.Name+" in AgentRM's daemon are not the ones saved in the app (its state file may have been edited); nothing was given. Open the Vault tab and save the account again"
+		m.event("TAMPER vault account %s: the daemon's settings differ from the app's; request %s refused", p.Name, a.ID)
+		return a, acct, ask, nil, errors.New(a.Error)
 	}
 	// The account may have been narrowed since the agent asked: the ask must still fit it.
 	ask = *a.Vault
@@ -536,4 +551,11 @@ func (m *Manager) proxyLookup(tok string) (vault.Route, string, bool) {
 	g.LastUsed = &t
 	m.dirty = true
 	return vault.Route{Upstream: u, Header: header, Prefix: prefix, Key: live.cred.ProxyKey, ReadOnly: g.Scope == "read", Ended: live.ended}, "", true
+}
+
+// sameAccount compares two accounts as they would be saved: an empty list and none are the same.
+func sameAccount(a, b *model.VaultAccount) bool {
+	ja, err1 := json.Marshal(a)
+	jb, err2 := json.Marshal(b)
+	return err1 == nil && err2 == nil && bytes.Equal(ja, jb)
 }

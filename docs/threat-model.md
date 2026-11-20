@@ -110,6 +110,14 @@ can reach them:
 - **On approval, only.** The app reads an account's secret after Touch ID (or your password),
   for one request it shows you, and passes it to the daemon on the helper's stdin (never argv,
   which other processes can read). The daemon accepts it only from the app (`ViaApp`, above).
+  The helper sends it only to the daemon: the socket's folder is yours, so anything running as
+  you could move the socket aside and listen in its place; before sending, the helper checks
+  that the process at the other end runs the same executable as itself.
+- **With the settings you saved.** The app keeps each account's settings in its Keychain item,
+  beside the secret, and sends them with the secret. The daemon's copy is in `state.json`,
+  which anything running as you can edit while the daemon is stopped (to send a key to another
+  address, or widen what may be asked); if the two differ, nothing is given, and the Vault tab
+  marks the account until you save it again.
 - **In the daemon's memory, while a grant lasts.** It mints the short-lived credential, keeps
   it, and forgets it when the grant ends. Nothing secret is written to `state.json`, traces,
   events, the log or `agentrm status`; tests check this. A daemon restart ends every grant.
@@ -125,23 +133,34 @@ What approving protects against, and what it does not:
 - An agent cannot approve its own request: answering needs the app, and the app needs Touch ID.
   Editing or adding an account needs Touch ID too, so a driven UI cannot point an API key's
   account at another server and then ask for it.
-- One session's grant is not another's: grants are bound to the session the kernel says is
-  asking (see "Who acts").
-- After a denial the session cannot ask for that account again, in any form, for a few
-  minutes, and no session may have more than three requests open: an agent cannot keep asking
-  until you click the wrong button.
+- One session's grant is not another's: a grant is reused only by the agent process it was
+  given to (the session name is the agent's own word, from its hooks), and no hook may name
+  itself "you". Every request's caller is the process that opened the connection, checked by
+  its PID and its start time, so a connection kept open after its process exits does not pass
+  for whatever process gets that PID next (the app's helper, say).
+- After a denial the agent cannot ask for that account again, in any form, for a few minutes,
+  and no agent may have more than three requests open: an agent cannot keep asking until you
+  click the wrong button. Both count against the agent process, not only the session name.
+- `/clear` ends the old conversation's grants; the new one asks for its own.
 - A request waiting for you is checked again against the account when you approve, and after
   the credential is made: narrowing or removing an account fails what was asked under the old
   limits.
 - Grants to you (a terminal) are never reused: anything that passes for a person would share
   them, so each request from a terminal asks again.
-- Variables `vault run` sets are never kept in AgentRM's restart records, whatever their names.
+- Variables `vault run` and `vault reveal` set are never kept in AgentRM's restart records,
+  whatever their names.
 - Revoking an API key's grant (or its expiry) refuses new requests through the proxy and cuts
   the ones still under way, a streamed answer included.
 - **Approving is trusting the purpose the agent wrote.** The approval shows what it will get and
   where the request comes from; it cannot show what the agent will do with it. Keep each
   account's own limits tight (the GitHub App's permissions, the IAM user's roles): they are the
   ceiling no approval can raise.
+- **Another of your processes can read a `vault run` command's environment** (`ps -E`), and with
+  it the grant's token, while the command runs. Same-user processes are not isolated from each
+  other on macOS; short grants are the limit.
+- **A terminal driven by an agent passes for you.** An agent can open Terminal with AppleScript
+  and ask from there: the request shows as yours. It gets nothing without your approval, but it
+  can fill your three open requests, or cause a denial pause, for a few minutes.
 - **AWS sessions and seen passwords cannot be taken back.** Revoking ends the grant in AgentRM;
   an AWS session works until it expires, and a password until you change it.
 

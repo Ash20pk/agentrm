@@ -64,7 +64,9 @@ func (m *Manager) resolve(f facts, req *api.Req) api.Caller {
 		if req.Via == "hook" && (req.Agent == "" || req.Agent == f.agent) {
 			m.hookSeen[f.agent] = m.now()
 			if real := req.Session; real != "" && m.agentSessions[f.agentPID] != real {
-				if holder := m.sessionHolder(real, f.agentPID, f.procs); holder != 0 {
+				if reservedSession(real) {
+					m.refuseClaim(f, real, 0)
+				} else if holder := m.sessionHolder(real, f.agentPID, f.procs); holder != 0 {
 					m.refuseClaim(f, real, holder)
 				} else {
 					m.learnSession(f.agentPID, real, f.agent)
@@ -135,14 +137,25 @@ func (m *Manager) sessionHolder(id string, pid int, procs map[int]*sys.Proc) int
 	return 0
 }
 
+// reservedSession: names that are never an agent's session. "you" is the person: an agent
+// that took it would be handed what the person was given.
+func reservedSession(id string) bool {
+	return id == "you" || id == "detached"
+}
+
 // refuseClaim reports, once per agent process and session, a hook that named another live
-// agent's session. Must be called with mu held.
+// agent's session (holder), or a reserved one (holder 0). Must be called with mu held.
 func (m *Manager) refuseClaim(f facts, id string, holder int) {
 	key := strconv.Itoa(f.agentPID) + " " + id
 	if m.claimRefused[key] {
 		return
 	}
 	m.claimRefused[key] = true
+	if holder == 0 {
+		m.event("TAMPER a hook under %s (pid %d) named itself session %q, which is reserved: ignored, it keeps its own session.",
+			agentTitle(f.agent), f.agentPID, id)
+		return
+	}
 	m.event("TAMPER a hook under %s (pid %d) named session %s, which belongs to the live agent pid %d: ignored, it keeps its own session.",
 		agentTitle(f.agent), f.agentPID, short(id), holder)
 }
@@ -165,6 +178,13 @@ func (m *Manager) learnSession(pid int, real string, kind ...string) {
 		if m.st.Sessions[real] == nil {
 			s.ID = real
 			m.st.Sessions[real] = s
+		}
+	}
+	// Grants the agent got before its hook named the session: the same process, the same
+	// conversation.
+	for _, g := range m.st.VaultGrants {
+		if g.Session == placeholder && g.AgentPID == pid {
+			g.Session = real
 		}
 	}
 	for _, l := range m.st.Leases {

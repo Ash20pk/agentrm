@@ -58,6 +58,25 @@ enum VaultKeychain {
     static func delete(_ account: String) {
         SecItemDelete(query(account) as CFDictionary)
     }
+
+    /// The account's settings are kept in its item, beside the secret, as you saved them. The
+    /// daemon's copy lives in a file anything running as you can edit; the daemon uses the
+    /// secret only if its copy matches this one.
+    static let settingsKey = "_account"
+
+    /// The item's secret and the settings saved with it.
+    static func readAll(_ account: String) throws -> (material: [String: String], settings: VaultAccount?) {
+        var m = try read(account)
+        let raw = m.removeValue(forKey: settingsKey)
+        let settings = raw.flatMap { try? JSONDecoder().decode(VaultAccount.self, from: Data($0.utf8)) }
+        return (m, settings)
+    }
+
+    static func saveAll(_ account: String, material: [String: String], settings: VaultAccount) throws {
+        var m = material
+        m[settingsKey] = String(decoding: try JSONEncoder().encode(settings), as: UTF8.self)
+        try save(account, m)
+    }
 }
 
 enum VaultAuth {
@@ -85,8 +104,12 @@ extension Store {
                 return
             }
             do {
-                let material = try VaultKeychain.read(ask.account)
-                let body = try JSONEncoder().encode(["material": material])
+                let (material, settings) = try VaultKeychain.readAll(ask.account)
+                guard let settings, settings.name == ask.account, settings.kind == ask.kind else {
+                    throw CLI.Failure(message: "\(ask.account) has no saved settings in the Keychain: open Vault, edit it and save it again.")
+                }
+                struct Answer: Encodable { let material: [String: String]; let account: VaultAccount }
+                let body = try JSONEncoder().encode(Answer(material: material, account: settings))
                 var args = ["vault", "answer", a.id, "--approve"]
                 if let minutes { args += ["--for", String(minutes)] }
                 _ = try await CLI.run(args, timeout: 50, input: body)
@@ -108,17 +131,17 @@ extension Store {
         let renamedFrom = old.flatMap { $0 == acct.name ? nil : $0 }
         // What the Keychain held, to put back if the daemon refuses the account.
         let previous = try? VaultKeychain.read(acct.name)
-        if let material {
-            try VaultKeychain.save(acct.name, material)
-        } else if let from = renamedFrom {
-            try VaultKeychain.save(acct.name, try VaultKeychain.read(from))
-        }
-        var list = vaultAccounts.filter { $0.name != (old ?? acct.name) && $0.name != acct.name }
+        // The secret: the new one, or the one saved (under the old name, if renamed). The
+        // settings are saved with it every time, so that the item always holds the account as
+        // you last saved it.
+        let secret = try material ?? VaultKeychain.readAll(renamedFrom ?? acct.name).material
+        try VaultKeychain.saveAll(acct.name, material: secret, settings: acct)
+        var list = vaultAccounts.filter { $0.name != (old ?? acct.name) && $0.name != acct.name }.map { savedSettings($0.name) ?? $0 }
         list.append(acct)
         do {
             try await syncVaultAccounts(list)
         } catch {
-            if let previous { try? VaultKeychain.save(acct.name, previous) } else if material != nil || renamedFrom != nil { VaultKeychain.delete(acct.name) }
+            if let previous { try? VaultKeychain.save(acct.name, previous) } else { VaultKeychain.delete(acct.name) }
             throw error
         }
         if let from = renamedFrom { VaultKeychain.delete(from) }
@@ -128,7 +151,7 @@ extension Store {
         guard await VaultAuth.confirm("remove the vault account \(name)") else {
             throw CLI.Failure(message: "Not removed: authentication was cancelled.")
         }
-        try await syncVaultAccounts(vaultAccounts.filter { $0.name != name })
+        try await syncVaultAccounts(vaultAccounts.filter { $0.name != name }.map { savedSettings($0.name) ?? $0 })
         VaultKeychain.delete(name)
     }
 
@@ -140,6 +163,16 @@ extension Store {
 
     func revokeGrant(_ g: VaultGrant) { act(["vault", "revoke", g.id]) }
 
+    /// The account as you saved it in the app, from its Keychain item (nil before it was saved
+    /// with its settings). Preferred over the daemon's copy, which lives in an editable file.
+    func savedSettings(_ name: String) -> VaultAccount? { try? VaultKeychain.readAll(name).settings }
+
+    /// Whether the daemon's copy of an account differs from the one saved in the app.
+    func vaultTampered(_ a: VaultAccount) -> Bool {
+        guard let saved = savedSettings(a.name) else { return false }
+        return saved.normalized != a.normalized
+    }
+
     static func agentName(_ agent: String) -> String {
         switch agent {
         case "claude": return "Claude Code"
@@ -147,5 +180,22 @@ extension Store {
         case "you": return "you"
         default: return agent.capitalized
         }
+    }
+}
+
+extension VaultAccount {
+    /// Empty lists, maps and strings as absent, as the daemon writes them.
+    var normalized: VaultAccount {
+        var a = self
+        func n(_ s: String?) -> String? { (s ?? "").isEmpty ? nil : s }
+        a.note = n(a.note); a.app_id = n(a.app_id); a.installation_id = n(a.installation_id); a.api_url = n(a.api_url)
+        a.header = n(a.header); a.prefix = n(a.prefix); a.key_env = n(a.key_env); a.base_env = n(a.base_env)
+        a.region = n(a.region); a.external_id = n(a.external_id); a.username = n(a.username); a.url = n(a.url)
+        a.user_env = n(a.user_env); a.pass_env = n(a.pass_env)
+        if (a.scopes ?? []).isEmpty { a.scopes = nil }
+        if (a.repos ?? []).isEmpty { a.repos = nil }
+        if (a.permissions ?? [:]).isEmpty { a.permissions = nil }
+        if a.max_minutes == 0 { a.max_minutes = nil }
+        return a
     }
 }

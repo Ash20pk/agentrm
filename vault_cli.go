@@ -117,15 +117,19 @@ func runVault(args []string) int {
 		req.ApprovalID, req.Approve, req.TTLMinutes = arg(0), approve, *minutes
 		if *approve {
 			var in struct {
-				Material map[string]string `json:"material"`
+				Material map[string]string  `json:"material"`
+				Account  *model.VaultAccount `json:"account"` // as saved in the app
 			}
 			if err := json.NewDecoder(io.LimitReader(os.Stdin, 1<<20)).Decode(&in); err != nil {
 				return fail(fmt.Errorf("the secret was not readable on stdin: %w", err))
 			}
 			req.Material = in.Material
+			if in.Account != nil {
+				req.VaultAccounts = []model.VaultAccount{*in.Account}
+			}
 		}
 		var r api.ApprovalResp
-		if err := api.CallTimeout(45*time.Second, "/vault/answer", req, &r); err != nil {
+		if err := api.CallDaemon(45*time.Second, "/vault/answer", req, &r); err != nil {
 			return fail(err)
 		}
 		fmt.Println(r.Approval.State)
@@ -138,7 +142,7 @@ func runVault(args []string) int {
 		if req.VaultAccounts == nil {
 			req.VaultAccounts = []model.VaultAccount{}
 		}
-		if err := api.Call("/vault/accounts", req, nil); err != nil {
+		if err := api.CallDaemon(5*time.Second, "/vault/accounts", req, nil); err != nil {
 			return fail(err)
 		}
 	default:
@@ -240,6 +244,11 @@ func printExports(w io.Writer, g *api.VaultResp) {
 	}
 	for _, k := range keys {
 		fmt.Fprintf(w, "export %s='%s'\n", k, strings.ReplaceAll(g.Env[k], "'", `'\''`))
+	}
+	// As vault run does: so that AgentRM never keeps them when it records how to restart a
+	// command started from this shell.
+	if len(keys) > 0 {
+		fmt.Fprintf(w, "export %s=\"${%s:+$%s,}%s\"\n", sys.VaultVarsEnv, sys.VaultVarsEnv, sys.VaultVarsEnv, strings.Join(keys, ","))
 	}
 }
 

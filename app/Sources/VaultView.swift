@@ -36,7 +36,8 @@ struct VaultApprovalCard: View {
         .shadow(color: Lamp.waiting.color.opacity(0.12), radius: 12)
     }
 
-    private var account: VaultAccount? { store.vaultAccounts.first { $0.name == ask.account } }
+    // As saved in the app: the daemon's copy could have been edited.
+    private var account: VaultAccount? { store.savedSettings(ask.account) ?? store.vaultAccounts.first { $0.name == ask.account } }
 
     private func fact(_ k: String, _ v: String) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -72,7 +73,7 @@ enum VaultText {
             let repos = (ask.repos ?? []).isEmpty ? "every repo the app can reach" : (ask.repos ?? []).joined(separator: ", ")
             return "\(ask.scope.replacingOccurrences(of: ",", with: ", ")) on \(repos)"
         case "apikey": return ask.scope == "read" ? "read-only (GET) use of the API, through AgentRM" : "full use of the API, through AgentRM (never the key)"
-        case "aws": return "the role \(ask.scope.split(separator: "/").last.map(String.init) ?? ask.scope)"
+        case "aws": return "the role \(ask.scope)" // the whole ARN: the account is in it
         case "password": return "the login" + (account?.username.map { " as \($0)" } ?? "")
         default: return ask.scope
         }
@@ -167,10 +168,12 @@ struct VaultTab: View {
                             Text(VaultText.summary(a)).font(Face.body(12)).foregroundStyle(Ink.dim).lineLimit(1)
                             if !VaultKeychain.has(a.name) {
                                 Text("No secret saved: edit it to add one").font(Face.body(12)).foregroundStyle(Color(hex: 0xFF8A8D))
+                            } else if store.vaultTampered(a) {
+                                Text("Changed outside the app: requests for it are refused until you edit it and save it again").font(Face.body(12, .semibold)).foregroundStyle(Color(hex: 0xFF8A8D))
                             }
                         }
                         Spacer()
-                        Button("Edit") { editing = VaultEdit(account: a, isNew: false) }.buttonStyle(.key)
+                        Button("Edit") { editing = VaultEdit(account: store.savedSettings(a.name) ?? a, isNew: false) }.buttonStyle(.key)
                         Button("Remove") {
                             Task {
                                 do { try await store.deleteVaultAccount(a.name); error = nil } catch { self.error = error.localizedDescription }
