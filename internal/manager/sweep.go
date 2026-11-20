@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -524,22 +525,50 @@ var dockerClients = map[string]bool{"docker": true, "com.docker.cli": true, "doc
 // watchDocker follows `docker events` and, for each container created, finds the client
 // process that asked for it. This attributes containers started by scripts and Makefiles,
 // which command text cannot.
+//
+// Docker being off (or not installed) is not a failure: there is nothing to watch, and the
+// watcher looks again every few seconds so that it is following again soon after Docker starts.
+// Other failures are reported, and retried less and less often.
 func (m *Manager) watchDocker(ctx context.Context) {
 	backoff := 30 * time.Second
 	for ctx.Err() == nil {
-		err := m.followDocker(ctx)
-		m.mu.Lock()
-		if err != nil {
-			m.dockerEventsErr = err.Error()
+		wait := dockerOffPoll
+		var why string
+		if dockerEngineState() != discover.EngineDown {
+			why = dockerEventsProblem(m.followDocker(ctx), dockerEngineState())
+			if why != "" {
+				wait, backoff = backoff, min(backoff*2, 5*time.Minute)
+			} else {
+				backoff = 30 * time.Second
+			}
 		}
+		m.mu.Lock()
+		m.dockerEventsErr = why
 		m.mu.Unlock()
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(backoff):
+		case <-time.After(wait):
 		}
-		backoff = min(backoff*2, 5*time.Minute)
 	}
+}
+
+// dockerOffPoll is how often the watcher looks for Docker while it is off: a stat of its socket.
+const dockerOffPoll = 10 * time.Second
+
+// dockerEngineState is the Docker engine's state; a variable so that tests can set it.
+var dockerEngineState = func() discover.EngineState {
+	s, _ := discover.DockerEngine()
+	return s
+}
+
+// dockerEventsProblem is what to report when `docker events` stopped: nothing when Docker is
+// off or not installed, since then there are no events to miss.
+func dockerEventsProblem(err error, engine discover.EngineState) string {
+	if err == nil || engine == discover.EngineDown || errors.Is(err, exec.ErrNotFound) {
+		return ""
+	}
+	return err.Error()
 }
 
 func (m *Manager) followDocker(ctx context.Context) error {
