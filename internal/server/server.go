@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"agentrm/internal/api"
@@ -46,7 +47,15 @@ func ServeLocked(ctx context.Context, m *manager.Manager, lock *store.DaemonLock
 	_ = os.Chmod(sock, 0o600) // only this user can talk to the daemon
 	// IdleTimeout: a connection kept open between requests is how a process outlives its
 	// identity check (see sys.PeerFrom); none needs to idle for long.
-	srv := &http.Server{Handler: Handler(m), ConnContext: sys.WithPeer, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
+	fw := newFreezeWatch(ctx)
+	connCtx := func(ctx context.Context, c net.Conn) context.Context {
+		ctx = sys.WithPeer(ctx, c)
+		if fw.justThawed() {
+			ctx = sys.MarkSuspect(ctx)
+		}
+		return ctx
+	}
+	srv := &http.Server{Handler: Handler(m), ConnContext: connCtx, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 30 * time.Second}
 	go func() {
 		<-ctx.Done()
 		sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -100,4 +109,54 @@ func orNone(v string) string {
 		return "none"
 	}
 	return v
+}
+
+// freezeWatch notices the daemon having been frozen (kill -STOP, or the Mac asleep): a beat
+// every half second that comes late. Connections accepted just after are suspect (see
+// sys.PeerSuspect).
+type freezeWatch struct {
+	mu       sync.Mutex
+	last     time.Time // the last beat (monotonic)
+	thawedAt time.Time // when a late beat was last seen
+}
+
+const (
+	freezeBeat  = 500 * time.Millisecond
+	freezeGap   = 2 * time.Second // a beat this late means the process was not running
+	freezeAfter = 2 * time.Second // how long connections stay suspect after
+)
+
+func newFreezeWatch(ctx context.Context) *freezeWatch {
+	fw := &freezeWatch{last: time.Now()}
+	go func() {
+		t := time.NewTicker(freezeBeat)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				fw.beat(time.Now())
+			}
+		}
+	}()
+	return fw
+}
+
+func (fw *freezeWatch) beat(now time.Time) {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if now.Sub(fw.last) > freezeGap {
+		fw.thawedAt = now
+	}
+	fw.last = now
+}
+
+// justThawed: the process was frozen and has just resumed, whether or not the beat has run
+// since (accepting may come first).
+func (fw *freezeWatch) justThawed() bool {
+	now := time.Now()
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	return now.Sub(fw.last) > freezeGap || (!fw.thawedAt.IsZero() && now.Sub(fw.thawedAt) < freezeAfter)
 }

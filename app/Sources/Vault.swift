@@ -108,8 +108,9 @@ extension Store {
                 guard let settings, settings.name == ask.account, settings.kind == ask.kind else {
                     throw CLI.Failure(message: "\(ask.account) has no saved settings in the Keychain: open Vault, edit it and save it again.")
                 }
-                struct Answer: Encodable { let material: [String: String]; let account: VaultAccount }
-                let body = try JSONEncoder().encode(Answer(material: material, account: settings))
+                // The request as shown to you: the daemon gives nothing unless it holds this one.
+                struct Answer: Encodable { let material: [String: String]; let account: VaultAccount; let shown: VaultAsk }
+                let body = try JSONEncoder().encode(Answer(material: material, account: settings, shown: ask))
                 var args = ["vault", "answer", a.id, "--approve"]
                 if let minutes { args += ["--for", String(minutes)] }
                 _ = try await CLI.run(args, timeout: 50, input: body)

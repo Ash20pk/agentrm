@@ -8,9 +8,28 @@ import (
 type peerKey struct{}
 
 type peer struct {
-	pid   int
-	start uint64
-	ok    bool
+	pid     int
+	start   uint64
+	ok      bool
+	suspect bool
+}
+
+// MarkSuspect marks the connection's peer as one that may not be what its PID says (see
+// PeerSuspect).
+func MarkSuspect(ctx context.Context) context.Context {
+	p, _ := ctx.Value(peerKey{}).(peer)
+	p.suspect = true
+	return context.WithValue(ctx, peerKey{}, p)
+}
+
+// PeerSuspect: the connection was accepted just after the server had been frozen. A
+// connection waits in the listen queue while the server is stopped (kill -STOP), and the PID
+// it was made from can be given to another process before it is accepted; the start time
+// read at accept is then that other process's. Such a peer is who its PID says for being
+// told things, but not for acting as the AgentRM app.
+func PeerSuspect(ctx context.Context) bool {
+	p, _ := ctx.Value(peerKey{}).(peer)
+	return p.suspect
 }
 
 // WithPeer stores the connection's peer process in the request context

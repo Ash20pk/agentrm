@@ -68,6 +68,9 @@ type VaultAsk struct {
 	// a session's name is the agent's word (its hooks send it), and could be claimed by
 	// another agent once the first is gone.
 	AgentPID int    `json:"agent_pid,omitempty"`
+	// AgentStart is when that process started (sys.ProcStartID): a PID alone may since have
+	// been given to another process.
+	AgentStart uint64 `json:"agent_start,omitempty"`
 	Repo     string `json:"repo,omitempty"` // the project it asked from
 	Cwd     string `json:"cwd,omitempty"`
 }

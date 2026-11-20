@@ -25,6 +25,7 @@ import (
 
 	"agentrm/internal/api"
 	"agentrm/internal/model"
+	"agentrm/internal/sys"
 	"agentrm/internal/vault"
 )
 
@@ -53,6 +54,9 @@ type vaultRevoke struct {
 	cred  *vault.Credential
 	grant string
 }
+
+// procStartID names one process with its PID (see sys.ProcStartID); a variable for tests.
+var procStartID = sys.ProcStartID
 
 func (m *Manager) vaultAccount(name string) *model.VaultAccount {
 	return m.st.VaultAccounts[name]
@@ -109,6 +113,9 @@ func (m *Manager) vaultRequest(c api.Caller, r api.Req) (any, []Effect, error) {
 	}
 	ask := model.VaultAsk{Scope: r.Scope, Repos: r.Repos, Minutes: r.TTLMinutes, Purpose: strings.TrimSpace(r.Purpose),
 		Reveal: r.Reveal, Session: c.Session, Agent: c.Agent, AgentPID: c.AgentPID, Repo: r.Repo, Cwd: r.Cwd}
+	if c.AgentPID > 0 {
+		ask.AgentStart, _ = procStartID(c.AgentPID)
+	}
 	if err := vault.Normalize(acct, &ask); err != nil {
 		return nil, nil, err
 	}
@@ -120,7 +127,7 @@ func (m *Manager) vaultRequest(c api.Caller, r api.Req) (any, []Effect, error) {
 	for i := len(m.st.VaultGrants) - 1; i >= 0 && !c.Human && c.AgentPID > 0; i-- {
 		g := m.st.VaultGrants[i]
 		live := m.vaultLive[g.ID]
-		if live == nil || !g.Live(now) || g.AgentPID != c.AgentPID || !vault.Covers(g, &ask) {
+		if live == nil || !g.Live(now) || g.AgentPID != c.AgentPID || g.AgentStart != ask.AgentStart || !vault.Covers(g, &ask) {
 			continue
 		}
 		t := now
@@ -272,6 +279,15 @@ func (m *Manager) vaultAnswerCheck(c api.Caller, r api.Req) (a *model.Approval, 
 	}
 	if len(r.Material) == 0 {
 		return a, acct, ask, nil, fmt.Errorf("no secret came with the approval of %s", a.Vault.Account)
+	}
+	// What you approved is what the app showed you, from the status it read over the socket.
+	// Something listening in the daemon's place could have shown you a smaller request than
+	// this one, and put the daemon back before the app answered: the app sends back what it
+	// showed, and it must be this request, field for field.
+	if r.VaultShown == nil || !sameShown(r.VaultShown, a.Vault) {
+		a.State, a.Error = "failed", "the request you approved is not the one AgentRM holds (what was shown may have been altered); nothing was given. Ask the agent to ask again"
+		m.event("TAMPER vault request %s: the approval was for a request other than the one held; refused", a.ID)
+		return a, acct, ask, nil, errors.New(a.Error)
 	}
 	// The app sends the account as you saved it (it keeps it in the Keychain, with the secret).
 	// The daemon's copy lives in state.json, which anything running as you can edit while the
@@ -558,4 +574,12 @@ func sameAccount(a, b *model.VaultAccount) bool {
 	ja, err1 := json.Marshal(a)
 	jb, err2 := json.Marshal(b)
 	return err1 == nil && err2 == nil && bytes.Equal(ja, jb)
+}
+
+// sameShown compares the request the app showed you with the one held, field by field: every
+// field the approval shows.
+func sameShown(shown, held *model.VaultAsk) bool {
+	return shown.Account == held.Account && shown.Kind == held.Kind && shown.Scope == held.Scope &&
+		slices.Equal(shown.Repos, held.Repos) && shown.Minutes == held.Minutes && shown.Purpose == held.Purpose &&
+		shown.Reveal == held.Reveal && shown.Session == held.Session && shown.Agent == held.Agent && shown.Repo == held.Repo
 }

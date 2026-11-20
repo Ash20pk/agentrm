@@ -24,6 +24,16 @@ var appFacts = facts{pid: 4242, gui: true, viaApp: true, app: "AgentRM.app"}
 
 func vaultTest(t *testing.T, accts ...model.VaultAccount) (*Manager, *clock) {
 	t.Helper()
+	// Test agents' PIDs are made up: give each a start time of its own, never a real process's.
+	starts := map[int]uint64{}
+	old := procStartID
+	procStartID = func(pid int) (uint64, bool) {
+		if starts[pid] == 0 {
+			starts[pid] = uint64(len(starts) + 1)
+		}
+		return starts[pid], true
+	}
+	t.Cleanup(func() { procStartID = old })
 	m, c := newTest(t, 8)
 	if _, _, err := m.vaultSetAccounts(you, api.Req{VaultAccounts: accts}); err != nil {
 		t.Fatal(err)
@@ -72,7 +82,7 @@ func answer(t *testing.T, m *Manager, a *model.Approval, approve bool, material 
 		}
 		m.mu.Unlock()
 	}
-	_, err := m.vaultAnswer(context.Background(), appFacts, api.Req{ApprovalID: a.ID, Approve: &approve, Material: material, VaultAccounts: saved})
+	_, err := m.vaultAnswer(context.Background(), appFacts, api.Req{ApprovalID: a.ID, Approve: &approve, Material: material, VaultAccounts: saved, VaultShown: a.Vault})
 	return err
 }
 
@@ -484,7 +494,7 @@ func TestVaultRefusesAnAccountEditedOutsideTheApp(t *testing.T) {
 	a, _ := ask(t, m, vaultAgent("s1"), api.Req{Account: "openai"})
 	yes := true
 	_, err := m.vaultAnswer(context.Background(), appFacts, api.Req{ApprovalID: a.ID, Approve: &yes,
-		Material: map[string]string{"key": "sk-real"}, VaultAccounts: []model.VaultAccount{saved}})
+		Material: map[string]string{"key": "sk-real"}, VaultAccounts: []model.VaultAccount{saved}, VaultShown: a.Vault})
 	if err == nil || a.State != "failed" || !strings.Contains(a.Error, "not the ones saved in the app") {
 		t.Fatalf("an edited account was used: %v, %s %s", err, a.State, a.Error)
 	}
@@ -558,5 +568,37 @@ func TestVaultGrantsEndWhenTheSessionIsCleared(t *testing.T) {
 	m.mu.Unlock()
 	if gr := m.vaultGrant(g.Grant.ID); gr.Ended == nil || !strings.Contains(gr.EndReason, "cleared") {
 		t.Fatalf("the cleared session's grant lives on: %+v", gr)
+	}
+}
+
+// You approve what the app showed you. If that was not the request the daemon holds (the
+// status came from something in the daemon's place), nothing is given.
+func TestVaultApprovalMustMatchWhatWasShown(t *testing.T) {
+	m, _ := vaultTest(t, loginAcct)
+	a, _ := ask(t, m, vaultAgent("s1"), api.Req{Account: "staging-admin", Purpose: "delete the staging database", TTLMinutes: 60})
+	shown := *a.Vault
+	shown.Purpose, shown.Minutes = "read the README", 5
+	yes := true
+	_, err := m.vaultAnswer(context.Background(), appFacts, api.Req{ApprovalID: a.ID, Approve: &yes,
+		Material: map[string]string{"password": "hunter2"}, VaultAccounts: []model.VaultAccount{loginAcct}, VaultShown: &shown})
+	if err == nil || a.State != "failed" {
+		t.Fatalf("approved a request other than the one shown: %v %s", err, a.State)
+	}
+	b, _ := ask(t, m, vaultAgent("s2"), api.Req{Account: "staging-admin"})
+	if _, err := m.vaultAnswer(context.Background(), appFacts, api.Req{ApprovalID: b.ID, Approve: &yes,
+		Material: map[string]string{"password": "hunter2"}, VaultAccounts: []model.VaultAccount{loginAcct}}); err == nil {
+		t.Fatal("approved with nothing to say what was shown")
+	}
+}
+
+// A grant is tied to the agent process, start time included: another process later given the
+// same PID is asked like anyone else.
+func TestVaultGrantNotForAReusedPID(t *testing.T) {
+	m, _ := vaultTest(t, loginAcct)
+	c := vaultAgent("s1")
+	grantFor(t, m, c, api.Req{Account: "staging-admin"}, map[string]string{"password": "hunter2"})
+	procStartID = func(int) (uint64, bool) { return 999, true } // the PID now names another process
+	if a, g := ask(t, m, c, api.Req{Account: "staging-admin"}); g != nil || a == nil {
+		t.Fatalf("a process given the same PID later got the grant: %+v", g)
 	}
 }

@@ -383,15 +383,18 @@ func (m *Manager) Handle(path string, peerPID int, req api.Req) (any, error) {
 // HandleCtx is Handle for a caller that may go away: ctx ends when its connection does. Only a
 // request that waits (acquire with WaitSeconds) looks at it.
 func (m *Manager) HandleCtx(ctx context.Context, path string, peerPID int, req api.Req) (any, error) {
+	facts := gatherFacts(peerPID)
+	if sys.PeerSuspect(ctx) {
+		facts.viaApp = false // accepted just after the daemon was frozen: see sys.PeerSuspect
+	}
 	if path == "/vault/answer" {
 		// It carries a secret: never traced, and it mints outside the lock.
-		return m.vaultAnswer(ctx, gatherFacts(peerPID), req)
+		return m.vaultAnswer(ctx, facts, req)
 	}
 	h, ok := m.routes()[path]
 	if !ok {
 		return nil, fmt.Errorf("unknown request %s", path)
 	}
-	facts := gatherFacts(peerPID)
 	req.Repo, req.Branch = "", ""
 	if req.Cwd != "" && (path == "/touch" || path == "/acquire" || path == "/renew" || path == "/claim" || path == "/vault/request") {
 		req.Repo, req.Branch = sys.GitHead(req.Cwd) // a file read: outside the lock

@@ -112,7 +112,10 @@ can reach them:
   which other processes can read). The daemon accepts it only from the app (`ViaApp`, above).
   The helper sends it only to the daemon: the socket's folder is yours, so anything running as
   you could move the socket aside and listen in its place; before sending, the helper checks
-  that the process at the other end runs the same executable as itself.
+  that the process at the other end runs the same executable as itself. Such a listener could
+  still have shown you a different request (the app reads what to show over the same socket)
+  and put the daemon back in time for the answer, so the app sends back the request it showed
+  you, and the daemon gives nothing unless it is, field for field, the request it holds.
 - **With the settings you saved.** The app keeps each account's settings in its Keychain item,
   beside the secret, and sends them with the secret. The daemon's copy is in `state.json`,
   which anything running as you can edit while the daemon is stopped (to send a key to another
@@ -137,7 +140,9 @@ What approving protects against, and what it does not:
   given to (the session name is the agent's own word, from its hooks), and no hook may name
   itself "you". Every request's caller is the process that opened the connection, checked by
   its PID and its start time, so a connection kept open after its process exits does not pass
-  for whatever process gets that PID next (the app's helper, say).
+  for whatever process gets that PID next (the app's helper, say). Connections accepted just
+  after the daemon was frozen (`kill -STOP`, which lets connections queue while the PID they
+  came from is reused) never count as the app. A grant is tied to its agent's start time too.
 - After a denial the agent cannot ask for that account again, in any form, for a few minutes,
   and no agent may have more than three requests open: an agent cannot keep asking until you
   click the wrong button. Both count against the agent process, not only the session name.
@@ -158,6 +163,13 @@ What approving protects against, and what it does not:
 - **Another of your processes can read a `vault run` command's environment** (`ps -E`), and with
   it the grant's token, while the command runs. Same-user processes are not isolated from each
   other on macOS; short grants are the limit.
+- **An agent can start agents.** Each child (`claude -p ...`) is a new process with its own
+  session, so it has its own three open requests and no denial pause: a determined agent can
+  keep asking, more slowly. Every request still needs your approval.
+- **Debug builds can be read with a debugger.** Xcode signs a Debug app so that a debugger may
+  attach (`get-task-allow`); an agent could attach to it and read the vault's Keychain items as
+  the app. Use release builds for real accounts, and never install a Debug build in
+  /Applications.
 - **A terminal driven by an agent passes for you.** An agent can open Terminal with AppleScript
   and ask from there: the request shows as yours. It gets nothing without your approval, but it
   can fill your three open requests, or cause a denial pause, for a few minutes.

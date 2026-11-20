@@ -88,6 +88,9 @@ type Req struct {
 	GrantID       string               `json:"grant_id,omitempty"`
 	Material      map[string]string    `json:"material,omitempty"`
 	VaultAccounts []model.VaultAccount `json:"vault_accounts,omitempty"`
+	// VaultShown is the request as the app showed it to you when you approved: the daemon
+	// gives nothing unless it is the request it holds.
+	VaultShown *model.VaultAsk `json:"vault_shown,omitempty"`
 }
 
 // Caller is who is really on the other end, as established from the peer PID.

@@ -119,11 +119,12 @@ func runVault(args []string) int {
 			var in struct {
 				Material map[string]string  `json:"material"`
 				Account  *model.VaultAccount `json:"account"` // as saved in the app
+				Shown    *model.VaultAsk     `json:"shown"`   // the request as the app showed it
 			}
 			if err := json.NewDecoder(io.LimitReader(os.Stdin, 1<<20)).Decode(&in); err != nil {
 				return fail(fmt.Errorf("the secret was not readable on stdin: %w", err))
 			}
-			req.Material = in.Material
+			req.Material, req.VaultShown = in.Material, in.Shown
 			if in.Account != nil {
 				req.VaultAccounts = []model.VaultAccount{*in.Account}
 			}
