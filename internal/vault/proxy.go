@@ -1,6 +1,7 @@
 package vault
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"net/http"
@@ -16,6 +17,9 @@ type Route struct {
 	Prefix   string   // before the key in it
 	Key      string
 	ReadOnly bool // GET, HEAD and OPTIONS only
+	// Ended is closed when the grant ends; a request still being served (a long stream) is cut
+	// then, not left to finish. nil: never.
+	Ended <-chan struct{}
 }
 
 // Lookup finds the live grant a proxy token belongs to, and counts the use. ok is false for a
@@ -67,6 +71,18 @@ func NewProxy(lookup Lookup) http.Handler {
 				}
 			}
 		}
+		if route.Ended != nil {
+			ctx, cancel := context.WithCancel(r.Context())
+			defer cancel()
+			go func() {
+				select {
+				case <-route.Ended:
+					cancel()
+				case <-ctx.Done():
+				}
+			}()
+			r = r.WithContext(ctx)
+		}
 		rp := &httputil.ReverseProxy{
 			Rewrite: func(pr *httputil.ProxyRequest) {
 				pr.Out.URL.Scheme, pr.Out.URL.Host = route.Upstream.Scheme, route.Upstream.Host
@@ -76,6 +92,12 @@ func NewProxy(lookup Lookup) http.Handler {
 			},
 			FlushInterval: -1, // streamed answers (server-sent events) pass at once
 			ErrorHandler: func(w http.ResponseWriter, _ *http.Request, err error) {
+				select {
+				case <-route.Ended:
+					proxyError(w, http.StatusUnauthorized, "AgentRM vault: the grant ended while this request was waiting for the API")
+					return
+				default:
+				}
 				proxyError(w, http.StatusBadGateway, "AgentRM vault: the API did not answer: "+err.Error())
 			},
 		}

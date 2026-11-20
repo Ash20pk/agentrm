@@ -136,8 +136,8 @@ What approving protects against, and what it does not:
 - Grants to you (a terminal) are never reused: anything that passes for a person would share
   them, so each request from a terminal asks again.
 - Variables `vault run` sets are never kept in AgentRM's restart records, whatever their names.
-- Revoking an API key's grant refuses new requests through the proxy at once; a request already
-  streaming finishes.
+- Revoking an API key's grant (or its expiry) refuses new requests through the proxy and cuts
+  the ones still under way, a streamed answer included.
 - **Approving is trusting the purpose the agent wrote.** The approval shows what it will get and
   where the request comes from; it cannot show what the agent will do with it. Keep each
   account's own limits tight (the GitHub App's permissions, the IAM user's roles): they are the

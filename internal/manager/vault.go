@@ -42,6 +42,8 @@ const (
 type vaultLive struct {
 	cred *vault.Credential
 	acct model.VaultAccount
+	// ended is closed when the grant ends: the proxy cuts the requests it is still serving.
+	ended chan struct{}
 }
 
 type vaultRevoke struct {
@@ -218,7 +220,7 @@ func (m *Manager) vaultAnswer(ctx context.Context, f facts, r api.Req) (any, err
 	if m.vaultLive == nil {
 		m.vaultLive, m.vaultTok = map[string]*vaultLive{}, map[string]string{}
 	}
-	m.vaultLive[g.ID] = &vaultLive{cred: cred, acct: acct}
+	m.vaultLive[g.ID] = &vaultLive{cred: cred, acct: acct, ended: make(chan struct{})}
 	if cred.ProxyToken != "" {
 		m.vaultTok[cred.ProxyToken] = g.ID
 	}
@@ -295,6 +297,7 @@ func (m *Manager) vaultEnd(g *model.VaultGrant, why string, now time.Time) *vaul
 	if live == nil {
 		return nil
 	}
+	close(live.ended)
 	if live.cred.ProxyToken != "" {
 		delete(m.vaultTok, live.cred.ProxyToken)
 	}
@@ -532,5 +535,5 @@ func (m *Manager) proxyLookup(tok string) (vault.Route, string, bool) {
 	g.Uses++
 	g.LastUsed = &t
 	m.dirty = true
-	return vault.Route{Upstream: u, Header: header, Prefix: prefix, Key: live.cred.ProxyKey, ReadOnly: g.Scope == "read"}, "", true
+	return vault.Route{Upstream: u, Header: header, Prefix: prefix, Key: live.cred.ProxyKey, ReadOnly: g.Scope == "read", Ended: live.ended}, "", true
 }

@@ -402,3 +402,51 @@ func TestVaultRestartEndsGrants(t *testing.T) {
 		t.Fatal("a grant survived a restart in the record")
 	}
 }
+
+// A stream already flowing through the proxy is cut when its grant ends, not left to finish.
+func TestVaultRevokeCutsAStream(t *testing.T) {
+	upstreamDone := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(upstreamDone)
+		_, _ = io.WriteString(w, "data: first\n\n")
+		w.(http.Flusher).Flush()
+		select { // a long answer: it would go on for minutes
+		case <-r.Context().Done():
+		case <-time.After(30 * time.Second):
+			_, _ = io.WriteString(w, "data: after-revoke\n\n")
+		}
+	}))
+	defer up.Close()
+	acct := model.VaultAccount{Name: "openai", Kind: model.VaultAPIKey, APIURL: up.URL + "/v1"}
+	m, _ := vaultTest(t, acct)
+	g := grantFor(t, m, agent("s1"), api.Req{Account: "openai"}, map[string]string{"key": "sk-real-key"})
+	req, _ := http.NewRequest("GET", g.Env["AGENTRM_API_BASE"]+"/stream", nil)
+	req.Header.Set("Authorization", "Bearer "+g.Env["AGENTRM_API_KEY"])
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	first := make([]byte, len("data: first\n\n"))
+	if _, err := io.ReadFull(resp.Body, first); err != nil {
+		t.Fatalf("first event: %v", err)
+	}
+	m.mu.Lock()
+	m.revokeLater([]*vaultRevoke{m.vaultEnd(m.vaultGrant(g.Grant.ID), "revoked", m.now())})
+	m.mu.Unlock()
+	rest := make(chan []byte, 1)
+	go func() { b, _ := io.ReadAll(resp.Body); rest <- b }()
+	select {
+	case b := <-rest:
+		if strings.Contains(string(b), "after-revoke") {
+			t.Fatalf("the stream went on after the revoke: %q", b)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream was not cut when the grant was revoked")
+	}
+	select {
+	case <-upstreamDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request to the API was left open")
+	}
+}
