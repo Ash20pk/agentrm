@@ -311,7 +311,9 @@ func TestProxyStaysUnderTheBasePath(t *testing.T) {
 		return Route{Upstream: u, Key: "k"}, "", true
 	}))
 	defer p.Close()
-	for path, want := range map[string]int{"/v1/models": 200, "/v1": 200, "/admin/keys": 403, "/v10/x": 403} {
+	for path, want := range map[string]int{"/v1/models": 200, "/v1": 200, "/admin/keys": 403, "/v10/x": 403,
+		// The API would resolve these to /admin/keys.
+		"/v1/../admin/keys": 400, "/v1/%2e%2e/admin/keys": 400, "/v1/x/../../admin": 400, "/v1/..%5cadmin": 400, "/v1/./models": 400} {
 		req, _ := http.NewRequest("GET", p.URL+path, nil)
 		req.Header.Set("Authorization", "Bearer "+tok)
 		resp, err := http.DefaultClient.Do(req)

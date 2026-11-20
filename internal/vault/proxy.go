@@ -42,6 +42,12 @@ func NewProxy(lookup Lookup) http.Handler {
 			proxyError(w, http.StatusForbidden, "AgentRM vault: this grant is read-only (GET); ask for --scope full to "+r.Method)
 			return
 		}
+		// "." and ".." are refused, not resolved: the API would resolve them, and /v1/../admin
+		// is /admin there. Backslashes too, which some servers take for slashes.
+		if dotted(r.URL.Path) {
+			proxyError(w, http.StatusBadRequest, "AgentRM vault: a path with . or .. segments or backslashes is not forwarded")
+			return
+		}
 		if base := strings.TrimRight(route.Upstream.Path, "/"); base != "" && r.URL.Path != base && !strings.HasPrefix(r.URL.Path, base+"/") {
 			proxyError(w, http.StatusForbidden, "AgentRM vault: this grant is for "+route.Upstream.String()+" only")
 			return
@@ -75,6 +81,19 @@ func NewProxy(lookup Lookup) http.Handler {
 		}
 		rp.ServeHTTP(w, r)
 	})
+}
+
+// dotted reports whether a decoded path has a "." or ".." segment, or a backslash.
+func dotted(p string) bool {
+	if strings.ContainsRune(p, '\\') {
+		return true
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "." || seg == ".." {
+			return true
+		}
+	}
+	return false
 }
 
 // findToken looks for a proxy token in any header: as the whole value, after "Bearer ", or in
