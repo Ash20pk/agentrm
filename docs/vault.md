@@ -23,8 +23,8 @@ its longest).
 
 | Kind | What the agent gets | When it ends |
 |---|---|---|
-| **GitHub App** | A fresh installation token limited to the repos and permissions asked (`GH_TOKEN`, `GITHUB_TOKEN`, and git set up to push with it) | Expiry, revoke or session end: revoked at GitHub at once. GitHub's own limit is one hour |
 | **API key** | A token for AgentRM's local proxy and the proxy's address (`OPENAI_API_KEY`, `OPENAI_BASE_URL`...). The proxy adds the real key to each request. `read` grants only allow GET | At once, everywhere: the proxy stops accepting the token. **The agent never holds the key** |
+| **GitHub App** | A fresh installation token limited to the repos and permissions asked (`GH_TOKEN`, `GITHUB_TOKEN`, and git set up to push with it) | Expiry, revoke or session end: revoked at GitHub at once. GitHub's own limit is one hour |
 | **AWS** | An STS session for one of the account's roles (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`) | At its expiry (15 minutes at least). STS sessions cannot be cut short: a revoked grant still works until then, and the record says so |
 | **Login** | The username and password (`AGENTRM_USERNAME`, `AGENTRM_PASSWORD`, `AGENTRM_URL`) | The grant ends, but a password cannot be taken back once seen. Prefer the other kinds |
 
@@ -42,6 +42,16 @@ prints goes into its transcript, and so to its model provider.
 Open AgentRM → Vault → Add account. Saving asks for Touch ID; secrets go to the Keychain, the
 rest to the daemon. Editing an account ends its live grants.
 
+**Start with an API key.** It is the quickest to set up and the only kind whose secret the
+agent never holds; the app offers it first. With the other kinds the agent holds a credential
+for as long as the grant lasts, and could print or copy it: the app says so when you add one
+and on every approval.
+
+**API key.** Choose OpenAI, Anthropic or OpenRouter to fill in the address and variables, or
+enter your own. The tool the agent runs must let its API address be set by a variable (most
+SDKs and CLIs do: `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`...). Tick read-only for keys agents
+should only query with.
+
 **GitHub App.** Create one at github.com/settings/apps/new (or your organisation's), with no
 webhook, and the most permissions you would ever let an agent have (for example Contents: write,
 Pull requests: write, Metadata: read). Generate a private key, install the app on the repos
@@ -49,11 +59,6 @@ agents may touch, and note the App ID and the installation ID (the number at the
 github.com/settings/installations/<id>). In AgentRM, the repos and permissions you list are the
 most an agent may ask for; each grant is narrower if the agent asks for less (the default is
 `contents:read`).
-
-**API key.** Choose OpenAI, Anthropic or OpenRouter to fill in the address and variables, or
-enter your own. The tool the agent runs must let its API address be set by a variable (most
-SDKs and CLIs do: `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`...). Tick read-only for keys agents
-should only query with.
 
 **AWS.** Keys of an IAM user whose only permission is `sts:AssumeRole` on the roles listed, and
 the role ARNs. Each role's trust policy must allow that user. Agents ask for a role by name.

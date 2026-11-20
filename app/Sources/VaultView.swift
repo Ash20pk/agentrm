@@ -23,8 +23,7 @@ struct VaultApprovalCard: View {
             if ask.reveal == true {
                 warn("It asked to SEE the secret, not only use it: what it is shown goes into its transcript.")
             }
-            if ask.kind == "password" { warn("A password cannot be taken back once used.") }
-            if ask.kind == "aws" { warn("An AWS session cannot be cut short: it lasts until it expires.") }
+            if ask.kind != "apikey" { warn(VaultText.protection(ask.kind)) }
             HStack(spacing: 8) {
                 Spacer()
                 Button("Deny") { store.answer(approval.id, approve: false) }.buttonStyle(.key)
@@ -52,8 +51,20 @@ struct VaultApprovalCard: View {
 }
 
 enum VaultText {
-    static let kinds: [(id: String, name: String)] = [("github", "GitHub App"), ("apikey", "API key"), ("aws", "AWS role"), ("password", "Login")]
+    /// In order of how well they keep the secret from the agent: an API key never reaches it.
+    static let kinds: [(id: String, name: String)] = [("apikey", "API key"), ("github", "GitHub App"), ("aws", "AWS role"), ("password", "Login")]
     static func kindName(_ k: String) -> String { kinds.first { $0.id == k }?.name ?? k }
+
+    /// What the vault can and cannot keep from an agent given this kind of account.
+    static func protection(_ k: String) -> String {
+        switch k {
+        case "apikey": return "The agent never holds the key: AgentRM's proxy adds it. Revoking stops it at once."
+        case "github": return "The agent holds a short-lived token it could print or copy while the grant lasts. Revoking ends it at GitHub."
+        case "aws": return "The agent holds session keys it could print or copy. They work until they expire (15 minutes at least), revoked or not."
+        case "password": return "The agent sees the password and can keep it. Use only logins you could change in a minute."
+        default: return ""
+        }
+    }
 
     static func gives(_ ask: VaultAsk, account: VaultAccount?) -> String {
         switch ask.kind {
@@ -112,6 +123,25 @@ struct VaultTab: View {
         }
     }
 
+    private func add(_ kind: String) { editing = VaultEdit(account: VaultAccountEditor.blank(kind), isNew: true) }
+
+    /// No accounts yet: start with an API key, the kind whose secret the agent never sees and
+    /// the quickest to set up.
+    private var firstRun: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Start with an API key").font(Face.body(15, .semibold))
+            Text("Paste a key (OpenAI, Anthropic, OpenRouter or your own API). Agents get a token for AgentRM's local proxy instead of the key, so they never see it, and revoking stops them at once.")
+                .font(Face.body(13)).foregroundStyle(Ink.dim).fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 8) {
+                Button("Add an API key") { add("apikey") }.buttonStyle(.key(.amber))
+                Spacer()
+            }
+            Text("GitHub Apps, AWS roles and logins work too, under Add account. With those the agent holds the credential while the grant lasts, and could print it.")
+                .font(Face.body(12)).foregroundStyle(Ink.label).fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(14).frame(maxWidth: .infinity, alignment: .leading)
+    }
+
     private var accounts: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -119,16 +149,13 @@ struct VaultTab: View {
                 Spacer()
                 Menu("Add account") {
                     ForEach(VaultText.kinds, id: \.id) { k in
-                        Button(k.name) { editing = VaultEdit(account: VaultAccountEditor.blank(k.id), isNew: true) }
+                        Button(k.id == "apikey" ? "API key (safest)" : k.name) { add(k.id) }
                     }
                 }
                 .menuStyle(.borderlessButton).fixedSize()
             }
             VStack(spacing: 0) {
-                if store.vaultAccounts.isEmpty {
-                    Text("No accounts yet. Add a GitHub App, an API key, AWS keys or a login.")
-                        .font(Face.body(13)).foregroundStyle(Ink.label).padding(14).frame(maxWidth: .infinity, alignment: .leading)
-                }
+                if store.vaultAccounts.isEmpty { firstRun }
                 ForEach(store.vaultAccounts) { a in
                     HStack(spacing: 12) {
                         LampDot(VaultKeychain.has(a.name) ? Lamp.inUse : Lamp.nobody)
