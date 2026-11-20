@@ -28,6 +28,11 @@ its longest).
 | **AWS** | An STS session for one of the account's roles (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`) | At its expiry (15 minutes at least). STS sessions cannot be cut short: a revoked grant still works until then, and the record says so |
 | **Login** | The username and password (`AGENTRM_USERNAME`, `AGENTRM_PASSWORD`, `AGENTRM_URL`) | The grant ends, but a password cannot be taken back once seen. Prefer the other kinds |
 
+Agents that use AgentRM over MCP have `agentrm_vault_list`, `agentrm_vault_request` and
+`agentrm_vault_revoke`. Over MCP an API key's access is handed over as it is to a command (a
+proxy token and base URL, never the key); any other kind is handed over only with `reveal`,
+because a tool's answer goes into the transcript.
+
 `agentrm vault run` puts the access in the command's environment only. `agentrm vault reveal`
 prints it as shell exports: that is a separate approval, marked in red, because what an agent
 prints goes into its transcript, and so to its model provider.
