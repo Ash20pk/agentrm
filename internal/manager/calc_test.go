@@ -143,7 +143,7 @@ func TestAccuracyLedger(t *testing.T) {
 	}
 	// A grant followed by heavy swapping counts against admission.
 	m.grantProbes = append(m.grantProbes, &grantProbe{at: c.Now(), lease: "g"})
-	m.lastSwapouts, m.lastSwapAt = 0, c.Now()
+	m.swapSamples = []swapSample{{c.Now(), 0}}
 	c.Add(time.Minute)
 	m.takeMem(sys.MemStats{AvailableMB: 3300, Swapouts: 2000}, c.Now()) // 2 GB a minute
 	c.Add(grantWatch)

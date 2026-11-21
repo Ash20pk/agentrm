@@ -109,6 +109,14 @@ type Resource struct {
 	// never followed by a stop on the same prediction (see manager/prepare.go).
 	PreparedFor   string     `json:"prepared_for,omitempty"`
 	PreparedUntil *time.Time `json:"prepared_until,omitempty"`
+	// NextStep is what AgentRM will do to it if nothing changes ("pause" or "stop"), at NextAt,
+	// after a wait that began at NextFrom; NextDry: in dry run, it only would. Worked out on each
+	// sweep from the same timing the decision uses, so what the app counts down to is what
+	// happens. Empty: nothing is coming (held, pinned, yours, a VM, an app...).
+	NextStep string     `json:"next_step,omitempty"`
+	NextAt   *time.Time `json:"next_at,omitempty"`
+	NextFrom *time.Time `json:"next_from,omitempty"`
+	NextDry  bool       `json:"next_dry,omitempty"`
 	// Unseen is the time its source last failed to answer (Docker hung): what is shown is the
 	// last view, not the current one, and nothing is paused, stopped or counted on from it.
 	Unseen  *time.Time `json:"unseen,omitempty"`
@@ -153,8 +161,9 @@ type Lease struct {
 	UsedMB float64 `json:"used_mb,omitempty"`
 	// BaseFootprintMB is the session's process-tree memory when the lease was granted.
 	BaseFootprintMB float64 `json:"base_footprint_mb,omitempty"`
-	// DaemonBaseMB is what each Gradle and Kotlin daemon held when a gradle lease was granted. The
-	// build runs inside those daemons, not in a process it starts, so their growth is its use.
+	// DaemonBaseMB is what each Gradle and Kotlin daemon held when a gradle lease was granted, or
+	// Docker's VM when a Docker lease was. The work runs inside those, not in a process the
+	// session starts, so their growth is its use.
 	DaemonBaseMB map[string]float64 `json:"daemon_base_mb,omitempty"`
 	Declared     bool               `json:"declared,omitempty"` // the holder chose MemGB itself
 	HadResources bool               `json:"had_resources,omitempty"`
@@ -285,8 +294,17 @@ type Question struct {
 type Stopped struct {
 	Resource  Resource  `json:"resource"`
 	StoppedAt time.Time `json:"stopped_at"`
-	Why       string    `json:"why"`
-	By        string    `json:"by"` // "agentrm" or the session that asked
+	// FreedMB is what the stop was expected to give back: all a process held, part of what
+	// Docker counted for a container (its return ratio when it was stopped).
+	FreedMB float64 `json:"freed_mb,omitempty"`
+	Why     string  `json:"why"`
+	By      string  `json:"by"` // "agentrm" or the session that asked
+}
+
+// FreedMark is one stop and what it gave back.
+type FreedMark struct {
+	At time.Time `json:"at"`
+	MB float64   `json:"mb"`
 }
 
 // Approval is a privileged request from a terminal waiting for a click in the app.
@@ -358,6 +376,9 @@ type State struct {
 	AgentSessions map[string]string `json:"agent_sessions"`
 	// Stopped is what AgentRM stopped, newest last, kept for restoring (bounded).
 	Stopped []*Stopped `json:"stopped"`
+	// Freed is every stop of the last month and what it gave back: the totals (today, the
+	// week's receipt) are not cut short by Stopped's bound.
+	Freed []FreedMark `json:"freed,omitempty"`
 	// Approvals waiting for the user.
 	Approvals map[string]*Approval `json:"approvals"`
 	// Decisions records each would-pause/would-stop decision for review.

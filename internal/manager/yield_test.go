@@ -76,6 +76,7 @@ func TestNoneReleasesAtOnce(t *testing.T) {
 
 func TestHighCostIsTakenLast(t *testing.T) {
 	m, c, ra, rb := yieldSetup(t)
+	learnFullReturn(m)
 	m.st.Leases[rb.LeaseID].LastUsed = c.Now().Add(-2 * time.Hour) // b is even idler than a
 	acquire(t, m, agent("c"), "cluster", 1.5)
 	m.yield(agent("b"), api.Req{LeaseID: rb.LeaseID, Cost: "high"})

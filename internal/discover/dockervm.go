@@ -51,12 +51,20 @@ func dockerVMProc(procs map[int]*sys.Proc) *sys.Proc {
 			host = p
 		}
 	}
+	return vzGuest(procs, host, nil)
+}
+
+// vzGuest is the Virtualization.framework process that runs the guest a host process started:
+// it runs under launchd, not under the host, so it is paired by start time (within a minute
+// after the host). nil if none; taken ones are skipped.
+func vzGuest(procs map[int]*sys.Proc, host *sys.Proc, taken map[int]bool) *sys.Proc {
 	if host == nil || host.Start.IsZero() {
 		return nil
 	}
+	var best *sys.Proc
 	var bestGap time.Duration
 	for _, p := range procs {
-		if filepath.Base(p.Exe) != "com.apple.Virtualization.VirtualMachine" || p.Start.IsZero() {
+		if filepath.Base(p.Exe) != "com.apple.Virtualization.VirtualMachine" || p.Start.IsZero() || taken[p.PID] {
 			continue
 		}
 		gap := p.Start.Sub(host.Start)
@@ -71,6 +79,22 @@ func dockerVMProc(procs map[int]*sys.Proc) *sys.Proc {
 		}
 	}
 	return best
+}
+
+// vzGuestMB is what the guest of a Lima (vz) or Tart VM holds, by footprint, or 0 if it runs
+// in a child process instead (qemu, counted in the host's subtree). The pairing is noted in
+// taken.
+func vzGuestMB(procs map[int]*sys.Proc, host *sys.Proc, taken map[int]bool) float64 {
+	g := vzGuest(procs, host, taken)
+	if g == nil {
+		return 0
+	}
+	taken[g.PID] = true
+	mb := g.RSSMB
+	if fp, ok := footprintOf(g.PID); ok && fp > mb {
+		mb = fp
+	}
+	return mb
 }
 
 // dockerVM is the resource for Docker Desktop's VM, or nil when it is not running. MemMB is the

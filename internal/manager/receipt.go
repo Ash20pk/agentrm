@@ -100,12 +100,8 @@ func (m *Manager) makeReceipt(since, until time.Time) *api.Receipt {
 			r.Wrong++
 		}
 	}
-	for _, s := range m.st.Stopped {
-		if !s.StoppedAt.Before(since) && !s.StoppedAt.After(until) {
-			r.Stopped++
-			r.FreedGB += s.Resource.MemMB / 1024
-		}
-	}
+	freed, n := m.freedMB(since, until)
+	r.Stopped, r.FreedGB = n, freed/1024
 	var waits []time.Duration
 	for _, e := range m.eventLines(since) {
 		if e.t.After(until) {

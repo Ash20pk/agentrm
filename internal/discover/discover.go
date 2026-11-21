@@ -44,6 +44,7 @@ func Discover(cfg model.Config, procs map[int]*sys.Proc) Result {
 	rs, err := Docker()
 	add(SrcDocker, rs, err)
 	rs, err = Simulators(cfg)
+	measureSimulators(rs, procs)
 	add(SrcSimctl, rs, err)
 	if procs == nil {
 		res.Failed[SrcProcs] = fmt.Errorf("could not read the process table")
@@ -194,11 +195,30 @@ func Simulators(cfg model.Config) ([]*model.Resource, error) {
 			}
 			rt := runtime[strings.LastIndex(runtime, ".")+1:]
 			res = append(res, &model.Resource{ID: "sim:" + d.UDID, Kind: model.RKSimulator, Name: d.Name,
-				Detail: rt, UDID: d.UDID, MemMB: cfg.KindMemGB[model.KSimulator] * 1024,
+				Detail: rt + ", size estimated", UDID: d.UDID, MemMB: cfg.KindMemGB[model.KSimulator] * 1024,
 				Restart: "xcrun simctl boot " + d.UDID})
 		}
 	}
 	return res, nil
+}
+
+// measureSimulators sizes each booted simulator by what its processes hold: its launchd_sim
+// (whose arguments name the device) and everything under it. Until that process is found the
+// configured estimate stands, and says it is one.
+func measureSimulators(rs []*model.Resource, procs map[int]*sys.Proc) {
+	if len(rs) == 0 || procs == nil {
+		return
+	}
+	sub := subtreeMB(procs)
+	for _, r := range rs {
+		for _, p := range procs {
+			if filepath.Base(p.Exe) == "launchd_sim" && r.UDID != "" && strings.Contains(p.Args, r.UDID) {
+				r.MemMB = p.RSSMB + sub[p.PID]
+				r.Detail = strings.TrimSuffix(r.Detail, ", size estimated")
+				break
+			}
+		}
+	}
 }
 
 // ---- Processes ----
@@ -219,6 +239,10 @@ var databases = map[string]string{ // process name -> brew formula prefix
 func Processes(cfg model.Config, procs map[int]*sys.Proc) []*model.Resource {
 	var res []*model.Resource
 	sub := subtreeMB(procs)
+	vzTaken := map[int]bool{} // Virtualization.framework processes already paired with a VM
+	if d := dockerVMProc(procs); d != nil {
+		vzTaken[d.PID] = true
+	}
 	for _, p := range procs {
 		base := filepath.Base(p.Exe)
 		a := p.Args
@@ -229,17 +253,18 @@ func Processes(cfg model.Config, procs map[int]*sys.Proc) []*model.Resource {
 			res = append(res, procRes(p, "gradle", model.RKGradle, "Kotlin daemon", heap(a), p.RSSMB))
 		case strings.HasPrefix(base, "qemu-system") && avdRe.MatchString(a):
 			name := avdRe.FindStringSubmatch(a)[1]
-			res = append(res, procRes(p, "emu", model.RKEmulator, "Android emulator "+name, "AVD "+name, sub[p.PID]))
-		case strings.HasPrefix(base, "qemu-system") && !underApp(procs, p, "Docker.app"):
-			res = append(res, procRes(p, "vm", model.RKVM, "QEMU VM", trunc(a, 90), sub[p.PID]))
+			// qemu itself holds the guest's memory: it and what it started.
+			res = append(res, procRes(p, "emu", model.RKEmulator, "Android emulator "+name, "AVD "+name, p.RSSMB+sub[p.PID]))
+		case strings.HasPrefix(base, "qemu-system") && !underApp(procs, p, "Docker.app") && !underLima(procs, p):
+			res = append(res, procRes(p, "vm", model.RKVM, "QEMU VM", trunc(a, 90), p.RSSMB+sub[p.PID]))
 		case limaRe.MatchString(a):
 			name := limaRe.FindStringSubmatch(a)[1]
-			r := procRes(p, "vm", model.RKVM, "Lima VM "+name, "limactl", sub[p.PID])
+			r := procRes(p, "vm", model.RKVM, "Lima VM "+name, "limactl", p.RSSMB+sub[p.PID]+vzGuestMB(procs, p, vzTaken))
 			r.ID, r.Restart = "vm:lima-"+name, "limactl start "+name
 			res = append(res, r)
 		case tartRe.MatchString(a):
 			name := tartRe.FindStringSubmatch(a)[1]
-			r := procRes(p, "vm", model.RKVM, "Tart VM "+name, "tart", sub[p.PID])
+			r := procRes(p, "vm", model.RKVM, "Tart VM "+name, "tart", p.RSSMB+sub[p.PID]+vzGuestMB(procs, p, vzTaken))
 			r.ID, r.Restart = "vm:tart-"+name, "tart run "+name
 			res = append(res, r)
 		case base == "ollama" && strings.Contains(a, " serve"):
@@ -315,6 +340,17 @@ func subtreeMB(procs map[int]*sys.Proc) map[int]float64 {
 func underApp(procs map[int]*sys.Proc, p *sys.Proc, app string) bool {
 	for i, q := 0, p; q != nil && q.PID > 1 && i < 64; i, q = i+1, procs[q.PPID] {
 		if strings.Contains(q.Exe, "/"+app+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// underLima reports whether p was started by a Lima host agent: its qemu is counted as the
+// Lima VM's, not as a VM of its own.
+func underLima(procs map[int]*sys.Proc, p *sys.Proc) bool {
+	for i, q := 0, procs[p.PPID]; q != nil && q.PID > 1 && i < 64; i, q = i+1, procs[q.PPID] {
+		if limaRe.MatchString(q.Args) {
 			return true
 		}
 	}

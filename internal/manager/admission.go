@@ -166,8 +166,7 @@ func (m *Manager) fits(session, kind, cwd string, needMB float64, me *model.Wait
 		}
 	}
 	if needMB > head {
-		return false, fmt.Sprintf("not enough memory: %.1f GB needed, %.1f GB can be handed out (%.1f GB available, %.1f GB promised to other leases, %.1f GB kept free)",
-			needMB/1024, max(0, head)/1024, m.mem.AvailableMB/1024, m.pendingMB()/1024, m.cfg.HeadroomGB), false
+		return false, "not enough memory: " + shortfall(needMB, m.mem.AvailableMB, m.pendingMB(), m.cfg.HeadroomGB*1024), false
 	}
 	if needMB > head-aheadMB {
 		if m.canBackfill(session, kind, cwd, me, waiters) {
@@ -464,9 +463,7 @@ func (m *Manager) reclaim(needMB float64, forSession string, now time.Time) stri
 		over := m.cfg.MaxSessionShare > 0 && m.heldMB(l.Session) > share
 		rank := m.costRank(l)
 		if rank == 1 || !l.Verified || idle >= minIdle || over && idle >= minIdle/2 {
-			// Releasing a lease frees its whole promise (what it has not taken yet stops being
-			// held back) as well as what it uses.
-			cands = append(cands, cand{l, max(l.MemGB*1024, m.materialisedMB(l)), idle, over, p, rank})
+			cands = append(cands, cand{l, m.releaseGivesMB(l), idle, over, p, rank})
 		}
 	}
 	sortCands(cands, func(c cand) int { return c.rank }, func(a, b cand) bool {
@@ -553,7 +550,7 @@ func (m *Manager) checkOverrun(l *model.Lease, now time.Time) {
 		Delivered: map[string]bool{}, Answers: map[string]string{},
 		Text: fmt.Sprintf("[agentrm] Your %s lease %s asked for %.1f GB and is using %.1f GB. Until %s your requests are "+
 			"charged at least AgentRM's estimate. Next time ask for about %.1f GB (agentrm acquire --kind %s --mem %.1f).",
-			l.Kind, l.ID, l.MemGB, l.PeakMB/1024, now.Add(time.Hour).Format("15:04"), suggestGB(l.PeakMB), l.Kind, suggestGB(l.PeakMB))}
+			l.Kind, l.ID, l.MemGB, l.PeakMB/1024, now.Add(time.Hour).Format("15:04"), suggestGB(l.PeakMB, l.MemGB), l.Kind, suggestGB(l.PeakMB, l.MemGB))}
 }
 
 // learn folds a finished lease's peak into the estimates for its kind and its project.

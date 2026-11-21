@@ -101,7 +101,7 @@ func TestCrashedFileDoesNotSpoilTheNext(t *testing.T) {
 	t0 := time.Date(2026, 11, 17, 10, 0, 0, 0, time.Local)
 	w := NewWriter(dir, 36500) // the frames are dated in the past; the writer prunes by the real clock
 	w.Write(Frame{T: t0, Exit: 1})
-	w.Flush() // then the daemon dies: no gzip trailer
+	w.Flush()                   // then the daemon dies: no gzip trailer
 	w2 := NewWriter(dir, 36500) // the frames are dated in the past; the writer prunes by the real clock
 	w2.Write(Frame{T: t0.Add(time.Minute), Exit: 2})
 	w2.Close()

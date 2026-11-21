@@ -189,6 +189,7 @@ func TestFairShare(t *testing.T) {
 func TestReclaimPressesTheLeastUsed(t *testing.T) {
 	m, c := newTest(t, 1.5)
 	m.cfg.DryRun = false
+	learnFullReturn(m) // the order holders are pressed in, not how much a container gives back
 	now := c.Now()
 	since := now.Add(-time.Minute)
 	orphan := addRes(m, "compose:old", model.RKContainers, 800, "")

@@ -14,6 +14,7 @@ package manager
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -41,6 +42,46 @@ func (m *Manager) materialisedMB(l *model.Lease) float64 {
 		}
 	}
 	return used
+}
+
+// shortfall words a refusal for want of memory so its sum adds up as printed: what can be
+// handed out is shown as available less promised less kept free, from the figures as rounded.
+// Where a tenth of a GB is too coarse to show need above what can be handed out, the figures
+// get two decimals.
+func shortfall(needMB, availMB, pendingMB, keepMB float64) string {
+	for _, places := range []float64{10, 100} {
+		r := func(mb float64) float64 { return math.Round(mb/1024*places) / places }
+		need, avail, pending, keep := r(needMB), r(availMB), r(pendingMB), r(keepMB)
+		head := max(0, math.Round((avail-pending-keep)*places)/places)
+		if need > head || places == 100 {
+			f := gbText(places)
+			return fmt.Sprintf("%s GB needed, %s GB can be handed out (%s GB available, %s GB promised to leases, %s GB kept free)",
+				f(need), f(head), f(avail), f(pending), f(keep))
+		}
+	}
+	return ""
+}
+
+// gbText formats a GB figure to one decimal (places 10) or two (100).
+func gbText(places float64) func(float64) string {
+	if places >= 100 {
+		return func(x float64) string { return fmt.Sprintf("%.2f", x) }
+	}
+	return func(x float64) string { return fmt.Sprintf("%.1f", x) }
+}
+
+// releaseGivesMB is what releasing a lease with resources makes available: the part of its
+// promise it has not taken yet, which stops being held back, and what stopping its resources
+// gives back (part of a container's memory: returnRatio).
+func (m *Manager) releaseGivesMB(l *model.Lease) float64 {
+	mat, back := 0.0, 0.0
+	for _, rid := range l.Resources {
+		if r := m.st.Resources[rid]; r != nil {
+			mat += r.MemMB
+			back += r.MemMB * m.returnRatio(r.Source)
+		}
+	}
+	return max(0, l.MemGB*1024-mat) + back
 }
 
 // pendingMB is the memory promised to leases that they have not taken yet.
@@ -72,8 +113,9 @@ func (m *Manager) heldMB(session string) float64 {
 }
 
 // estimateGB is the memory a new lease is expected to need: what past leases of this kind in
-// this project really used, else of this kind anywhere (mean plus twice the typical deviation,
-// and at least 15% over the mean), else the configured default.
+// this project really used, else of this kind anywhere (the learned peak plus its typical
+// deviation, the deviation capped at half the peak, and at least 15% over the peak), else the
+// configured default.
 func (m *Manager) estimateGB(kind, cwd string) float64 {
 	for _, key := range []string{kind + "@" + projectOf(cwd), kind} {
 		if strings.HasSuffix(key, "@") {
@@ -123,13 +165,34 @@ func (m *Manager) procMB(p *sys.Proc) float64 {
 
 // usedSince is what the processes of a tree started at or after t hold now.
 func (m *Manager) usedSince(tree []*sys.Proc, t time.Time) float64 {
+	return m.usedBetween(tree, t, time.Time{})
+}
+
+// usedBetween is what the processes of a tree started at or after from, and before to (zero:
+// no end), hold now.
+func (m *Manager) usedBetween(tree []*sys.Proc, from, to time.Time) float64 {
 	total := 0.0
 	for _, p := range tree {
-		if !p.Start.IsZero() && !p.Start.Before(t) {
+		if !p.Start.IsZero() && !p.Start.Before(from) && (to.IsZero() || p.Start.Before(to)) {
 			total += m.procMB(p)
 		}
 	}
 	return total
+}
+
+// nextBuildLease is when the session's next build lease after l was granted (zero: none). What
+// starts after it is that lease's work, not l's.
+func (m *Manager) nextBuildLease(l *model.Lease) time.Time {
+	var next time.Time
+	for _, o := range m.st.Leases {
+		if o == l || o.Session != l.Session || len(o.Resources) > 0 || inferred(o) {
+			continue
+		}
+		if (o.Created.After(l.Created) || o.Created.Equal(l.Created) && o.ID > l.ID) && (next.IsZero() || o.Created.Before(next)) {
+			next = o.Created
+		}
+	}
+	return next
 }
 
 // dockerVMIdleMB is what Docker Desktop's VM holds with nothing running, until it is measured
@@ -144,10 +207,12 @@ func (m *Manager) dockerVMIdle() float64 {
 	return dockerVMIdleMB
 }
 
-// creditDockerVM turns the VM's measured footprint into what restarting it gives back: all it
-// holds above its idle size. A few minutes after AgentRM restarted it, with nothing running,
-// its footprint is that idle size, and is learned. Must hold mu.
-func (m *Manager) creditDockerVM(r *model.Resource, now time.Time) {
+// creditDockerVM turns the VM's measured footprint into what it holds of its own: above its
+// idle size, and not what its running containers hold (they are resources of their own, and
+// counting it in the VM too showed it twice). With nothing running, that is what restarting it
+// gives back. A few minutes after AgentRM restarted it, with nothing running, its footprint is
+// that idle size, and is learned. Must hold mu.
+func (m *Manager) creditDockerVM(r *model.Resource, containersMB float64, now time.Time) {
 	full := r.MemMB
 	if mark := m.restartedAt[r.ID]; mark != nil && !mark.sampled {
 		since := now.Sub(mark.at)
@@ -166,6 +231,9 @@ func (m *Manager) creditDockerVM(r *model.Resource, now time.Time) {
 		}
 	}
 	idle := m.dockerVMIdle()
-	r.MemMB = max(0, full-idle)
+	r.MemMB = max(0, full-idle-containersMB)
 	r.Detail = fmt.Sprintf("holds %.1f GB; about %.1f GB of it is what it needs idle", full/1024, idle/1024)
+	if containersMB > 0 {
+		r.Detail += fmt.Sprintf(" and %.1f GB its containers", containersMB/1024)
+	}
 }

@@ -207,10 +207,27 @@ func (m *Manager) recordStopped(r model.Resource, why, by string, now time.Time)
 		r.RestartArgv, r.RestartEnv = nil, nil
 	}
 	r.PausedAt, r.OrphanSince, r.LeaseID, r.Urgent = nil, nil, "", false
-	m.st.Stopped = append(m.st.Stopped, &model.Stopped{Resource: r, StoppedAt: now, Why: why, By: by})
+	r.NextStep, r.NextAt, r.NextFrom, r.NextDry = "", nil, nil, false
+	freed := r.MemMB * m.returnRatio(r.Source)
+	m.st.Stopped = append(m.st.Stopped, &model.Stopped{Resource: r, StoppedAt: now, Why: why, By: by, FreedMB: freed})
 	if len(m.st.Stopped) > 50 {
 		m.st.Stopped = m.st.Stopped[len(m.st.Stopped)-50:]
 	}
+	m.st.Freed = append(m.st.Freed, model.FreedMark{At: now, MB: freed})
+	for len(m.st.Freed) > 0 && now.Sub(m.st.Freed[0].At) > 31*24*time.Hour {
+		m.st.Freed = m.st.Freed[1:]
+	}
+}
+
+// freedMB is what stops between since and until gave back, and how many there were.
+func (m *Manager) freedMB(since, until time.Time) (mb float64, n int) {
+	for _, f := range m.st.Freed {
+		if !f.At.Before(since) && !f.At.After(until) {
+			mb += f.MB
+			n++
+		}
+	}
+	return mb, n
 }
 
 func (m *Manager) hasStopped(s *model.Stopped) bool {

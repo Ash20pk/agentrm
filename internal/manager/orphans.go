@@ -26,6 +26,7 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 	blocked := len(m.liveWaiters(now)) > 0
 	var effects []Effect
 	for _, r := range m.st.Resources {
+		r.NextStep, r.NextAt, r.NextFrom, r.NextDry = "", nil, nil, false
 		if m.pending[r.ID] != "" {
 			continue
 		}
@@ -53,6 +54,7 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 			continue
 		}
 		grace, hold, reason, ownerGone := m.collectTiming(r, now, blocked)
+		m.planNext(r, grace, hold, blocked, now)
 		if r.OrphanSince == nil {
 			t := now
 			r.OrphanSince = &t
@@ -143,6 +145,44 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 		}
 	}
 	return effects
+}
+
+// planNext records what the steps below will do to an unclaimed r, and when, for the app's
+// countdown: the same rules, read ahead. Must hold mu.
+func (m *Manager) planNext(r *model.Resource, grace, hold time.Duration, blocked bool, now time.Time) {
+	if r.StartedBy == "you" {
+		return // asked about, never paused or stopped
+	}
+	since := now
+	if r.OrphanSince != nil {
+		since = *r.OrphanSince
+	}
+	direct := r.Urgent || blocked || m.cfg.PauseMinutes <= 0 || !discover.CanPause(r)
+	if r.PreparedUntil != nil && !direct {
+		return // resumed when its prediction is settled (prepare.go)
+	}
+	step, from, at := "", since, since.Add(grace)
+	switch {
+	case r.PausedAt == nil && !direct:
+		step = "pause"
+	case r.PausedAt != nil && !direct:
+		if discover.CanAutoStop(r) {
+			step, from, at = "stop", *r.PausedAt, r.PausedAt.Add(hold)
+		}
+	case !discover.CanAutoStop(r):
+		if r.PausedAt == nil && discover.CanPause(r) {
+			step = "pause"
+		}
+	default:
+		step = "stop"
+		if r.PausedAt != nil {
+			from = *r.PausedAt
+		}
+	}
+	if step == "" {
+		return
+	}
+	r.NextStep, r.NextFrom, r.NextAt, r.NextDry = step, &from, &at, m.dryFor(r)
 }
 
 // decide logs a pause, stop or reclaim decision for review.

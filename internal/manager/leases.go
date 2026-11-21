@@ -2,6 +2,7 @@ package manager
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -50,24 +51,42 @@ func (m *Manager) acquire(c api.Caller, r api.Req) (any, []Effect, error) {
 	// A session that already holds a lease of this kind reuses it. That is also how a lease
 	// granted from the queue is taken up. Only for what the lease covers: asking for more goes
 	// through admission for the difference (it used to be granted at the old size).
-	extraGB := 0.0
+	// What the session holds of this kind is compared in total: asking for 2 GB again while
+	// holding 1 + 1 is the same ask, not another 1 GB.
+	var mine []*model.Lease
+	heldGB, declared := 0.0, false
 	for _, l := range m.st.Leases {
 		if l.Session == c.Session && l.Kind == r.Kind {
-			// The hook's automatic request declares nothing; it must not second-guess a lease
-			// the agent took with its own figure.
-			if more := memGB - l.MemGB; more > 0.25 && (r.MemGB > 0 || !l.Declared) {
-				extraGB = max(extraGB, more)
-				continue
+			mine = append(mine, l)
+			heldGB += l.MemGB
+			declared = declared || l.Declared
+		}
+	}
+	extraGB := 0.0
+	if len(mine) > 0 {
+		// The hook's automatic request declares nothing; it must not second-guess a lease
+		// the agent took with its own figure.
+		if more := memGB - heldGB; more > 0.25 && (r.MemGB > 0 || !declared) {
+			extraGB = more
+		} else {
+			// Reused: all of them are renewed and taken up; the answer names the one granted from
+			// the queue if there is one, else the newest.
+			sort.Slice(mine, func(i, j int) bool { return mine[i].Created.After(mine[j].Created) })
+			pick := mine[0]
+			for _, l := range mine {
+				if l.Offered != nil && pick.Offered == nil {
+					pick = l
+				}
+				l.Expires = now.Add(minutes(l.TTL))
+				l.LastUsed = now
+				m.takeUp(l)
 			}
-			l.Expires = now.Add(minutes(l.TTL))
-			l.LastUsed = now
-			m.takeUp(l)
 			m.dropWaiter(c.Session, r.Kind)
-			return &api.AcquireResp{Granted: true, Lease: l, Reused: true}, nil, nil
+			return &api.AcquireResp{Granted: true, Lease: pick, Reused: true}, nil, nil
 		}
 	}
 	if extraGB > 0 {
-		memGB = extraGB // a second lease of this kind for the difference
+		memGB = extraGB // another lease of this kind for the difference
 	}
 	m.yieldsSeeUse(c.Session, nil, r.Kind, now)
 	fast := m.readFast() // pressure, load and disk right now, not as of the last sweep
@@ -120,10 +139,10 @@ func (m *Manager) grant(w *model.Waiter, now time.Time, note string) *model.Leas
 	if s := m.st.Sessions[w.Session]; s != nil {
 		l.BaseFootprintMB = s.FootprintMB
 	}
-	if l.Kind == model.KGradle {
+	if host := daemonHost(l.Kind); host != "" {
 		l.DaemonBaseMB = map[string]float64{}
 		for id, r := range m.st.Resources {
-			if r.Kind == model.RKGradle {
+			if r.Kind == host {
 				l.DaemonBaseMB[id] = r.MemMB
 			}
 		}
@@ -358,9 +377,14 @@ func (m *Manager) updateFootprints(procs map[int]*sys.Proc, now time.Time) {
 		if len(l.Resources) == 0 && !inferred(l) {
 			// A build: what it uses is what it started. Only processes started since the grant
 			// count, by footprint, so a simulator, a Gradle daemon or a dev server the session
-			// already had is not charged to the build.
+			// already had is not charged to the build. A process started after a later build
+			// lease of the same session is that lease's: each process is charged once.
 			if s := m.st.Sessions[l.Session]; s != nil {
-				l.UsedMB = m.usedSince(trees[s.AgentPID], l.Created.Add(-2*time.Second)) + m.daemonGrowthMB(l)
+				from, to := l.Created.Add(-2*time.Second), m.nextBuildLease(l)
+				if !to.IsZero() {
+					to = to.Add(-2 * time.Second)
+				}
+				l.UsedMB = m.usedBetween(trees[s.AgentPID], from, to) + m.daemonGrowthMB(l)
 				l.PeakMB = max(l.PeakMB, l.UsedMB)
 				m.checkOverrun(l, now)
 			}
@@ -455,20 +479,34 @@ func inferred(l *model.Lease) bool {
 // the grant was started by the build and counts in full. Shared equally by gradle leases that
 // overlap, since a daemon cannot say whose build grew it.
 func (m *Manager) daemonGrowthMB(l *model.Lease) float64 {
-	if l.Kind != model.KGradle || l.DaemonBaseMB == nil {
+	host := daemonHost(l.Kind)
+	if host == "" || l.DaemonBaseMB == nil {
 		return 0
 	}
 	grew := 0.0
 	for id, r := range m.st.Resources {
-		if r.Kind == model.RKGradle && r.Unseen == nil {
+		if r.Kind == host && r.Unseen == nil {
 			grew += max(0, r.MemMB-l.DaemonBaseMB[id])
 		}
 	}
 	n := 0
 	for _, o := range m.st.Leases {
-		if o.Kind == model.KGradle {
+		if daemonHost(o.Kind) == host && len(o.Resources) == 0 {
 			n++
 		}
 	}
 	return grew / float64(max(n, 1))
+}
+
+// daemonHost is the kind of resource a lease's work runs inside rather than in a process its
+// session starts: Gradle's daemons, or Docker's VM for a Docker build (BuildKit runs in the VM)
+// and for compose and clusters until their containers are bound to the lease. "" for the rest.
+func daemonHost(kind string) string {
+	switch kind {
+	case model.KGradle:
+		return model.RKGradle
+	case model.KDockerBuild, model.KCompose, model.KCluster:
+		return model.RKDockerVM
+	}
+	return ""
 }

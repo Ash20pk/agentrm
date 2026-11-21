@@ -17,7 +17,7 @@ import (
 func dockerVM(m *Manager, fullMB float64) *model.Resource {
 	r := &model.Resource{ID: discover.DockerVMID, Kind: model.RKDockerVM, Source: discover.SrcProcs, Name: "Docker Desktop VM",
 		MemMB: fullMB, PID: 120, ProcStart: m.now().Add(-time.Hour), FirstSeen: m.now()}
-	m.creditDockerVM(r, m.now())
+	m.creditDockerVM(r, 0, m.now())
 	m.st.Resources[r.ID] = r
 	return r
 }

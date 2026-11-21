@@ -61,14 +61,17 @@ type Manager struct {
 	eventSeq  int
 	failed    map[string]error // discovery sources that failed on the last sweep
 
-	agentSessions   map[int]string
-	recent          map[string][]cmdRecord
-	hookSeen        map[string]time.Time // agent kind -> last hook call
-	claimRefused    map[string]bool      // "pid session": a hook that named another agent's session, reported once
-	waiters         []*model.Waiter
-	swapRate        float64
-	lastSwapouts    float64
-	lastSwapAt      time.Time
+	agentSessions map[int]string
+	recent        map[string][]cmdRecord
+	hookSeen      map[string]time.Time // agent kind -> last hook call
+	claimRefused  map[string]bool      // "pid session": a hook that named another agent's session, reported once
+	waiters       []*model.Waiter
+	swapRate      float64
+	swapSamples   []swapSample // cumulative swap-outs over the last minute or so (takeMem)
+	memAt         time.Time    // when m.mem was read
+	// freshMem: a request for memory reads it again first when it is older than memFresh
+	// (live only: tests and replays bring their own readings).
+	freshMem        bool
 	activity        *evidence.Activity
 	classifier      *shell.Classifier
 	dockerOrigin    map[string]origin          // resource ID -> who started it
@@ -159,7 +162,7 @@ func New(o Options) *Manager {
 		m.classifier, _ = shell.NewClassifier(nil)
 		return m
 	}
-	m.mem = sys.ReadMem()
+	m.mem, m.freshMem = sys.ReadMem(), true
 	cfg, notes := store.LoadConfig(o.Dir, m.mem.TotalMB)
 	st, snotes := store.LoadState(o.Dir, now())
 	m.cfg, m.st = cfg, st
@@ -399,7 +402,21 @@ func (m *Manager) HandleCtx(ctx context.Context, path string, peerPID int, req a
 	if req.Cwd != "" && (path == "/touch" || path == "/acquire" || path == "/renew" || path == "/claim" || path == "/vault/request") {
 		req.Repo, req.Branch = sys.GitHead(req.Cwd) // a file read: outside the lock
 	}
+	if path == "/acquire" && m.memStale() {
+		// Between sweeps (30 s when idle) memory can change by gigabytes: a request is judged
+		// on a reading a few seconds old at most. A fast tick reads and records it as usual.
+		m.FastTick()
+	}
 	return m.handleFacts(ctx, path, h, facts, req)
+}
+
+// memFresh is how old a memory reading a request for memory may be judged on.
+const memFresh = 5 * time.Second
+
+func (m *Manager) memStale() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.freshMem && m.now().Sub(m.memAt) > memFresh
 }
 
 // readOnly requests change nothing and are not recorded.
@@ -459,6 +476,10 @@ func (m *Manager) status(c api.Caller, r api.Req) (any, []Effect, error) {
 	if m.dockerEventsErr != "" {
 		src["docker-events"] = m.dockerEventsErr
 	}
+	now := m.now()
+	y, mo, d := now.Date()
+	today, _ := m.freedMB(time.Date(y, mo, d, 0, 0, 0, 0, now.Location()), now)
+	week, _ := m.freedMB(now.AddDate(0, 0, -7), now)
 	return &api.Status{
 		APIVersion: api.Version, DaemonVersion: m.version,
 		Mem: m.mem, HeadroomMB: m.headroomMB(), PendingMB: m.pendingMB(), SwapRate: m.swapRate,
@@ -468,6 +489,7 @@ func (m *Manager) status(c api.Caller, r api.Req) (any, []Effect, error) {
 		Self: m.self, StartedAt: m.started, Notes: m.notes, Prediction: m.predictionScore(),
 		TrustLevels: m.trustLevels(m.now()), Accuracy: m.st.Accuracy, FailOpen: m.failOpen(m.now()),
 		Leaks: m.leakList(), VaultAccounts: m.vaultAccountList(), VaultGrants: m.st.VaultGrants,
+		FreedTodayMB: today, FreedWeekMB: week,
 	}, nil, nil
 }
 

@@ -36,10 +36,15 @@ func (m *Manager) receiptsPath(cwd string) string {
 	return filepath.Join(m.dir, "receipts", receiptName.ReplaceAllString(p, "_")+".txt")
 }
 
-// suggestGB is what to ask for next time after using usedMB: what it used and a fifth more,
-// rounded up to a tenth of a GB.
-func suggestGB(usedMB float64) float64 {
-	return math.Ceil(usedMB*1.2/1024*10) / 10
+// suggestGB is what to ask for next time after asking for askedGB and using usedMB: what it
+// used and a fifth more, rounded up to a tenth of a GB. After using well under the ask it is
+// always below the ask, so a receipt never suggests the figure it says was too much.
+func suggestGB(usedMB, askedGB float64) float64 {
+	s := math.Ceil(usedMB*1.2/1024*10) / 10
+	if usedMB/1024 < receiptUnder*askedGB && s >= askedGB {
+		s = max(0.1, math.Floor((askedGB-0.1)*10+1e-9)/10)
+	}
+	return s
 }
 
 // writeReceipt records what a finished lease asked for and used, and tells its session when the
@@ -56,7 +61,7 @@ func (m *Manager) writeReceipt(l *model.Lease, kind string, now time.Time) {
 	path := m.receiptsPath(l.Cwd)
 	if m.dir != "" {
 		line := fmt.Sprintf("%s  %-12s  %s %.1f GB  used %.1f GB  next time ask %.1f GB  %s\n",
-			now.Format("2006-01-02 15:04"), kind, who, asked, used, suggestGB(l.PeakMB), trunc(oneLine(l.Cmd), 80))
+			now.Format("2006-01-02 15:04"), kind, who, asked, used, suggestGB(l.PeakMB, l.MemGB), trunc(oneLine(l.Cmd), 80))
 		if err := os.MkdirAll(filepath.Dir(path), 0o755); err == nil {
 			if f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644); err == nil {
 				if fi, _ := f.Stat(); fi != nil && fi.Size() == 0 {
@@ -71,6 +76,9 @@ func (m *Manager) writeReceipt(l *model.Lease, kind string, now time.Time) {
 	if used >= receiptUnder*asked && used <= receiptOver*asked {
 		return
 	}
+	if math.Abs(suggestGB(l.PeakMB, l.MemGB)-asked) < 0.05 {
+		return // nothing smaller to suggest (asked 0.1 GB)
+	}
 	verb := "asked for"
 	if !l.Declared {
 		verb = "was charged AgentRM's estimate of"
@@ -79,6 +87,6 @@ func (m *Manager) writeReceipt(l *model.Lease, kind string, now time.Time) {
 		Delivered: map[string]bool{}, Answers: map[string]string{},
 		Text: fmt.Sprintf("[agentrm] Receipt: your %s %s %.1f GB and used %.1f GB. Next time ask for about %.1f GB: "+
 			"agentrm acquire --kind %s --mem %.1f. Every lease of this project is in %s.",
-			kind, verb, asked, used, suggestGB(l.PeakMB), kind, suggestGB(l.PeakMB), path)}
+			kind, verb, asked, used, suggestGB(l.PeakMB, l.MemGB), kind, suggestGB(l.PeakMB, l.MemGB), path)}
 	m.event("RECEIPT %s %s %s %.1f GB, used %.1f GB (%s)", l.ID, kind, verb, asked, used, short(l.Session))
 }

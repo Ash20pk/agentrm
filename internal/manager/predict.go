@@ -18,6 +18,7 @@ package manager
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -154,7 +155,9 @@ func (m *Manager) lifetime(kind, cwd string, q float64) (time.Duration, bool) {
 		}
 		s := append([]float64(nil), d...)
 		sort.Float64s(s)
-		i := int(q * float64(len(s)-1))
+		// Nearest rank: the smallest value at least a share q of the samples are at or under
+		// (with 5 samples, the 90th percentile is the 5th, not the 4th).
+		i := min(len(s)-1, max(0, int(math.Ceil(q*float64(len(s))))-1))
 		return time.Duration(s[i] * float64(time.Minute)), true
 	}
 	return 0, false

@@ -189,14 +189,51 @@ func (m *Manager) fastWith(procs map[int]*sys.Proc, mem sys.MemStats) {
 	}
 }
 
+// swapSample is the cumulative swap-out count (MB) at a moment.
+type swapSample struct {
+	at  time.Time
+	out float64
+}
+
+const (
+	// swapWindow is what the swap rate is measured over. Samples come every few seconds while
+	// someone waits: a rate over one gap turned a 20 MB burst into "600 MB a minute".
+	swapWindow = time.Minute
+	// swapWindowMin is the shortest span a rate is given for, just after a start.
+	swapWindowMin = 20 * time.Second
+)
+
 func (m *Manager) takeMem(mem sys.MemStats, now time.Time) {
-	if !m.lastSwapAt.IsZero() && now.Sub(m.lastSwapAt) > time.Second && mem.Swapouts >= m.lastSwapouts {
-		m.swapRate = (mem.Swapouts - m.lastSwapouts) / now.Sub(m.lastSwapAt).Minutes()
-	}
-	m.lastSwapouts, m.lastSwapAt = mem.Swapouts, now
-	m.mem = mem
+	m.swapRate = m.measureSwap(mem.Swapouts, now)
+	m.mem, m.memAt = mem, now
 	m.measureReturns(now)
 	m.watchGrants(now)
+}
+
+// measureSwap adds a sample and returns the swap-out rate in MB a minute over the last minute
+// or more: against the newest sample at least swapWindow old, or the oldest if it is at least
+// swapWindowMin old. Until then the rate stands as it was.
+func (m *Manager) measureSwap(out float64, now time.Time) float64 {
+	if n := len(m.swapSamples); n > 0 && (out < m.swapSamples[n-1].out || now.Before(m.swapSamples[n-1].at)) {
+		m.swapSamples = nil // the counter or the clock went back: start again
+	}
+	m.swapSamples = append(m.swapSamples, swapSample{now, out})
+	base := -1
+	for i := len(m.swapSamples) - 1; i >= 0; i-- {
+		if now.Sub(m.swapSamples[i].at) >= swapWindow {
+			base = i
+			break
+		}
+	}
+	if base < 0 {
+		if now.Sub(m.swapSamples[0].at) < swapWindowMin {
+			return m.swapRate
+		}
+		base = 0
+	}
+	b := m.swapSamples[base]
+	m.swapSamples = m.swapSamples[base:]
+	return (out - b.out) / now.Sub(b.at).Minutes()
 }
 
 // Sweep is the full pass: discovery, attribution, leases, orphans.
@@ -303,9 +340,16 @@ func (m *Manager) origins() map[string]origin { return m.dockerOrigin }
 func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[string]bool, now time.Time) {
 	m.failed = found.Failed
 	seen := map[string]bool{}
+	// What the containers hold is inside the VM's footprint, and is counted as theirs.
+	containers := 0.0
+	for _, r := range found.Resources {
+		if r.Source == discover.SrcDocker && r.Kind != model.RKDockerVM {
+			containers += r.MemMB
+		}
+	}
 	for _, r := range found.Resources {
 		if r.Kind == model.RKDockerVM {
-			m.creditDockerVM(r, now)
+			m.creditDockerVM(r, containers, now)
 		}
 	}
 	for _, r := range found.Resources {

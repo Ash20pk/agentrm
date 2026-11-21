@@ -197,6 +197,8 @@ type Status struct {
 	Events        []model.Event              `json:"events"`
 	Learned       map[string]float64         `json:"learned_mb"`
 	Stopped       []*model.Stopped           `json:"stopped"`
+	FreedTodayMB  float64                    `json:"freed_today_mb"` // what today's stops gave back
+	FreedWeekMB   float64                    `json:"freed_week_mb"`  // the last seven days
 	Approvals     map[string]*model.Approval `json:"approvals"`
 	Sources       map[string]string          `json:"sources"` // source -> "" (ok) or why it failed
 	Self          sys.SelfUsage              `json:"self"`

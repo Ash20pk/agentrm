@@ -2,6 +2,7 @@ package discover
 
 import (
 	"testing"
+	"time"
 
 	"agentrm/internal/model"
 	"agentrm/internal/sys"
@@ -42,8 +43,8 @@ func TestProcessKinds(t *testing.T) {
 	for _, r := range Processes(model.DefaultConfig(), procs) {
 		got[r.ID] = r
 	}
-	if r := got["emu:10"]; r == nil || r.Kind != model.RKEmulator {
-		t.Error("Android emulator not found")
+	if r := got["emu:10"]; r == nil || r.Kind != model.RKEmulator || r.MemMB != 2000 {
+		t.Errorf("Android emulator not found with the 2000 MB its qemu holds: %+v", r)
 	}
 	if r := got["vm:lima-default"]; r == nil || r.Kind != model.RKVM {
 		t.Error("Lima VM not found")
@@ -62,6 +63,55 @@ func TestProcessKinds(t *testing.T) {
 	}
 	if r := got[DockerVMID]; r == nil || r.PID != 50 || r.Kind != model.RKDockerVM {
 		t.Errorf("Docker Desktop's own VM was not listed as itself: %+v", r)
+	}
+}
+
+// A Lima VM on Apple's Virtualization runs its guest in a process under launchd, paired by
+// start time; on qemu the guest is the host agent's child, and not a VM of its own.
+func TestVMsCountTheirGuest(t *testing.T) {
+	t0 := time.Date(2026, 11, 18, 9, 0, 0, 0, time.UTC)
+	procs := map[int]*sys.Proc{
+		1:  {PID: 1, Exe: "launchd"},
+		20: {PID: 20, PPID: 1, Exe: "/opt/homebrew/bin/limactl", Args: "/opt/homebrew/bin/limactl hostagent --pidfile x vz1", RSSMB: 50, Start: t0},
+		21: {PID: 21, PPID: 1, Exe: "/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine",
+			RSSMB: 900, Start: t0.Add(3 * time.Second)},
+		30: {PID: 30, PPID: 1, Exe: "/opt/homebrew/bin/limactl", Args: "/opt/homebrew/bin/limactl hostagent --pidfile y q1", RSSMB: 40, Start: t0.Add(time.Hour)},
+		31: {PID: 31, PPID: 30, Exe: "/opt/homebrew/bin/qemu-system-aarch64", Args: "qemu-system-aarch64 -m 4096", RSSMB: 3000, Start: t0.Add(time.Hour)},
+	}
+	noFootprint(t, map[int]float64{21: 4096})
+	got := map[string]*model.Resource{}
+	for _, r := range Processes(model.DefaultConfig(), procs) {
+		got[r.ID] = r
+	}
+	if r := got["vm:lima-vz1"]; r == nil || r.MemMB != 50+4096 {
+		t.Errorf("Lima on vz without its guest's 4096 MB footprint: %+v", r)
+	}
+	if r := got["vm:lima-q1"]; r == nil || r.MemMB != 40+3000 {
+		t.Errorf("Lima on qemu without its qemu: %+v", r)
+	}
+	if got["vm:31"] != nil {
+		t.Error("Lima's qemu was listed as a second VM")
+	}
+}
+
+// A booted simulator is sized by its launchd_sim and what runs under it, not the estimate.
+func TestSimulatorsAreMeasured(t *testing.T) {
+	udid := "0F1E2D3C-AAAA-BBBB-CCCC-123456789ABC"
+	rs := []*model.Resource{{ID: "sim:" + udid, UDID: udid, MemMB: 1536, Detail: "iOS-18-0, size estimated"},
+		{ID: "sim:other", UDID: "other", MemMB: 1536, Detail: "iOS-18-0, size estimated"}}
+	procs := map[int]*sys.Proc{
+		1: {PID: 1, Exe: "launchd"},
+		60: {PID: 60, PPID: 1, Exe: "/Library/Developer/CoreSimulator/Volumes/iOS_22A/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 18.0.simruntime/Contents/Resources/RuntimeRoot/sbin/launchd_sim",
+			Args: "launchd_sim /Users/x/Library/Developer/CoreSimulator/Devices/" + udid + "/data/var/run/com.apple.CoreSimulator.simdevice." + udid + ".plist", RSSMB: 20},
+		61: {PID: 61, PPID: 60, Exe: "SpringBoard", RSSMB: 300},
+		62: {PID: 62, PPID: 61, Exe: "MyApp", RSSMB: 200},
+	}
+	measureSimulators(rs, procs)
+	if rs[0].MemMB != 520 || rs[0].Detail != "iOS-18-0" {
+		t.Errorf("simulator not measured: %+v", rs[0])
+	}
+	if rs[1].MemMB != 1536 || rs[1].Detail != "iOS-18-0, size estimated" {
+		t.Errorf("a simulator with no process found lost its estimate: %+v", rs[1])
 	}
 }
 
