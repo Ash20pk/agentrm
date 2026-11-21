@@ -256,9 +256,10 @@ func Processes(cfg model.Config, procs map[int]*sys.Proc) []*model.Resource {
 			continue
 		}
 		switch {
-		case strings.Contains(a, "org.gradle.launcher.daemon") || strings.Contains(a, "GradleDaemon"):
+		// The daemons are JVMs: a command that only mentions one (grep -r GradleDaemon) is not.
+		case base == "java" && (strings.Contains(a, "org.gradle.launcher.daemon") || strings.Contains(a, "GradleDaemon")):
 			res = append(res, procRes(p, "gradle", model.RKGradle, "Gradle daemon", heap(a), p.RSSMB))
-		case strings.Contains(a, "KotlinCompileDaemon"):
+		case base == "java" && strings.Contains(a, "KotlinCompileDaemon"):
 			res = append(res, procRes(p, "gradle", model.RKGradle, "Kotlin daemon", heap(a), p.RSSMB))
 		case strings.HasPrefix(base, "qemu-system") && avdRe.MatchString(a):
 			name := avdRe.FindStringSubmatch(a)[1]
@@ -389,9 +390,11 @@ func isHeadlessBrowser(args string) bool {
 		!strings.Contains(args, "--type=") // renderer, GPU and utility helpers are part of the parent
 }
 
+// isHeadlessBrowserParent reports whether p's parent is a headless browser listed in its place.
+// A shell whose command line starts one is not listed (shells), so the browser it started is.
 func isHeadlessBrowserParent(procs map[int]*sys.Proc, p *sys.Proc) bool {
 	par := procs[p.PPID]
-	return par != nil && isHeadlessBrowser(par.Args)
+	return par != nil && !shells[filepath.Base(par.Exe)] && isHeadlessBrowser(par.Args)
 }
 
 func browserName(args string) string {

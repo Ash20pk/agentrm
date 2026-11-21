@@ -570,7 +570,7 @@ func (m *Manager) learn(l *model.Lease) {
 	m.scoreCharge(l, kind)
 	m.writeReceipt(l, kind, m.now())
 	// Only leases that really ran something teach anything.
-	if kind == "" || l.PeakMB < minLearnMB || (model.LeaseToResource[kind] != "" && !l.HadResources) {
+	if kind == "" || l.PeakMB < minLearnMB || (model.LeaseToResource[kind] != "" && !l.HadResources) || inVM(l) {
 		return
 	}
 	keys := []string{kind}

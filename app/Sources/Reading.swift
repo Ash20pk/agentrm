@@ -67,7 +67,11 @@ extension Store {
             } else if !l.purpose.hasPrefix("inferred") {
                 detail += ", charged \(Fmt.size(l.mem_gb * 1024))"
             }
-            if (l.inside_mb ?? 0) > 0 { detail += l.kind == "gradle" ? ", mostly inside its Gradle daemon" : ", mostly inside Docker's VM" }
+            if let inside = l.inside_mb, inside > 0 {
+                // Docker's VM grows for others too: its growth is only taken off what is held back.
+                detail += l.kind == "gradle" ? ", \(Fmt.size(inside)) of it in its Gradle daemon"
+                    : ", \(Fmt.size(inside)) of it is Docker's VM growing since"
+            }
             items.append(Item(id: l.id, name: l.purpose.isEmpty ? Kind.name(l.kind) : l.purpose,
                               detail: detail, mb: mb, lamp: lamp, resource: nil, actions: [.release(l.id)]))
         }

@@ -71,8 +71,8 @@ type Manager struct {
 	// tickMu makes reading the machine, recording it and applying it one at a time: the sweep
 	// loop and a request refreshing memory would otherwise record deltas out of order.
 	tickMu sync.Mutex
-	// Docker's VM footprint and what its containers hold, as of the last sweep: a Docker
-	// lease's use is how the first grew beyond the second (daemonGrowthMB).
+	// Docker's VM footprint and what its containers hold, as of the last sweep: how much of a
+	// Docker lease's promise is no longer held back (daemonGrowthMB).
 	dockerFullMB, dockerContainersMB float64
 	dockerMeasured                   bool      // the last sweep measured the VM
 	memAt                            time.Time // when m.mem was read

@@ -50,7 +50,7 @@ func suggestGB(usedMB, askedGB float64) float64 {
 // writeReceipt records what a finished lease asked for and used, and tells its session when the
 // ask was far off. Must hold mu.
 func (m *Manager) writeReceipt(l *model.Lease, kind string, now time.Time) {
-	if kind == "" || l.PeakMB < minLearnMB || len(l.Resources) > 0 || l.HadResources || inferred(l) || l.Session == "you" {
+	if kind == "" || l.PeakMB < minLearnMB || len(l.Resources) > 0 || l.HadResources || inferred(l) || inVM(l) || l.Session == "you" {
 		return
 	}
 	asked, used := l.MemGB, l.PeakMB/1024

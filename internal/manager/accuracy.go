@@ -62,7 +62,7 @@ func (m *Manager) score(key string, predicted, actual float64, now time.Time) {
 // anything measurable (claims of something already running, holds on a cluster that lives in
 // Docker's VM) teach nothing about charges.
 func (m *Manager) scoreCharge(l *model.Lease, kind string) {
-	if kind == "" || l.PeakMB < minLearnMB || len(l.Resources) > 0 || l.HadResources || inferred(l) {
+	if kind == "" || l.PeakMB < minLearnMB || len(l.Resources) > 0 || l.HadResources || inferred(l) || inVM(l) {
 		return
 	}
 	m.score("charge:"+kind, l.MemGB*1024, l.PeakMB, m.now())

@@ -174,6 +174,12 @@ func (m *Manager) usedSince(tree []*sys.Proc, t time.Time) float64 {
 // usedBetween is what the processes of a tree started at or after from, and before to (zero:
 // no end), hold now, leaving out the processes in skip and everything under them.
 func (m *Manager) usedBetween(tree []*sys.Proc, from, to time.Time, skip map[int]bool) float64 {
+	return m.usedIn(tree, [][2]time.Time{{from, to}}, skip)
+}
+
+// usedIn is what the processes of a tree started in any of the windows [from, to) (to zero: no
+// end) hold now, each counted once, leaving out the processes in skip and everything under them.
+func (m *Manager) usedIn(tree []*sys.Proc, wins [][2]time.Time, skip map[int]bool) float64 {
 	byPID := make(map[int]*sys.Proc, len(tree))
 	for _, p := range tree {
 		byPID[p.PID] = p
@@ -186,9 +192,17 @@ func (m *Manager) usedBetween(tree []*sys.Proc, from, to time.Time, skip map[int
 		}
 		return false
 	}
+	in := func(t time.Time) bool {
+		for _, w := range wins {
+			if !t.Before(w[0]) && (w[1].IsZero() || t.Before(w[1])) {
+				return true
+			}
+		}
+		return false
+	}
 	total := 0.0
 	for _, p := range tree {
-		if !p.Start.IsZero() && !p.Start.Before(from) && (to.IsZero() || p.Start.Before(to)) && !skipped(p) {
+		if !p.Start.IsZero() && in(p.Start) && !skipped(p) {
 			total += m.procMB(p)
 		}
 	}

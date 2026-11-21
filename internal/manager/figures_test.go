@@ -123,6 +123,21 @@ func TestDockerBuildIsMeasuredInDockersVM(t *testing.T) {
 	if p := m.pendingMB(); p != 3*1024-2000 {
 		t.Fatalf("pending %.0f MB, want %d", p, 3*1024-2000)
 	}
+	// Only what is held back: the VM's growth teaches nothing and flags nothing. The docker CLI
+	// the session started is all it is known to have used.
+	m.dockerFullMB = 9300
+	procs[101] = &sys.Proc{PID: 101, PPID: 100, Exe: "docker", Args: "docker build .", RSSMB: 150, Start: t0.Add(time.Second)}
+	c.Add(time.Minute)
+	m.updateFootprints(procs, c.Now())
+	l := m.findLease("s", model.KDockerBuild)
+	if l.InsideMB != 3*1024 || l.PeakMB != 150 || l.Overran || c.Now().Before(m.st.Sessions["s"].DistrustUntil) {
+		t.Fatalf("8 GB of VM growth on a 3 GB lease: inside %.0f, peak %.0f, overran %v", l.InsideMB, l.PeakMB, l.Overran)
+	}
+	learned := len(m.st.Learned)
+	m.dropLease(l, "test")
+	if len(m.st.Learned) != learned {
+		t.Fatal("learned an estimate from the VM's growth")
+	}
 }
 
 // Docker's VM holds its containers' memory; they are counted as resources of their own, so the
@@ -286,8 +301,7 @@ func TestFreedLogIsSeededFromPastStops(t *testing.T) {
 }
 
 // A Docker lease's use is the VM's growth beyond its containers'. Containers stopping (the VM
-// keeps what they held), Docker not answering, or someone else's stack starting is no one's
-// work: charged to the lease, each read as an overrun and distrusted the session.
+// keeps what they held) or someone else's stack starting is no one's work.
 func TestDockerLeaseIsNotChargedForContainers(t *testing.T) {
 	m, c := newTest(t, 8)
 	m.dockerFullMB, m.dockerContainersMB, m.dockerMeasured = 6144, 4096, true
@@ -303,17 +317,22 @@ func TestDockerLeaseIsNotChargedForContainers(t *testing.T) {
 		m.updateFootprints(procs, c.Now())
 		return l.UsedMB
 	}
-	if u := measure(6144, 0); u != 0 {
-		t.Fatalf("the stack stopped and the VM kept its memory: charged %.0f MB", u)
-	}
-	if u := measure(7168, 1024); u != 0 {
+	if u := measure(7168, 5120); u != 0 {
 		t.Fatalf("an unrelated stack started: charged %.0f MB", u)
 	}
-	if u := measure(8168, 1024); u != 1000 {
+	if u := measure(7168, 0); u != 0 {
+		t.Fatalf("the stacks stopped and the VM kept their memory: charged %.0f MB", u)
+	}
+	if u := measure(8168, 0); u != 1000 {
 		t.Fatalf("the build grew the VM by 1000 MB: charged %.0f MB", u)
 	}
-	if l.Overran || c.Now().Before(m.st.Sessions["s"].DistrustUntil) {
-		t.Fatal("flagged as an overrun")
+	// Containers going up and down do not wear its use away.
+	for i := 0; i < 5; i++ {
+		measure(9168, 1000)
+		measure(8168, 0)
+	}
+	if u := measure(8168, 0); u != 1000 {
+		t.Fatalf("after containers came and went: %.0f MB, want 1000", u)
 	}
 }
 
@@ -366,8 +385,8 @@ func TestDockerVMGrowthIsNotTakeUp(t *testing.T) {
 	l.Offered = &off
 	m.dockerFullMB = 2200 // someone's pull
 	m.updateFootprints(procs, c.Now())
-	if l.DaemonBaseMB[dockerGrewKey] != 200 || l.UsedMB != 200 {
-		t.Fatalf("the VM's growth was not tracked: %v", l.DaemonBaseMB)
+	if l.InsideMB != 200 || l.UsedMB != 200 {
+		t.Fatalf("the VM's growth was not tracked: inside %.0f, used %.0f", l.InsideMB, l.UsedMB)
 	}
 	m.checkLeases(c.Now())
 	if l.Offered == nil {
@@ -500,8 +519,10 @@ func TestDockerVMGapIsNotGrowth(t *testing.T) {
 	if u := sweep(7144, 4096, true); u != 1000 {
 		t.Fatalf("real growth: %.0f MB, want 1000", u)
 	}
-	if l.Overran {
-		t.Fatal("flagged as an overrun")
+	// One low reading, then back: the recovery is not growth.
+	sweep(3000, 4096, true)
+	if u := sweep(7144, 4096, true); u != 1000 {
+		t.Fatalf("after a low reading: %.0f MB, want 1000", u)
 	}
 }
 
@@ -530,8 +551,9 @@ func TestComposeDownIsNotCharged(t *testing.T) {
 	}
 }
 
-// A Docker build's work is the VM's growth: a queued one is taken up by its own build.
-func TestDockerBuildIsTakenUpByItsBuild(t *testing.T) {
+// A queued Docker build is taken up when its command runs (the hook asks for it again), not by
+// the VM growing: an 80 MB drift or someone's pull deleted its grant notice.
+func TestDockerBuildIsTakenUpByItsCommand(t *testing.T) {
 	m, c := newTest(t, 8)
 	m.dockerFullMB, m.dockerMeasured = 2000, true
 	m.learnSession(100, "s", "claude")
@@ -547,8 +569,92 @@ func TestDockerBuildIsTakenUpByItsBuild(t *testing.T) {
 	c.Add(30 * time.Second)
 	m.updateFootprints(procs, c.Now())
 	m.checkLeases(c.Now())
+	if l.Offered == nil {
+		t.Fatal("taken up by the VM's growth")
+	}
+	if r := acquire(t, m, agent("s"), model.KDockerBuild, 0); !r.Granted || !r.Reused {
+		t.Fatalf("its command's request: %+v", r)
+	}
 	if l.Offered != nil {
-		t.Fatal("a running Docker build was not taken up")
+		t.Fatal("not taken up by its command")
+	}
+}
+
+// Two Docker leases: the VM's growth is handed out once, oldest first, each up to its promise.
+// Divided by the number of leases, a second lease halved the first's use (1.5 GB less headroom
+// for nothing), and releasing it made the first's jump.
+func TestDockerGrowthIsHandedOutOnce(t *testing.T) {
+	m, c := newTest(t, 16)
+	m.dockerFullMB, m.dockerMeasured = 2000, true
+	m.learnSession(100, "a", "claude")
+	m.learnSession(200, "b", "claude")
+	procs := map[int]*sys.Proc{
+		100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: c.Now().Add(-time.Hour)},
+		200: {PID: 200, PPID: 1, Exe: "claude", Args: "claude", Start: c.Now().Add(-time.Hour)},
+	}
+	sweep := func(full float64) {
+		m.dockerFullMB = full
+		c.Add(30 * time.Second)
+		m.updateFootprints(procs, c.Now())
+	}
+	acquire(t, m, agent("a"), model.KDockerBuild, 2)
+	a := m.findLease("a", model.KDockerBuild)
+	sweep(5000)
+	if a.InsideMB != 2048 {
+		t.Fatalf("a: %.0f, want its 2048 promise", a.InsideMB)
+	}
+	sweep(3500)
+	acquire(t, m, agent("b"), model.KDockerBuild, 2)
+	b := m.findLease("b", model.KDockerBuild)
+	sweep(3500)
+	if a.InsideMB != 1500 || b.InsideMB != 0 {
+		t.Fatalf("a second lease changed the first: a %.0f, b %.0f", a.InsideMB, b.InsideMB)
+	}
+	sweep(4500)
+	if a.InsideMB != 2048 || b.InsideMB != 452 {
+		t.Fatalf("2500 MB of growth: a %.0f (want 2048), b %.0f (want 452)", a.InsideMB, b.InsideMB)
+	}
+	m.dropLease(b, "test")
+	sweep(4500)
+	if a.InsideMB != 2048 {
+		t.Fatalf("b released: a %.0f", a.InsideMB)
+	}
+}
+
+// Asking for more of the same kind gets a second lease for the difference. The build's
+// processes, started under the first, are measured with both: the first was charged all of
+// them, flagged as an overrun and its session distrusted, and the second showed nothing used.
+func TestMoreOfTheSameKindIsMeasuredAsOne(t *testing.T) {
+	m, c := newTest(t, 12)
+	t0 := c.Now()
+	m.footprint = func(pid int) (float64, bool) { mb, ok := map[int]float64{102: 3072}[pid]; return mb, ok }
+	m.learnSession(100, "s", "claude")
+	if r := acquire(t, m, agent("s"), model.KCargoBuild, 1); !r.Granted {
+		t.Fatal(r.Reason)
+	}
+	c.Add(time.Minute)
+	if r := acquire(t, m, agent("s"), model.KCargoBuild, 3); !r.Granted || r.Reused {
+		t.Fatalf("asking for 3: %+v", r)
+	}
+	var first, extra *model.Lease
+	for _, l := range m.st.Leases {
+		if l.Created.Equal(t0) {
+			first = l
+		} else {
+			extra = l
+		}
+	}
+	procs := map[int]*sys.Proc{
+		100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: t0.Add(-time.Hour)},
+		102: {PID: 102, PPID: 100, Exe: "rustc", Args: "rustc", Start: t0.Add(10 * time.Second)},
+	}
+	c.Add(time.Minute)
+	m.updateFootprints(procs, c.Now())
+	if first.UsedMB != 1024 || extra.UsedMB != 2048 {
+		t.Fatalf("first %.0f (want 1024), extra %.0f (want 2048)", first.UsedMB, extra.UsedMB)
+	}
+	if first.Overran || extra.Overran || c.Now().Before(m.st.Sessions["s"].DistrustUntil) {
+		t.Fatal("flagged as an overrun for asking correctly")
 	}
 }
 

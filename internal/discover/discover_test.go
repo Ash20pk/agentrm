@@ -134,10 +134,52 @@ func TestDockerGuestIsPairedWithTheOthers(t *testing.T) {
 	if d := dockerVMProc(procs); d == nil || d.PID != 11 {
 		t.Fatalf("Docker's guest: %+v", d)
 	}
+	found := false
 	for _, r := range Processes(model.DefaultConfig(), procs) {
-		if r.ID == "vm:lima-a" && r.MemMB != 1010 {
-			t.Fatalf("Lima: %.0f MB", r.MemMB)
+		if r.ID == "vm:lima-a" {
+			found = true
+			if r.MemMB != 1010 {
+				t.Fatalf("Lima: %.0f MB", r.MemMB)
+			}
 		}
+	}
+	if !found {
+		t.Fatal("Lima VM not found")
+	}
+}
+
+// A headless browser an agent's shell started is listed: the shell is not (shells), so the
+// browser must not be taken for a helper of it.
+func TestHeadlessBrowserFromAShell(t *testing.T) {
+	procs := map[int]*sys.Proc{
+		1: {PID: 1, Exe: "launchd"},
+		5: {PID: 5, PPID: 1, Exe: "/bin/zsh", Args: "/bin/zsh -c chromium --headless --dump-dom https://example.com", RSSMB: 5},
+		6: {PID: 6, PPID: 5, Exe: "/opt/homebrew/bin/chromium", Args: "chromium --headless --dump-dom https://example.com", RSSMB: 400},
+	}
+	noFootprint(t, nil)
+	rs := Processes(model.DefaultConfig(), procs)
+	if len(rs) != 1 || rs[0].ID != "browser:6" || rs[0].MemMB != 400 {
+		t.Fatalf("want the browser alone, got %d: %+v", len(rs), rs)
+	}
+}
+
+// Gradle and Kotlin daemons are JVMs; anything else that mentions them is not one.
+func TestDaemonsAreJava(t *testing.T) {
+	jdk := "/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home/bin/java"
+	procs := map[int]*sys.Proc{
+		1:  {PID: 1, Exe: "launchd"},
+		10: {PID: 10, PPID: 1, Exe: jdk, Args: "java -Xmx2g -cp gradle-launcher.jar org.gradle.launcher.daemon.bootstrap.GradleDaemon 8.10", RSSMB: 900},
+		11: {PID: 11, PPID: 1, Exe: jdk, Args: "java -cp kotlin-daemon.jar org.jetbrains.kotlin.daemon.KotlinCompileDaemon", RSSMB: 600},
+		20: {PID: 20, PPID: 1, Exe: "/usr/bin/grep", Args: "grep -r KotlinCompileDaemon .", RSSMB: 3},
+		21: {PID: 21, PPID: 1, Exe: "/opt/homebrew/bin/rg", Args: "rg org.gradle.launcher.daemon GradleDaemon", RSSMB: 3},
+	}
+	noFootprint(t, nil)
+	got := map[string]bool{}
+	for _, r := range Processes(model.DefaultConfig(), procs) {
+		got[r.ID] = true
+	}
+	if !got["gradle:10"] || !got["gradle:11"] || len(got) != 2 {
+		t.Fatalf("want the two JVM daemons only: %v", got)
 	}
 }
 
