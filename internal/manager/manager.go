@@ -78,7 +78,11 @@ type Manager struct {
 	// dockerStale: Docker did not answer, so dockerContainersMB is its last view, not a
 	// measurement: no Docker lease is credited with the VM's growth until it answers.
 	dockerStale bool
-	memAt       time.Time // when m.mem was read
+	// tickFrame is what the tick under way read, written to the trace once it holds mu
+	// (writeTick). Set and read only by the goroutine holding tickMu.
+	tickFrame *trace.Frame
+	tickRec   *trace.Writer // the writer it was read for: its process table is a delta from that one's last
+	memAt     time.Time     // when m.mem was read
 	// freshMem: a request for memory reads it again first when it is older than memFresh
 	// (live only: tests and replays bring their own readings).
 	freshMem        bool
@@ -432,21 +436,42 @@ func (m *Manager) HandleCtx(ctx context.Context, path string, peerPID int, req a
 
 // peekMem reads memory again while a tick is under way: what is available, not the swap rate,
 // whose samples are the ticks' own and would be taken out of order.
-func (m *Manager) peekMem() {
-	mem := sys.ReadMem()
-	if rec := m.recorder(); rec != nil {
-		rec.Write(trace.Frame{T: m.now(), Mem: &mem})
-	}
-	m.peekWith(mem)
-}
+// Whether it is taken is decided under mu, and only a reading taken is written to the trace, at
+// the time it was taken: a replay takes each one as it comes.
+func (m *Manager) peekMem() { m.peek(sys.ReadMem()) }
 
-// peekWith records a memory reading taken by peekMem (live, or from a trace).
-func (m *Manager) peekWith(mem sys.MemStats) {
-	mem.SwapUnread = true // not a swap sample (and not in a trace: set here, for live and replay)
+// peek is peekMem on what was read.
+func (m *Manager) peek(mem sys.MemStats) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.now().Sub(m.memAt) > memFresh {
-		m.takeMem(mem, m.now())
+	now := m.now()
+	if now.Sub(m.memAt) <= memFresh {
+		return // a tick took a fresher one meanwhile
+	}
+	if rec := m.recorder(); rec != nil {
+		rec.Write(trace.Frame{T: now, Mem: &mem})
+	}
+	m.peekWith(mem, now)
+}
+
+// peekWith takes a memory reading peekMem took (live, or from a trace). Must hold mu.
+func (m *Manager) peekWith(mem sys.MemStats, now time.Time) {
+	mem.SwapUnread = true // not a swap sample (and not in a trace: set here, for live and replay)
+	m.takeMem(mem, now)
+}
+
+// writeTick writes the frame of the tick under way, once it holds mu: what the tick read goes
+// into the trace in the order it is taken, after any reading a request took meanwhile (peekMem).
+// Must hold mu.
+func (m *Manager) writeTick(now time.Time) {
+	f := m.tickFrame
+	if f == nil {
+		return
+	}
+	m.tickFrame = nil
+	if rec := m.recorder(); rec != nil && rec == m.tickRec {
+		f.T = now
+		rec.Write(*f)
 	}
 }
 
@@ -464,11 +489,12 @@ var readOnly = map[string]bool{"/status": true, "/whoami": true, "/approval": tr
 
 // handleFacts serves a request from a caller already traced (live, or from a trace).
 func (m *Manager) handleFacts(ctx context.Context, path string, h handler, facts facts, req api.Req) (any, error) {
+	m.mu.Lock()
+	// Written under mu: requests, ticks and readings go into the trace in the order they are taken.
 	if rec := m.recorder(); rec != nil && !readOnly[path] && !strings.HasPrefix(path, "/vault/") {
 		rec.Write(trace.Frame{T: m.now(), Request: &trace.Request{Path: path, Req: req, Facts: trace.Facts{
 			PID: facts.pid, AgentPID: facts.agentPID, Agent: facts.agent, GUI: facts.gui, App: facts.app, AppPID: facts.appPID, ViaApp: facts.viaApp}}})
 	}
-	m.mu.Lock()
 	caller := m.resolve(facts, &req)
 	resp, effects, err := h(caller, req)
 	var ea *errApproval

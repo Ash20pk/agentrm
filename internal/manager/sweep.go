@@ -141,7 +141,8 @@ func (m *Manager) fastTick() {
 	mem := sys.ReadMem()
 	if rec := m.recorder(); rec != nil {
 		now := m.now()
-		rec.Write(trace.Frame{T: now, Fast: &trace.Sweep{Procs: rec.Procs(now, procs, m.traceOwner, m.footprint), Mem: mem}})
+		m.tickRec = rec
+		m.tickFrame = &trace.Frame{T: now, Fast: &trace.Sweep{Procs: rec.Procs(now, procs, m.traceOwner, m.footprint), Mem: mem}}
 	}
 	m.fastWith(procs, mem)
 }
@@ -150,6 +151,7 @@ func (m *Manager) fastTick() {
 func (m *Manager) fastWith(procs map[int]*sys.Proc, mem sys.MemStats) {
 	m.mu.Lock()
 	now := m.now()
+	m.writeTick(now)
 	m.takeMem(mem, now)
 	if procs != nil {
 		sys.Procs.Set(procs)
@@ -292,14 +294,16 @@ func (m *Manager) recordSweep(procs map[int]*sys.Proc, found discover.Result, me
 	for src, err := range found.Failed {
 		failed[src] = err.Error()
 	}
-	rec.Write(trace.Frame{T: now, Sweep: &trace.Sweep{Procs: rec.Procs(now, procs, m.traceOwner, m.footprint),
-		Found: found.Resources, Failed: failed, Mem: mem, Est: est, Cwds: cwds}})
+	m.tickRec = rec
+	m.tickFrame = &trace.Frame{T: now, Sweep: &trace.Sweep{Procs: rec.Procs(now, procs, m.traceOwner, m.footprint),
+		Found: found.Resources, Failed: failed, Mem: mem, Est: est, Cwds: cwds}} // written by sweepWith (writeTick)
 }
 
 // sweepWith is a full sweep on what was read (live, or from a trace).
 func (m *Manager) sweepWith(procs map[int]*sys.Proc, found discover.Result, mem sys.MemStats, est map[string]bool, cwds map[int]string) {
 	m.mu.Lock()
 	now := m.now()
+	m.writeTick(now)
 	m.takeMem(mem, now)
 	m.lastSweep = now
 	if procs != nil {

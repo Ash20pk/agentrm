@@ -230,27 +230,39 @@ func (m *Manager) seedFreed() {
 		return
 	}
 	for _, s := range m.st.Stopped {
-		if s.FreedMB == 0 {
-			s.FreedMB = s.Resource.MemMB * m.returnRatio(s.Resource.Source)
-		}
+		s.FreedMB = m.stopFreedMB(s)
 		m.st.Freed = append(m.st.Freed, model.FreedMark{At: s.StoppedAt, MB: s.FreedMB, ID: s.Resource.ID})
 	}
 }
 
+// stopFreedMB is what a stop gave back: as recorded, else (a stop recorded before that was kept)
+// worked out from what it held.
+func (m *Manager) stopFreedMB(s *model.Stopped) float64 {
+	if s.FreedMB != 0 {
+		return s.FreedMB
+	}
+	return s.Resource.MemMB * m.returnRatio(s.Resource.Source)
+}
+
 // unfree takes a restored stop out of the freed totals: it gave nothing back in the end.
-// Its own entry is taken out; else one written before entries had IDs, if its time and what it
-// gave back are this stop's (stops made together share a time).
+// Its own entry is taken out; else, of those written before entries had IDs at its time (stops
+// made together share a time), the one closest to what it gave back. A stop seeded into the
+// totals before it kept what it gave back has that worked out the same way again.
 func (m *Manager) unfree(s *model.Stopped) {
-	for _, legacy := range []bool{false, true} {
-		for i, f := range m.st.Freed {
-			if !f.At.Equal(s.StoppedAt) {
-				continue
-			}
-			if (!legacy && f.ID == s.Resource.ID) || (legacy && f.ID == "" && math.Abs(f.MB-s.FreedMB) < 0.5) {
-				m.st.Freed = append(m.st.Freed[:i], m.st.Freed[i+1:]...)
-				return
-			}
+	for i, f := range m.st.Freed {
+		if f.At.Equal(s.StoppedAt) && f.ID == s.Resource.ID {
+			m.st.Freed = append(m.st.Freed[:i], m.st.Freed[i+1:]...)
+			return
 		}
+	}
+	want, best := m.stopFreedMB(s), -1
+	for i, f := range m.st.Freed {
+		if f.At.Equal(s.StoppedAt) && f.ID == "" && (best < 0 || math.Abs(f.MB-want) < math.Abs(m.st.Freed[best].MB-want)) {
+			best = i
+		}
+	}
+	if best >= 0 {
+		m.st.Freed = append(m.st.Freed[:best], m.st.Freed[best+1:]...)
 	}
 }
 

@@ -469,7 +469,8 @@ func (m *Manager) updateFootprints(procs map[int]*sys.Proc, now time.Time) {
 // charged once. Leases of the same kind are measured as one, since an agent that asks for more
 // gets a second lease for the difference and its build's processes cannot say which they belong
 // to: what they use together fills the oldest lease's promise first, and the newest takes the
-// rest. Must hold mu.
+// rest. They are judged together too: a session is flagged for going well over what it asked
+// for in all, not because its top-up took the excess. Must hold mu.
 func (m *Manager) measureBuilds(ls []*model.Lease, tree []*sys.Proc, bound map[int]bool, now time.Time) {
 	oldestFirst(ls)
 	var wins [][2]time.Time // each lease's, from its grant to the session's next one
@@ -481,6 +482,7 @@ func (m *Manager) measureBuilds(ls []*model.Lease, tree []*sys.Proc, bound map[i
 		wins = append(wins, [2]time.Time{l.Created.Add(-2 * time.Second), to})
 	}
 	left := m.usedIn(tree, wins, bound)
+	usedMB, askedGB := 0.0, 0.0
 	for i, l := range ls {
 		l.InsideMB = m.daemonGrowthMB(l)
 		own := left
@@ -494,8 +496,10 @@ func (m *Manager) measureBuilds(ls []*model.Lease, tree []*sys.Proc, bound map[i
 			peak = l.UsedMB
 		}
 		l.PeakMB = max(l.PeakMB, peak)
-		m.checkOverrun(l, now)
+		usedMB += peak
+		askedGB += l.MemGB
 	}
+	m.checkOverrunOf(ls, usedMB, askedGB, now)
 }
 
 func cmdSuffix(c string) string {
@@ -534,24 +538,32 @@ func inferred(l *model.Lease) bool {
 // runs in Docker's VM.
 //
 // A host cannot say whose work grew it, so its growth is handed out once: oldest lease first,
-// none given more than it saw grow since its own grant, and in all no more than the most any of
-// them saw. A lease granted later does not change what an older one is given, and one released
-// does not make another's jump.
+// none given more than it saw grow since its own grant or more than it was promised, and in all
+// no more than the most any of them saw. A lease granted later does not change what an older one
+// is given, and one released does not make another's jump. Growth is real memory either way (it
+// is in what is available); what is handed out only decides whose promise it fills.
 //
-// For Docker, what a lease is given is capped at its promise, and only ever makes less of the
-// promise held back (materialisedMB): the VM grows for reasons that have nothing to do with the
-// lease (someone else's pull, an unleased build, memory its containers let go of), so its growth
-// never flags an overrun, distrusts a session, teaches an estimate or takes a lease up. A wrong
-// reading can make headroom off by the promise at most.
+// What is left once every promise is full is someone's overrun. For a Gradle daemon it goes to
+// the newest lease, when all the leases on the daemon are one session's (they are judged together:
+// checkOverrun): a build that goes well over is caught. When two sessions share the daemon, whose
+// it is cannot be told, and it is nobody's: one session's build never gets another flagged.
+//
+// For Docker, what a lease is given only ever makes less of the promise held back
+// (materialisedMB): the VM grows for reasons that have nothing to do with the lease (someone
+// else's pull, an unleased build, memory its containers let go of), so its growth never flags an
+// overrun, distrusts a session, teaches an estimate or takes a lease up. A wrong reading can make
+// headroom off by the promise at most.
 func (m *Manager) daemonGrowthMB(l *model.Lease) float64 {
 	host := daemonHost(l.Kind)
 	if host == "" || len(l.Resources) > 0 {
 		return 0
 	}
 	var ls []*model.Lease
+	one := true // all the leases on the host are one session's
 	for _, o := range m.st.Leases {
 		if daemonHost(o.Kind) == host && len(o.Resources) == 0 {
 			ls = append(ls, o)
+			one = one && o.Session == l.Session
 		}
 	}
 	oldestFirst(ls)
@@ -559,17 +571,18 @@ func (m *Manager) daemonGrowthMB(l *model.Lease) float64 {
 	for _, o := range ls {
 		pool = max(pool, m.hostGrowthMB(o))
 	}
+	given := 0.0
 	for _, o := range ls {
-		c := min(m.hostGrowthMB(o), pool)
-		if host == model.RKDockerVM {
-			c = min(c, o.MemGB*1024)
-		}
+		c := min(m.hostGrowthMB(o), pool, o.MemGB*1024)
 		pool -= c
 		if o == l {
-			return c
+			given = c
 		}
 	}
-	return 0
+	if host != model.RKDockerVM && one && l == ls[len(ls)-1] {
+		given += pool
+	}
+	return given
 }
 
 // hostGrowthMB is what a lease's host grew by since the lease was granted.

@@ -296,7 +296,9 @@ func replayAgentRM(path string, truth *usage, o ReplayOptions) (*ReplayReport, e
 			lastProcs = procs
 			m.fastWith(procs, f.Fast.Mem)
 		case f.Mem != nil:
-			m.peekWith(*f.Mem)
+			m.mu.Lock()
+			m.peekWith(*f.Mem, m.now())
+			m.mu.Unlock()
 		case f.Request != nil:
 			r := f.Request
 			req := r.Req

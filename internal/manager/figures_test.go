@@ -2,15 +2,18 @@ package manager
 
 import (
 	"errors"
+	"fmt"
 	"math"
 	"regexp"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	"agentrm/internal/discover"
 	"agentrm/internal/model"
 	"agentrm/internal/sys"
+	"agentrm/internal/trace"
 )
 
 // The swap rate is over a minute. Measured over one 2-second gap, 20 MB read as 600 MB a minute,
@@ -703,12 +706,12 @@ func TestPeekedMemoryIsNotASwapSample(t *testing.T) {
 	m, c := newTest(t, 8)
 	m.takeMem(sys.MemStats{AvailableMB: 1000, Swapouts: 500}, c.Now())
 	c.Add(2 * time.Second)
-	m.peekWith(sys.MemStats{AvailableMB: 9000, Swapouts: 100})
+	m.peek(sys.MemStats{AvailableMB: 9000, Swapouts: 100})
 	if m.mem.AvailableMB != 1000 {
 		t.Fatal("a fresh reading was replaced")
 	}
 	c.Add(10 * time.Second)
-	m.peekWith(sys.MemStats{AvailableMB: 6000, Swapouts: 900})
+	m.peek(sys.MemStats{AvailableMB: 6000, Swapouts: 900})
 	if m.mem.AvailableMB != 6000 {
 		t.Fatalf("available %.0f, want the peeked 6000", m.mem.AvailableMB)
 	}
@@ -724,13 +727,16 @@ func TestNoVMCreditWhileDockerIsSilent(t *testing.T) {
 	m.learnSession(100, "s", "claude")
 	procs := map[int]*sys.Proc{100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: c.Now().Add(-time.Hour)}}
 	sweep := func(full float64, fail bool) float64 {
-		res := discover.Result{Resources: []*model.Resource{{ID: "docker-vm", Kind: model.RKDockerVM, Source: "procs", MemMB: full}}}
-		if fail {
-			res.Failed = map[string]error{discover.SrcDocker: errors.New("hung")}
+		// The sweep's own order: leases are measured before what Docker reported is merged, so
+		// a reading is used from the next sweep on. Two sweeps on the same reading.
+		for range 2 {
+			res := discover.Result{Resources: []*model.Resource{{ID: "docker-vm", Kind: model.RKDockerVM, Source: "procs", MemMB: full}}}
+			if fail {
+				res.Failed = map[string]error{discover.SrcDocker: errors.New("hung")}
+			}
+			c.Add(30 * time.Second)
+			m.sweepWith(procs, res, m.mem, nil, nil)
 		}
-		c.Add(30 * time.Second)
-		m.merge(res, procs, nil, c.Now())
-		m.updateFootprints(procs, c.Now())
 		if l := m.findLease("s", model.KDockerBuild); l != nil {
 			return l.InsideMB
 		}
@@ -776,5 +782,184 @@ func TestRestartIsOfferedWhenItWouldBeAccepted(t *testing.T) {
 	m.checkOrphans(c.Now())
 	if vm.RestartBlocked == "" {
 		t.Fatal("a container runs in it, but Restart is offered")
+	}
+}
+
+// Two sessions on one Gradle daemon: its growth fills each lease up to its promise and no
+// further. Handed out oldest first with no cap, a 1 GB lease was charged another session's 3 GB
+// build, flagged as an overrun and its session distrusted.
+func TestGradleGrowthIsNotChargedAcrossSessions(t *testing.T) {
+	m, c := newTest(t, 16)
+	m.st.Resources["gradle:50"] = &model.Resource{ID: "gradle:50", Kind: model.RKGradle, MemMB: 1000}
+	m.learnSession(100, "x", "claude")
+	m.learnSession(200, "y", "claude")
+	procs := map[int]*sys.Proc{
+		100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: c.Now().Add(-time.Hour)},
+		200: {PID: 200, PPID: 1, Exe: "claude", Args: "claude", Start: c.Now().Add(-time.Hour)},
+	}
+	acquire(t, m, agent("x"), model.KGradle, 1)
+	c.Add(time.Minute)
+	acquire(t, m, agent("y"), model.KGradle, 4)
+	x, y := m.findLease("x", model.KGradle), m.findLease("y", model.KGradle)
+	m.st.Resources["gradle:50"].MemMB = 4000 // y's build
+	c.Add(time.Minute)
+	m.updateFootprints(procs, c.Now())
+	if x.InsideMB > 1024 || x.Overran || c.Now().Before(m.st.Sessions["x"].DistrustUntil) {
+		t.Fatalf("x charged %.0f MB of y's build (overran %v)", x.InsideMB, x.Overran)
+	}
+	if x.InsideMB+y.InsideMB != 3000 {
+		t.Fatalf("x %.0f + y %.0f, want the 3000 MB it grew", x.InsideMB, y.InsideMB)
+	}
+	// Well beyond both promises: whose it is cannot be told, and neither is flagged.
+	m.st.Resources["gradle:50"].MemMB = 12000
+	c.Add(time.Minute)
+	m.updateFootprints(procs, c.Now())
+	if x.Overran || y.Overran {
+		t.Fatal("flagged for growth another session may have caused")
+	}
+}
+
+// One session on the daemon: growth beyond its promise is its build's, and caught.
+func TestOwnGradleOverrunIsCaught(t *testing.T) {
+	m, c := newTest(t, 16)
+	m.st.Resources["gradle:50"] = &model.Resource{ID: "gradle:50", Kind: model.RKGradle, MemMB: 1000}
+	m.learnSession(100, "s", "claude")
+	procs := map[int]*sys.Proc{100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: c.Now().Add(-time.Hour)}}
+	acquire(t, m, agent("s"), model.KGradle, 2)
+	l := m.findLease("s", model.KGradle)
+	m.st.Resources["gradle:50"].MemMB = 7000
+	c.Add(time.Minute)
+	m.updateFootprints(procs, c.Now())
+	if l.InsideMB != 6000 || !l.Overran {
+		t.Fatalf("6 GB on a 2 GB lease: charged %.0f, overran %v", l.InsideMB, l.Overran)
+	}
+}
+
+// A top-up is judged with the lease it tops up: 5.2 GB used on 4.5 GB asked for in all is not
+// an overrun, though the 0.5 GB lease holds all of the excess; 8 GB is.
+func TestTopUpIsJudgedWithItsLease(t *testing.T) {
+	m, c := newTest(t, 16)
+	t0 := c.Now()
+	fp := 5.2 * 1024
+	m.footprint = func(pid int) (float64, bool) {
+		if pid == 102 {
+			return fp, true
+		}
+		return 0, false
+	}
+	m.learnSession(100, "s", "claude")
+	acquire(t, m, agent("s"), model.KCargoBuild, 4)
+	c.Add(time.Minute)
+	if r := acquire(t, m, agent("s"), model.KCargoBuild, 4.5); !r.Granted || r.Reused {
+		t.Fatalf("asking for 4.5: %+v", r)
+	}
+	procs := map[int]*sys.Proc{
+		100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: t0.Add(-time.Hour)},
+		102: {PID: 102, PPID: 100, Exe: "rustc", Args: "rustc", Start: t0.Add(10 * time.Second)},
+	}
+	c.Add(time.Minute)
+	m.updateFootprints(procs, c.Now())
+	if c.Now().Before(m.st.Sessions["s"].DistrustUntil) {
+		t.Fatal("distrusted for 16% over what it asked for in all")
+	}
+	fp = 8 * 1024
+	c.Add(time.Minute)
+	m.updateFootprints(procs, c.Now())
+	until := m.st.Sessions["s"].DistrustUntil
+	if !c.Now().Before(until) {
+		t.Fatal("8 GB on 4.5 GB asked for: not caught")
+	}
+	c.Add(30 * time.Minute)
+	m.updateFootprints(procs, c.Now())
+	if !m.st.Sessions["s"].DistrustUntil.Equal(until) {
+		t.Fatal("flagged again for the same overrun")
+	}
+}
+
+// What AgentRM charges a build that declared nothing is its own estimate: going over it is not
+// the agent's doing, and no one is flagged.
+func TestUndeclaredBuildIsNotFlagged(t *testing.T) {
+	m, c := newTest(t, 16)
+	t0 := c.Now()
+	m.footprint = func(pid int) (float64, bool) { return 9000, pid == 102 }
+	m.learnSession(100, "s", "claude")
+	acquire(t, m, agent("s"), model.KCargoBuild, 0)
+	procs := map[int]*sys.Proc{
+		100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: t0.Add(-time.Hour)},
+		102: {PID: 102, PPID: 100, Exe: "rustc", Args: "rustc", Start: t0.Add(10 * time.Second)},
+	}
+	c.Add(time.Minute)
+	m.updateFootprints(procs, c.Now())
+	if l := m.findLease("s", model.KCargoBuild); l == nil || l.Overran || c.Now().Before(m.st.Sessions["s"].DistrustUntil) {
+		t.Fatal("flagged for going over AgentRM's own estimate")
+	}
+}
+
+// Recording turned off and on while a tick read its inputs: its process table is a delta from
+// the old writer's, and is not written to the new one.
+func TestTickIsWrittenOnlyToItsOwnTrace(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.recP.Store(trace.NewWriter(t.TempDir(), 36500))
+	m.recordSweep(nil, discover.Result{}, m.mem, nil, nil)
+	m.recP.Swap(nil).Close()
+	dir := t.TempDir()
+	m.recP.Store(trace.NewWriter(dir, 36500))
+	c.Add(time.Second)
+	m.sweepWith(nil, discover.Result{}, m.mem, nil, nil)
+	m.recorder().Close()
+	if r, err := trace.Open(dir); err == nil {
+		if f, err := r.Next(); err == nil && f.Sweep != nil {
+			t.Fatal("the old writer's sweep was written to the new trace")
+		}
+	}
+}
+
+// A memory reading taken for a request while a tick runs goes into the trace in the order it was
+// taken, and only when it was taken: a replay takes what the daemon took, in the same order.
+func TestPeekIsTracedInOrder(t *testing.T) {
+	dir := t.TempDir()
+	m, c := newTest(t, 8)
+	m.recP.Store(trace.NewWriter(dir, 36500))
+	mem := m.mem
+	m.takeMem(mem, c.Now())
+	m.recordSweep(nil, discover.Result{}, mem, nil, nil) // a sweep read its inputs...
+	m.peek(sys.MemStats{AvailableMB: 3000})              // ...the last reading is fresh: not taken
+	c.Add(10 * time.Second)
+	m.peek(sys.MemStats{AvailableMB: 2000}) // ...a request's reading, taken
+	m.sweepWith(nil, discover.Result{}, mem, nil, nil)
+	m.recorder().Close()
+	r, err := trace.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for {
+		f, err := r.Next()
+		if err != nil {
+			break
+		}
+		switch {
+		case f.Mem != nil:
+			got = append(got, fmt.Sprintf("mem %.0f", f.Mem.AvailableMB))
+		case f.Sweep != nil:
+			got = append(got, "sweep")
+		}
+	}
+	if strings.Join(got, ", ") != "mem 2000, sweep" {
+		t.Fatalf("trace %v, want the taken reading, then the sweep", got)
+	}
+}
+
+// A stop seeded into the freed totals before stops kept what they gave back: restoring it takes
+// its entry out.
+func TestRestoreTakesOutASeededEntry(t *testing.T) {
+	m, c := newTest(t, 8)
+	at := c.Now().Add(-time.Hour)
+	a := &model.Stopped{Resource: model.Resource{ID: "a", MemMB: 3000, Source: "procs"}, StoppedAt: at}
+	k := m.returnRatio("procs")
+	m.st.Freed = []model.FreedMark{{At: at, MB: 3000 * k}, {At: at, MB: 500 * k}}
+	m.unfree(a)
+	if len(m.st.Freed) != 1 || m.st.Freed[0].MB != 500*k {
+		t.Fatalf("left %+v, want b's stop", m.st.Freed)
 	}
 }

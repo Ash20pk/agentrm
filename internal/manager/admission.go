@@ -543,22 +543,45 @@ func projectOf(cwd string) string {
 
 // checkOverrun flags a lease that took far more than its holder declared.
 func (m *Manager) checkOverrun(l *model.Lease, now time.Time) {
-	if !l.Declared || l.Overran || l.PeakMB <= 1.5*l.MemGB*1024+256 {
+	m.checkOverrunOf([]*model.Lease{l}, l.PeakMB, l.MemGB, now)
+}
+
+// checkOverrunOf judges a session's leases of one kind together (oldest first, as measureBuilds
+// orders them), on what they use and asked for in all: an agent that asks for more gets a lease
+// for the difference, and which of them its build's memory is in cannot be told. Only leases
+// that all declared their need are judged; the newest is told.
+func (m *Manager) checkOverrunOf(ls []*model.Lease, usedMB, askedGB float64, now time.Time) {
+	for _, o := range ls {
+		if !o.Declared || o.Overran {
+			return
+		}
+	}
+	if len(ls) == 0 || usedMB <= 1.5*askedGB*1024+256 {
 		return
 	}
-	l.Overran = true
+	for _, o := range ls {
+		o.Overran = true
+	}
+	l := ls[len(ls)-1]
 	if s := m.st.Sessions[l.Session]; s != nil {
 		s.DistrustUntil = now.Add(time.Hour)
 	}
-	m.event("OVERRAN lease %s (%s) declared %.1f GB and used %.1f GB. Memory figures from %s are ignored until %s.",
-		l.ID, l.Kind, l.MemGB, l.PeakMB/1024, short(l.Session), now.Add(time.Hour).Format("15:04"))
+	which, what := "lease "+l.ID, "lease "+l.ID
+	if len(ls) > 1 {
+		which = fmt.Sprintf("leases (%d, newest %s)", len(ls), l.ID)
+		what = fmt.Sprintf("leases (%d, newest %s) asked for %.1f GB in all and are", len(ls), l.ID, askedGB)
+	} else {
+		what += fmt.Sprintf(" asked for %.1f GB and is", askedGB)
+	}
+	m.event("OVERRAN %s (%s) declared %.1f GB and used %.1f GB. Memory figures from %s are ignored until %s.",
+		which, l.Kind, askedGB, usedMB/1024, short(l.Session), now.Add(time.Hour).Format("15:04"))
 	// macOS cannot cap a process's memory, so the lease cannot stop it; the agent is told now,
 	// while it can still act, and its real use already counts against what others are granted.
 	m.st.Questions["overran:"+l.ID] = &model.Question{Created: now, For: l.Session,
 		Delivered: map[string]bool{}, Answers: map[string]string{},
-		Text: fmt.Sprintf("[agentrm] Your %s lease %s asked for %.1f GB and is using %.1f GB. Until %s your requests are "+
+		Text: fmt.Sprintf("[agentrm] Your %s %s using %.1f GB. Until %s your requests are "+
 			"charged at least AgentRM's estimate. Next time ask for about %.1f GB (agentrm acquire --kind %s --mem %.1f).",
-			l.Kind, l.ID, l.MemGB, l.PeakMB/1024, now.Add(time.Hour).Format("15:04"), suggestGB(l.PeakMB, l.MemGB), l.Kind, suggestGB(l.PeakMB, l.MemGB))}
+			l.Kind, what, usedMB/1024, now.Add(time.Hour).Format("15:04"), suggestGB(usedMB, askedGB), l.Kind, suggestGB(usedMB, askedGB))}
 }
 
 // learn folds a finished lease's peak into the estimates for its kind and its project.
