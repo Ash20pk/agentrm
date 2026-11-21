@@ -147,9 +147,9 @@ extension Store {
                     detail += would ? ", would \(verb) \(at < Date() ? "now" : Fmt.rel(at))" : ", \(verb)s \(at < Date() ? "now" : Fmt.rel(at))"
                 }
                 return Item(id: r.id, name: r.name, detail: detail, mb: r.mem_mb, lamp: lamp, resource: r,
-                            // Restart offered only when the daemon would consider it (nothing runs in
-                            // it): otherwise it is refused.
-                            actions: r.pinned == true ? [.unpin] : (r.orphan_since != nil ? [.stop] : []),
+                            // Restart offered exactly when the daemon would accept it (nothing runs in
+                            // it), whether or not it would restart it on its own.
+                            actions: r.pinned == true ? [.unpin] : (r.restart_blocked == nil ? [.stop] : []),
                             deadline: step == "stop" && !would && r.pinned != true ? next : nil, window: window, step: step)
             }
             return Item(id: r.id, name: r.name, detail: "\(Kind.name(r.kind)), pinned by you", mb: r.mem_mb,

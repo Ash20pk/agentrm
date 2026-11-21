@@ -580,7 +580,7 @@ func (m *Manager) hostGrowthMB(l *model.Lease) float64 {
 	}
 	if daemonHost(l.Kind) == model.RKDockerVM {
 		base, ok := b[dockerOwnKey]
-		if !ok || b[dockerRebaseKey] == 1 || !m.dockerMeasured {
+		if !ok || b[dockerRebaseKey] == 1 || !m.dockerMeasured || m.dockerStale {
 			return 0
 		}
 		// Beyond the most its containers held since the base: a VM that kept what stopped

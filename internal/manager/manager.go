@@ -74,8 +74,11 @@ type Manager struct {
 	// Docker's VM footprint and what its containers hold, as of the last sweep: how much of a
 	// Docker lease's promise is no longer held back (daemonGrowthMB).
 	dockerFullMB, dockerContainersMB float64
-	dockerMeasured                   bool      // the last sweep measured the VM
-	memAt                            time.Time // when m.mem was read
+	dockerMeasured                   bool // the last sweep measured the VM
+	// dockerStale: Docker did not answer, so dockerContainersMB is its last view, not a
+	// measurement: no Docker lease is credited with the VM's growth until it answers.
+	dockerStale bool
+	memAt       time.Time // when m.mem was read
 	// freshMem: a request for memory reads it again first when it is older than memFresh
 	// (live only: tests and replays bring their own readings).
 	freshMem        bool
@@ -414,15 +417,37 @@ func (m *Manager) HandleCtx(ctx context.Context, path string, peerPID int, req a
 		// Between sweeps (30 s when idle) memory can change by gigabytes: a request is judged
 		// on a reading a few seconds old at most. A fast tick reads and records it as usual.
 		// Never waited for: while a sweep or another request's tick is under way (a sweep can
-		// take a minute running its stops), the request is judged on what is known.
+		// take a minute running its stops), memory alone is read again (peekMem).
 		if m.tickMu.TryLock() {
 			if m.memStale() {
 				m.fastTick()
 			}
 			m.tickMu.Unlock()
+		} else {
+			m.peekMem()
 		}
 	}
 	return m.handleFacts(ctx, path, h, facts, req)
+}
+
+// peekMem reads memory again while a tick is under way: what is available, not the swap rate,
+// whose samples are the ticks' own and would be taken out of order.
+func (m *Manager) peekMem() {
+	mem := sys.ReadMem()
+	if rec := m.recorder(); rec != nil {
+		rec.Write(trace.Frame{T: m.now(), Mem: &mem})
+	}
+	m.peekWith(mem)
+}
+
+// peekWith records a memory reading taken by peekMem (live, or from a trace).
+func (m *Manager) peekWith(mem sys.MemStats) {
+	mem.SwapUnread = true // not a swap sample (and not in a trace: set here, for live and replay)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.now().Sub(m.memAt) > memFresh {
+		m.takeMem(mem, m.now())
+	}
 }
 
 // memFresh is how old a memory reading a request for memory may be judged on.

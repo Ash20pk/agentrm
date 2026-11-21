@@ -370,6 +370,7 @@ func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[
 		}
 	}
 	m.dockerFullMB, m.dockerContainersMB, m.dockerMeasured = 0, containers, false
+	m.dockerStale = found.Failed[discover.SrcDocker] != nil
 	for _, r := range found.Resources {
 		if r.Kind == model.RKDockerVM {
 			m.dockerFullMB = r.MemMB // its footprint, before it is credited

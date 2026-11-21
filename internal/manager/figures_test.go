@@ -695,3 +695,86 @@ func TestRecordedLeaseDoesNotCutABuild(t *testing.T) {
 		t.Fatalf("build charged %.0f MB, want its rustc's 900", bld.UsedMB)
 	}
 }
+
+// A memory reading taken for a request while a sweep runs counts for what is available, not as
+// a swap sample (taken out of the ticks' order, it upset the rate), and only when the last
+// reading is old.
+func TestPeekedMemoryIsNotASwapSample(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.takeMem(sys.MemStats{AvailableMB: 1000, Swapouts: 500}, c.Now())
+	c.Add(2 * time.Second)
+	m.peekWith(sys.MemStats{AvailableMB: 9000, Swapouts: 100})
+	if m.mem.AvailableMB != 1000 {
+		t.Fatal("a fresh reading was replaced")
+	}
+	c.Add(10 * time.Second)
+	m.peekWith(sys.MemStats{AvailableMB: 6000, Swapouts: 900})
+	if m.mem.AvailableMB != 6000 {
+		t.Fatalf("available %.0f, want the peeked 6000", m.mem.AvailableMB)
+	}
+	if n := len(m.swapSamples); n != 1 {
+		t.Fatalf("%d swap samples, want only the tick's", n)
+	}
+}
+
+// Docker not answering: the containers' figure is its last view, so no Docker lease is credited
+// with the VM's growth until it answers.
+func TestNoVMCreditWhileDockerIsSilent(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.learnSession(100, "s", "claude")
+	procs := map[int]*sys.Proc{100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: c.Now().Add(-time.Hour)}}
+	sweep := func(full float64, fail bool) float64 {
+		res := discover.Result{Resources: []*model.Resource{{ID: "docker-vm", Kind: model.RKDockerVM, Source: "procs", MemMB: full}}}
+		if fail {
+			res.Failed = map[string]error{discover.SrcDocker: errors.New("hung")}
+		}
+		c.Add(30 * time.Second)
+		m.merge(res, procs, nil, c.Now())
+		m.updateFootprints(procs, c.Now())
+		if l := m.findLease("s", model.KDockerBuild); l != nil {
+			return l.InsideMB
+		}
+		return -1
+	}
+	sweep(2000, false)
+	acquire(t, m, agent("s"), model.KDockerBuild, 2)
+	if u := sweep(3000, false); u != 1000 {
+		t.Fatalf("growth %.0f, want 1000", u)
+	}
+	if u := sweep(3500, true); u != 0 {
+		t.Fatalf("credited %.0f MB while Docker was not answering", u)
+	}
+	if u := sweep(3500, false); u != 1500 {
+		t.Fatalf("Docker answered again: %.0f, want 1500 since the grant", u)
+	}
+}
+
+// Restoring a stop made together with others, recorded before entries had IDs: the entry taken
+// out is the one with what this stop gave back.
+func TestRestoreTakesOutItsOwnLegacyEntry(t *testing.T) {
+	m, c := newTest(t, 8)
+	at := c.Now().Add(-time.Hour)
+	m.st.Freed = []model.FreedMark{{At: at, MB: 3000}, {At: at, MB: 500}}
+	m.unfree(&model.Stopped{Resource: model.Resource{ID: "b"}, StoppedAt: at, FreedMB: 500})
+	if len(m.st.Freed) != 1 || m.st.Freed[0].MB != 3000 {
+		t.Fatalf("left %+v, want the 3000 MB stop", m.st.Freed)
+	}
+}
+
+// The app offers Restart exactly when the daemon would accept one: a VM restarted a minute ago
+// is not restarted on AgentRM's own, but you may; one with a container running is refused.
+func TestRestartIsOfferedWhenItWouldBeAccepted(t *testing.T) {
+	m, c := newTest(t, 8)
+	vm := &model.Resource{ID: "docker-vm", Kind: model.RKDockerVM, Name: "Docker", MemMB: 2000, Source: "procs", FirstSeen: c.Now()}
+	m.st.Resources[vm.ID] = vm
+	m.restartedAt[vm.ID] = &restartMark{at: c.Now().Add(-time.Minute), sampled: true}
+	m.checkOrphans(c.Now())
+	if vm.OrphanSince != nil || vm.RestartBlocked != "" {
+		t.Fatalf("just restarted: orphan %v, blocked %q", vm.OrphanSince, vm.RestartBlocked)
+	}
+	addRes(m, "compose:app", model.RKContainers, 500, "")
+	m.checkOrphans(c.Now())
+	if vm.RestartBlocked == "" {
+		t.Fatal("a container runs in it, but Restart is offered")
+	}
+}

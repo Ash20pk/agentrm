@@ -76,6 +76,8 @@ struct Resource: Codable, Identifiable {
     var owner_gone_at: Date?
     var first_seen: Date?
     var ask_only: Bool?
+    /// Why it could not be restarted now (something runs in it); nil: Restart is accepted.
+    var restart_blocked: String?
     var pid: Int?
     /// What the daemon will do next if nothing changes ("pause" or "stop"), when, and since when
     /// it has been waiting; next_dry: in dry run, it only would. Nil: nothing is coming.

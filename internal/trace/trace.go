@@ -73,11 +73,13 @@ type Request struct {
 }
 
 type Frame struct {
-	T       time.Time `json:"t"`
-	Sweep   *Sweep    `json:"sweep,omitempty"`
-	Fast    *Sweep    `json:"fast,omitempty"` // a fast tick: memory and processes only
-	Request *Request  `json:"req,omitempty"`
-	Exit    int       `json:"exit,omitempty"` // an agent PID the kernel said exited
+	T     time.Time `json:"t"`
+	Sweep *Sweep    `json:"sweep,omitempty"`
+	Fast  *Sweep    `json:"fast,omitempty"` // a fast tick: memory and processes only
+	// Mem: memory read again for a request while a tick was under way (peekMem).
+	Mem     *sys.MemStats `json:"mem,omitempty"`
+	Request *Request      `json:"req,omitempty"`
+	Exit    int           `json:"exit,omitempty"` // an agent PID the kernel said exited
 	// Decision: the live daemon decided to pause, stop or reclaim (replay checks it agrees).
 	Decision *model.Decision `json:"decision,omitempty"`
 	ExitTab  *Procs          `json:"exit_procs,omitempty"`

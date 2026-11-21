@@ -121,6 +121,9 @@ type Resource struct {
 	// last view, not the current one, and nothing is paused, stopped or counted on from it.
 	Unseen  *time.Time `json:"unseen,omitempty"`
 	Restart string     `json:"restart,omitempty"` // how to bring it back after a stop
+	// RestartBlocked says why you could not restart it now (something runs in it), for what
+	// comes back by itself: the app offers Restart exactly when it is "". Worked out each sweep.
+	RestartBlocked string `json:"restart_blocked,omitempty"`
 	// Owner is the session that started or last held it, once that session is gone, and
 	// OwnerGoneAt when it went: the collector's strongest evidence that nobody needs it.
 	Owner       string     `json:"owner,omitempty"`

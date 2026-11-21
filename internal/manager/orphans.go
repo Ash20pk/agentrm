@@ -30,6 +30,7 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 		if op := m.pending[r.ID]; op != "" {
 			t := now // under way
 			r.NextStep, r.NextAt, r.NextFrom = op, &t, &t
+			r.RestartBlocked = "a " + op + " is under way"
 			continue
 		}
 		if !blocked && r.Urgent {

@@ -82,6 +82,7 @@ func (m *Manager) dockerBusy(r *model.Resource, now time.Time) string {
 // off) or restart it (its level on). Must hold mu.
 func (m *Manager) checkSelfRestarting(r *model.Resource, now time.Time) *Effect {
 	busy := m.restartBlocker(r, now)
+	r.RestartBlocked = busy // what a restart you ask for is refused on (stopNow)
 	if busy == "" && r.MemMB < selfRestartMinMB {
 		busy = "too little to give back"
 	}

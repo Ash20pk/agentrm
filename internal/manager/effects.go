@@ -2,6 +2,7 @@ package manager
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -237,11 +238,18 @@ func (m *Manager) seedFreed() {
 }
 
 // unfree takes a restored stop out of the freed totals: it gave nothing back in the end.
+// Its own entry is taken out; else one written before entries had IDs, if its time and what it
+// gave back are this stop's (stops made together share a time).
 func (m *Manager) unfree(s *model.Stopped) {
-	for i, f := range m.st.Freed {
-		if (f.ID == s.Resource.ID || f.ID == "") && f.At.Equal(s.StoppedAt) { // "": written before IDs
-			m.st.Freed = append(m.st.Freed[:i], m.st.Freed[i+1:]...)
-			return
+	for _, legacy := range []bool{false, true} {
+		for i, f := range m.st.Freed {
+			if !f.At.Equal(s.StoppedAt) {
+				continue
+			}
+			if (!legacy && f.ID == s.Resource.ID) || (legacy && f.ID == "" && math.Abs(f.MB-s.FreedMB) < 0.5) {
+				m.st.Freed = append(m.st.Freed[:i], m.st.Freed[i+1:]...)
+				return
+			}
 		}
 	}
 }
