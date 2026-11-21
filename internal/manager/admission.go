@@ -240,8 +240,10 @@ func (m *Manager) howToWait(w *model.Waiter) string {
 // Must hold mu.
 func (m *Manager) grantWaiters(now time.Time, press bool) {
 	for _, w := range append([]*model.Waiter(nil), m.liveWaiters(now)...) {
-		if m.findLease(w.Session, w.Kind) != nil {
-			m.dropWaiter(w.Session, w.Kind) // it got one some other way
+		// It got one some other way. A request for more than the session held waits while the
+		// session holds what it held then; only more than that answers it.
+		if held := m.heldGB(w.Session, w.Kind); held > 0 && (w.HeldGB == 0 || held > w.HeldGB+0.01) {
+			m.dropWaiter(w.Session, w.Kind)
 			continue
 		}
 		if w.Retry || m.busy(w.Kind) != "" {

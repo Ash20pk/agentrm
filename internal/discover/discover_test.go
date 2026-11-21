@@ -94,6 +94,30 @@ func TestVMsCountTheirGuest(t *testing.T) {
 	}
 }
 
+// Two VMs started close together: each gets its own guest whatever order they are looked at in
+// (A at 0 s with its guest at 50 s, B at 40 s with its guest at 45 s).
+func TestVMGuestPairingIsGlobal(t *testing.T) {
+	t0 := time.Date(2026, 11, 18, 9, 0, 0, 0, time.UTC)
+	vz := "/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine"
+	procs := map[int]*sys.Proc{
+		1:  {PID: 1, Exe: "launchd"},
+		20: {PID: 20, PPID: 1, Exe: "/opt/homebrew/bin/limactl", Args: "/opt/homebrew/bin/limactl hostagent --pidfile x a", RSSMB: 10, Start: t0},
+		21: {PID: 21, PPID: 1, Exe: vz, RSSMB: 1000, Start: t0.Add(50 * time.Second)},
+		30: {PID: 30, PPID: 1, Exe: "/opt/homebrew/bin/limactl", Args: "/opt/homebrew/bin/limactl hostagent --pidfile y b", RSSMB: 10, Start: t0.Add(40 * time.Second)},
+		31: {PID: 31, PPID: 1, Exe: vz, RSSMB: 3000, Start: t0.Add(45 * time.Second)},
+	}
+	noFootprint(t, nil)
+	for i := 0; i < 50; i++ { // map order varies run to run
+		got := map[string]float64{}
+		for _, r := range Processes(model.DefaultConfig(), procs) {
+			got[r.ID] = r.MemMB
+		}
+		if got["vm:lima-a"] != 1010 || got["vm:lima-b"] != 3010 {
+			t.Fatalf("guests swapped: %v", got)
+		}
+	}
+}
+
 // A booted simulator is sized by its launchd_sim and what runs under it, not the estimate.
 func TestSimulatorsAreMeasured(t *testing.T) {
 	udid := "0F1E2D3C-AAAA-BBBB-CCCC-123456789ABC"

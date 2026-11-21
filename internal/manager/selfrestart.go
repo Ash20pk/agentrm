@@ -95,6 +95,14 @@ func (m *Manager) checkSelfRestarting(r *model.Resource, now time.Time) *Effect 
 	if r.OrphanSince == nil {
 		t := now
 		r.OrphanSince = &t
+	}
+	// The app's countdown: restarted (stopped, and it comes back) after the grace.
+	from, at := *r.OrphanSince, r.OrphanSince.Add(minutes(m.cfg.GraceMinutes))
+	if r.Urgent {
+		at = now
+	}
+	r.NextStep, r.NextFrom, r.NextAt, r.NextDry = "stop", &from, &at, m.dryFor(r) || m.failOpen(now) != ""
+	if r.OrphanSince.Equal(now) {
 		return nil
 	}
 	idle := now.Sub(*r.OrphanSince)

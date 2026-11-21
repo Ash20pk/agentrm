@@ -157,7 +157,7 @@ struct MenuView: View {
                     .font(Face.body(12)).foregroundStyle((s.mem.pressure_level ?? 1) >= 4 ? Lamp.nobody.textColor : Ink.dim)
             }
             .frame(maxWidth: .infinity, alignment: .leading).padding(10).panel()
-            Readout(label: "Swap", value: "\(swap)", unit: "MB/m", color: Double(swap) > s.swapLimit ? Lamp.nobody.color : Ink.text)
+            Readout(label: "Swap", value: "\(swap)", unit: "MB/m", color: (s.swap_rate_mb_min ?? 0) > s.swapLimit ? Lamp.nobody.color : Ink.text)
         }
         .fixedSize(horizontal: false, vertical: true)
     }
@@ -185,7 +185,8 @@ struct MenuView: View {
     private func stoppedPanel(_ stopped: [StoppedItem]) -> some View {
         let today = stopped.filter { Calendar.current.isDateInToday($0.stopped_at) }
         let shown = (today.isEmpty ? stopped : today).suffix(3).reversed()
-        let freed = store.status?.freed_today_mb ?? today.reduce(0) { $0 + $1.freed }
+        // Today's total, only under "Stopped today".
+        let freed = today.isEmpty ? 0 : (store.status?.freed_today_mb ?? today.reduce(0) { $0 + $1.freed })
         return VStack(spacing: 0) {
             HStack {
                 Silk(today.isEmpty ? "Stopped earlier" : "Stopped today")
@@ -352,14 +353,14 @@ struct ItemRow: View {
                 Rectangle().fill(i < filled ? Lamp.paused.color : Ink.off).frame(height: 4)
             }
         }
-        .accessibilityLabel(item.lamp == .paused ? "Stops in \(Fmt.clock(d))" : "Pauses in \(Fmt.clock(d))"))
+        .accessibilityLabel(item.step == "stop" ? "Stops in \(Fmt.clock(d))" : "Pauses in \(Fmt.clock(d))"))
     }
 
     @ViewBuilder
     private func key(_ a: Item.Action) -> some View {
         switch a {
         case .keep: if let r = item.resource { Button("Keep") { onKeep(r) }.buttonStyle(.key) }
-        case .stop: Button("Stop") { store.stop(item.id) }.buttonStyle(.key(.danger))
+        case .stop: Button(item.resource?.kind == "docker-vm" ? "Restart" : "Stop") { store.stop(item.id) }.buttonStyle(.key(.danger))
         case .release(let id): Button("Release") { store.act(["release", id]) }.buttonStyle(.key)
         case .resume: Button("Resume") { store.resume(item.id) }.buttonStyle(.key)
         case .unpin: if let r = item.resource { Button("Unpin") { store.pin(r) }.buttonStyle(.key) }
@@ -369,7 +370,7 @@ struct ItemRow: View {
     @ViewBuilder
     private func more(_ r: Resource) -> some View {
         if r.paused_at != nil { Button("Resume") { store.resume(r.id) } }
-        if r.lease_id == nil { Button("Keep…") { onKeep(r) } }
+        if r.lease_id == nil && !r.selfRestarting { Button("Keep…") { onKeep(r) } } // not leased: nothing to claim
         Button(r.pinned == true ? "Unpin" : "Pin: never pause or stop") { store.pin(r) }
         Divider()
         Button("Stop now", role: .destructive) { store.stop(r.id) }

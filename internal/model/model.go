@@ -194,6 +194,9 @@ type Session struct {
 	Agent    string    `json:"agent"`
 	Cwd      string    `json:"cwd"`
 	LastSeen time.Time `json:"last_seen"`
+	// Grants are when the session was granted leases (the last day's), released ones included:
+	// what it starts after a grant is that lease's, not an earlier build's.
+	Grants []time.Time `json:"grants,omitempty"`
 	// FootprintMB is the resident memory of everything running under the agent's process.
 	FootprintMB float64   `json:"footprint_mb"`
 	AgentPID    int       `json:"agent_pid,omitempty"`
@@ -296,7 +299,7 @@ type Stopped struct {
 	StoppedAt time.Time `json:"stopped_at"`
 	// FreedMB is what the stop was expected to give back: all a process held, part of what
 	// Docker counted for a container (its return ratio when it was stopped).
-	FreedMB float64 `json:"freed_mb,omitempty"`
+	FreedMB float64 `json:"freed_mb"`
 	Why     string  `json:"why"`
 	By      string  `json:"by"` // "agentrm" or the session that asked
 }
@@ -305,6 +308,7 @@ type Stopped struct {
 type FreedMark struct {
 	At time.Time `json:"at"`
 	MB float64   `json:"mb"`
+	ID string    `json:"id,omitempty"` // the resource stopped
 }
 
 // Approval is a privileged request from a terminal waiting for a click in the app.
@@ -471,6 +475,9 @@ type Waiter struct {
 	// Retry marks a request only its own retry can complete (a restore has to start the thing
 	// as well), so no lease is granted for it from the queue.
 	Retry bool `json:"retry,omitempty"`
+	// HeldGB is set for a request for more than the session already holds of this kind: what
+	// it held then. It waits for the difference while holding that.
+	HeldGB float64 `json:"held_gb,omitempty"`
 	// Pressed is when holders were last pressed to make room for it.
 	Pressed time.Time `json:"-"`
 }

@@ -166,6 +166,9 @@ func (m *Manager) applyEffects(results []EffectResult) {
 				m.event("RESTORE FAILED %s: %v. It is still listed as stopped.", e.Res.ID, res.Err)
 				continue
 			}
+			if e.Stopped != nil {
+				m.unfree(e.Stopped)
+			}
 			m.event("RESTORED %s (%s) for %s", e.Res.ID, e.Res.Name, e.By)
 			m.kickSweep()
 		case "restart":
@@ -213,7 +216,7 @@ func (m *Manager) recordStopped(r model.Resource, why, by string, now time.Time)
 	if len(m.st.Stopped) > 50 {
 		m.st.Stopped = m.st.Stopped[len(m.st.Stopped)-50:]
 	}
-	m.st.Freed = append(m.st.Freed, model.FreedMark{At: now, MB: freed})
+	m.st.Freed = append(m.st.Freed, model.FreedMark{At: now, MB: freed, ID: r.ID})
 	for len(m.st.Freed) > 0 && now.Sub(m.st.Freed[0].At) > 31*24*time.Hour {
 		m.st.Freed = m.st.Freed[1:]
 	}
@@ -226,11 +229,20 @@ func (m *Manager) seedFreed() {
 		return
 	}
 	for _, s := range m.st.Stopped {
-		mb := s.FreedMB
-		if mb == 0 {
-			mb = s.Resource.MemMB * m.returnRatio(s.Resource.Source)
+		if s.FreedMB == 0 {
+			s.FreedMB = s.Resource.MemMB * m.returnRatio(s.Resource.Source)
 		}
-		m.st.Freed = append(m.st.Freed, model.FreedMark{At: s.StoppedAt, MB: mb})
+		m.st.Freed = append(m.st.Freed, model.FreedMark{At: s.StoppedAt, MB: s.FreedMB, ID: s.Resource.ID})
+	}
+}
+
+// unfree takes a restored stop out of the freed totals: it gave nothing back in the end.
+func (m *Manager) unfree(s *model.Stopped) {
+	for i, f := range m.st.Freed {
+		if f.ID == s.Resource.ID && f.At.Equal(s.StoppedAt) {
+			m.st.Freed = append(m.st.Freed[:i], m.st.Freed[i+1:]...)
+			return
+		}
 	}
 }
 

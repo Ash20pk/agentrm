@@ -117,6 +117,10 @@ func Docker() ([]*model.Resource, error) {
 			}
 			stats[f[0]] = stat{parseSize(f[1]), cpu, net * 1048576}
 		}
+	} else if strings.TrimSpace(out) != "" {
+		// Containers are running but their sizes could not be read: a failed source, so their
+		// last view is kept (D4), not a view where every container holds nothing.
+		return nil, fmt.Errorf("docker stats: %w", err)
 	}
 	groups := map[string]*model.Resource{}
 	for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
@@ -239,10 +243,7 @@ var databases = map[string]string{ // process name -> brew formula prefix
 func Processes(cfg model.Config, procs map[int]*sys.Proc) []*model.Resource {
 	var res []*model.Resource
 	sub := subtreeMB(procs)
-	vzTaken := map[int]bool{} // Virtualization.framework processes already paired with a VM
-	if d := dockerVMProc(procs); d != nil {
-		vzTaken[d.PID] = true
-	}
+	guests := vzGuests(procs)
 	for _, p := range procs {
 		base := filepath.Base(p.Exe)
 		a := p.Args
@@ -259,12 +260,12 @@ func Processes(cfg model.Config, procs map[int]*sys.Proc) []*model.Resource {
 			res = append(res, procRes(p, "vm", model.RKVM, "QEMU VM", trunc(a, 90), p.RSSMB+sub[p.PID]))
 		case limaRe.MatchString(a):
 			name := limaRe.FindStringSubmatch(a)[1]
-			r := procRes(p, "vm", model.RKVM, "Lima VM "+name, "limactl", p.RSSMB+sub[p.PID]+vzGuestMB(procs, p, vzTaken))
+			r := procRes(p, "vm", model.RKVM, "Lima VM "+name, "limactl", p.RSSMB+sub[p.PID]+guestMB(guests[p.PID]))
 			r.ID, r.Restart = "vm:lima-"+name, "limactl start "+name
 			res = append(res, r)
 		case tartRe.MatchString(a):
 			name := tartRe.FindStringSubmatch(a)[1]
-			r := procRes(p, "vm", model.RKVM, "Tart VM "+name, "tart", p.RSSMB+sub[p.PID]+vzGuestMB(procs, p, vzTaken))
+			r := procRes(p, "vm", model.RKVM, "Tart VM "+name, "tart", p.RSSMB+sub[p.PID]+guestMB(guests[p.PID]))
 			r.ID, r.Restart = "vm:tart-"+name, "tart run "+name
 			res = append(res, r)
 		case base == "ollama" && strings.Contains(a, " serve"):

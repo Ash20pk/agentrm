@@ -1,12 +1,14 @@
 package manager
 
 import (
+	"errors"
 	"math"
 	"regexp"
 	"strconv"
 	"testing"
 	"time"
 
+	"agentrm/internal/discover"
 	"agentrm/internal/model"
 	"agentrm/internal/sys"
 )
@@ -103,15 +105,14 @@ func TestAskingAgainDoesNotStackLeases(t *testing.T) {
 func TestDockerBuildIsMeasuredInDockersVM(t *testing.T) {
 	m, c := newTest(t, 8)
 	t0 := c.Now()
-	vm := &model.Resource{ID: "docker-vm", Kind: model.RKDockerVM, Source: "docker", MemMB: 500}
-	m.st.Resources[vm.ID] = vm
+	m.dockerFullMB = 1300 // the VM's footprint; its containers hold nothing
 	m.learnSession(100, "s", "claude")
 	procs := map[int]*sys.Proc{100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: t0.Add(-time.Hour)}}
 	m.updateFootprints(procs, t0)
 	if r := acquire(t, m, agent("s"), model.KDockerBuild, 3); !r.Granted {
 		t.Fatal(r.Reason)
 	}
-	vm.MemMB = 2500
+	m.dockerFullMB = 3300
 	c.Add(time.Minute)
 	m.updateFootprints(procs, c.Now())
 	for _, l := range m.st.Leases {
@@ -168,7 +169,7 @@ func TestRefusalAddsUp(t *testing.T) {
 	num := regexp.MustCompile(`[0-9]+\.[0-9]+`)
 	for _, tc := range []struct{ need, avail, pending, keep float64 }{
 		{2.4, 2.1, 0, 0.5}, {0.6, 2.1, 1.2, 0.5}, {0.62, 2.1, 1.02, 0.5}, {2.4, 2.1, 0, 0.75},
-		{1.36, 2.14, 0.01, 0.75}, {0.3, 0.2, 0, 0.5},
+		{1.36, 2.14, 0.01, 0.75}, {0.3, 0.2, 0, 0.5}, {2052.0 / 1024, 4104.5 / 1024, 1029.0 / 1024, 1},
 	} {
 		s := shortfall(tc.need*1024, tc.avail*1024, tc.pending*1024, tc.keep*1024)
 		f := num.FindAllString(s, -1)
@@ -281,5 +282,192 @@ func TestFreedLogIsSeededFromPastStops(t *testing.T) {
 	m.seedFreed() // once only
 	if len(m.st.Freed) != 2 {
 		t.Fatalf("seeded twice: %d", len(m.st.Freed))
+	}
+}
+
+// A Docker lease's use is the VM's growth beyond its containers'. Containers stopping (the VM
+// keeps what they held), Docker not answering, or someone else's stack starting is no one's
+// work: charged to the lease, each read as an overrun and distrusted the session.
+func TestDockerLeaseIsNotChargedForContainers(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.dockerFullMB, m.dockerContainersMB = 6144, 4096
+	m.learnSession(100, "s", "claude")
+	procs := map[int]*sys.Proc{100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: c.Now().Add(-time.Hour)}}
+	if r := acquire(t, m, agent("s"), model.KDockerBuild, 1); !r.Granted {
+		t.Fatal(r.Reason)
+	}
+	l := m.findLease("s", model.KDockerBuild)
+	measure := func(full, containers float64) float64 {
+		m.dockerFullMB, m.dockerContainersMB = full, containers
+		c.Add(time.Minute)
+		m.updateFootprints(procs, c.Now())
+		return l.UsedMB
+	}
+	if u := measure(6144, 0); u != 0 {
+		t.Fatalf("the stack stopped and the VM kept its memory: charged %.0f MB", u)
+	}
+	if u := measure(7168, 1024); u != 0 {
+		t.Fatalf("an unrelated stack started: charged %.0f MB", u)
+	}
+	if u := measure(8168, 1024); u != 1000 {
+		t.Fatalf("the build grew the VM by 1000 MB: charged %.0f MB", u)
+	}
+	if l.Overran || c.Now().Before(m.st.Sessions["s"].DistrustUntil) {
+		t.Fatal("flagged as an overrun")
+	}
+}
+
+// Docker not answering: its containers keep their last view, and the VM is credited with that,
+// not with nothing (which made the VM jump by the containers' memory).
+func TestDockerVMKeepsContainersWhenDockerFails(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.st.Resources["compose:app"] = &model.Resource{ID: "compose:app", Kind: model.RKContainers, Source: "docker", MemMB: 4096}
+	vm := &model.Resource{ID: "docker-vm", Kind: model.RKDockerVM, Source: "procs", MemMB: 6144}
+	m.merge(discover.Result{Resources: []*model.Resource{vm}, Failed: map[string]error{"docker": errors.New("hung")}}, nil, nil, c.Now())
+	if want := 6144 - m.dockerVMIdle() - 4096; vm.MemMB != want {
+		t.Fatalf("VM %.0f MB, want %.0f", vm.MemMB, want)
+	}
+	if m.dockerContainersMB != 4096 {
+		t.Fatalf("containers %.0f", m.dockerContainersMB)
+	}
+}
+
+// A failed vm_stat is not a reading: taken as one, the next good reading counted every swap-out
+// since boot as the last minute's, and refused everything for a minute.
+func TestFailedSwapReadingIsIgnored(t *testing.T) {
+	m, c := newTest(t, 8)
+	for i := 0; i < 25; i++ {
+		c.Add(3 * time.Second)
+		m.takeMem(sys.MemStats{Swapouts: 500000}, c.Now())
+	}
+	c.Add(3 * time.Second)
+	m.takeMem(sys.MemStats{SwapUnread: true}, c.Now())
+	for i := 0; i < 25; i++ {
+		c.Add(3 * time.Second)
+		m.takeMem(sys.MemStats{Swapouts: 500000}, c.Now())
+		if m.swapRate != 0 {
+			t.Fatalf("rate %.0f MB/min after a failed reading", m.swapRate)
+		}
+	}
+}
+
+// An unused compose lease is not "started" by someone else growing Docker's VM.
+func TestDockerVMGrowthIsNotTakeUp(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.dockerFullMB = 2000
+	m.learnSession(100, "s", "claude")
+	procs := map[int]*sys.Proc{100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: c.Now().Add(-time.Hour)}}
+	m.updateFootprints(procs, c.Now())
+	if r := acquire(t, m, agent("s"), model.KCompose, 2); !r.Granted {
+		t.Fatal(r.Reason)
+	}
+	l := m.findLease("s", model.KCompose)
+	off := c.Now()
+	l.Offered = &off
+	m.dockerFullMB = 2200 // someone's pull
+	m.updateFootprints(procs, c.Now())
+	if l.DaemonBaseMB[dockerGrewKey] != 200 || l.UsedMB != 200 {
+		t.Fatalf("the VM's growth was not tracked: %v", l.DaemonBaseMB)
+	}
+	m.checkLeases(c.Now())
+	if l.Offered == nil {
+		t.Fatal("taken up on the VM's growth")
+	}
+	c.Add(16 * time.Minute)
+	l.Offered = nil
+	m.checkLeases(c.Now())
+	if m.st.Leases[l.ID] != nil {
+		t.Fatal("kept although nothing was started under it")
+	}
+}
+
+// What a session starts after a later lease is that lease's, even once the later lease holds it
+// as a resource or has been released: charged back to the earlier build, it overran.
+func TestBuildIsNotChargedForALaterLeasesProcesses(t *testing.T) {
+	m, c := newTest(t, 8)
+	t0 := c.Now()
+	m.footprint = func(pid int) (float64, bool) { return map[int]float64{102: 2500}[pid], pid == 102 }
+	m.learnSession(100, "s", "claude")
+	procs := map[int]*sys.Proc{
+		100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: t0.Add(-time.Hour)},
+		102: {PID: 102, PPID: 100, Exe: "node", Args: "node server.js", Start: t0.Add(time.Minute + time.Second)},
+	}
+	m.updateFootprints(procs, t0)
+	if r := acquire(t, m, agent("s"), model.KCargoBuild, 1); !r.Granted {
+		t.Fatal(r.Reason)
+	}
+	bld := m.findLease("s", model.KCargoBuild)
+	c.Add(time.Minute)
+	if r := acquire(t, m, agent("s"), model.KServer, 2.5); !r.Granted {
+		t.Fatal(r.Reason)
+	}
+	srv := m.findLease("s", model.KServer)
+	// The server is bound as a resource of its lease.
+	m.st.Resources["srv:3000"] = &model.Resource{ID: "srv:3000", Kind: model.RKServer, PID: 102, MemMB: 2500, LeaseID: srv.ID}
+	srv.Resources = []string{"srv:3000"}
+	c.Add(time.Minute)
+	m.updateFootprints(procs, c.Now())
+	if bld.UsedMB != 0 {
+		t.Fatalf("the build was charged the bound server's %.0f MB", bld.UsedMB)
+	}
+	// Released while the server still runs.
+	delete(m.st.Leases, srv.ID)
+	delete(m.st.Resources, "srv:3000")
+	c.Add(time.Minute)
+	m.updateFootprints(procs, c.Now())
+	if bld.UsedMB != 0 || bld.Overran {
+		t.Fatalf("after the server's lease ended the build was charged %.0f MB", bld.UsedMB)
+	}
+}
+
+// Holding 1 GB and asking for 6: the request waits for the difference, and is granted it.
+func TestALargerAskWaitsInTheQueue(t *testing.T) {
+	m, c := newTest(t, 3)
+	if r := acquire(t, m, agent("s"), model.KServer, 1); !r.Granted {
+		t.Fatal(r.Reason)
+	}
+	if r := acquire(t, m, agent("s"), model.KServer, 6); r.Granted || r.Queue != 1 {
+		t.Fatalf("granted or not queued: %+v", r)
+	}
+	m.grantWaiters(c.Now(), false)
+	if len(m.waiters) != 1 {
+		t.Fatal("dropped from the queue because it holds a smaller lease")
+	}
+	m.mem.AvailableMB = 12 * 1024
+	m.grantWaiters(c.Now(), false)
+	if held := m.heldGB("s", model.KServer); held != 6 {
+		t.Fatalf("holds %.1f GB, want 6", held)
+	}
+}
+
+// A restored stop gave nothing back in the end.
+func TestRestoreTakesTheStopOutOfTheTotals(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.recordStopped(model.Resource{ID: "kind:a", Source: "procs", MemMB: 3000}, "test", "", c.Now())
+	st := m.st.Stopped[len(m.st.Stopped)-1]
+	m.applyEffects([]EffectResult{{Effect: Effect{Op: "restore", Res: st.Resource, Stopped: st}}})
+	if mb, n := m.freedMB(c.Now().Add(-time.Hour), c.Now()); mb != 0 || n != 0 {
+		t.Fatalf("still counted: %d stops, %.0f MB", n, mb)
+	}
+}
+
+// While everything is let through, nothing is paused or stopped: the countdown says it only
+// would. What is being paused or stopped right now says so.
+func TestNextStepWhileHeldAndUnderWay(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.cfg.DryRun = false
+	r := &model.Resource{ID: "srv:1", Kind: model.RKServer, Name: "srv", MemMB: 500, Source: "procs", FirstSeen: c.Now()}
+	m.st.Resources[r.ID] = r
+	until := c.Now().Add(time.Hour)
+	m.st.BypassUntil = &until
+	m.checkOrphans(c.Now())
+	if r.NextStep != "pause" || !r.NextDry {
+		t.Fatalf("held: %q dry %v", r.NextStep, r.NextDry)
+	}
+	m.st.BypassUntil = nil
+	m.pending[r.ID] = "stop"
+	m.checkOrphans(c.Now())
+	if r.NextStep != "stop" || r.NextAt == nil || !r.NextAt.Equal(c.Now()) {
+		t.Fatalf("under way: %q at %v", r.NextStep, r.NextAt)
 	}
 }

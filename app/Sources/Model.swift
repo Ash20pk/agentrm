@@ -52,6 +52,8 @@ struct Lease: Codable, Identifiable {
     var backfill: Bool?
     /// What a lease with nothing discoverable behind it (a build) uses now, measured.
     var used_mb: Double?
+    /// The holder chose the size itself (otherwise AgentRM's estimate, or inferred).
+    var declared: Bool?
 }
 
 struct Resource: Codable, Identifiable {
@@ -274,7 +276,11 @@ struct Status: Codable {
     var freed_week_mb: Double?
 
     /// The swap-out rate above which the daemon refuses work (its config, default 300 MB/min).
-    var swapLimit: Double { config.max_swap_mb_per_min ?? 300 }
+    /// 0 or less: the daemon does not refuse for swapping, so neither does the app warn.
+    var swapLimit: Double {
+        let l = config.max_swap_mb_per_min ?? 300
+        return l > 0 ? l : .infinity
+    }
 
     enum CodingKeys: String, CodingKey {
         case mem, headroom_mb, pending_mb, swap_rate_mb_min, waiters, config, leases, resources, sessions,

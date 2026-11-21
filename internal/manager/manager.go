@@ -68,7 +68,13 @@ type Manager struct {
 	waiters       []*model.Waiter
 	swapRate      float64
 	swapSamples   []swapSample // cumulative swap-outs over the last minute or so (takeMem)
-	memAt         time.Time    // when m.mem was read
+	// tickMu makes reading the machine, recording it and applying it one at a time: the sweep
+	// loop and a request refreshing memory would otherwise record deltas out of order.
+	tickMu sync.Mutex
+	// Docker's VM footprint and what its containers hold, as of the last sweep: a Docker
+	// lease's use is how the first grew beyond the second (daemonGrowthMB).
+	dockerFullMB, dockerContainersMB float64
+	memAt                            time.Time // when m.mem was read
 	// freshMem: a request for memory reads it again first when it is older than memFresh
 	// (live only: tests and replays bring their own readings).
 	freshMem        bool
@@ -405,8 +411,13 @@ func (m *Manager) HandleCtx(ctx context.Context, path string, peerPID int, req a
 	}
 	if path == "/acquire" && m.memStale() {
 		// Between sweeps (30 s when idle) memory can change by gigabytes: a request is judged
-		// on a reading a few seconds old at most. A fast tick reads and records it as usual.
-		m.FastTick()
+		// on a reading a few seconds old at most. A fast tick reads and records it as usual,
+		// after any tick under way; requests arriving together share one.
+		m.tickMu.Lock()
+		if m.memStale() {
+			m.fastTick()
+		}
+		m.tickMu.Unlock()
 	}
 	return m.handleFacts(ctx, path, h, facts, req)
 }

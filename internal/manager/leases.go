@@ -94,7 +94,7 @@ func (m *Manager) acquire(c api.Caller, r api.Req) (any, []Effect, error) {
 	if why := m.busy(r.Kind); why != "" {
 		return &api.AcquireResp{Reason: why}, nil, nil
 	}
-	want := model.Waiter{Session: c.Session, Agent: c.Agent, Kind: r.Kind, NeedMB: memGB * 1024,
+	want := model.Waiter{Session: c.Session, Agent: c.Agent, Kind: r.Kind, NeedMB: memGB * 1024, HeldGB: heldGB * b2f(extraGB > 0),
 		Purpose: r.Purpose, Cmd: trunc(r.Cmd, 200), Cwd: cwd, Via: r.Via,
 		TTLMinutes: r.TTLMinutes, UntilMinutes: r.UntilMinutes, Declared: r.MemGB > 0}
 	if why := m.failOpen(now); why != "" {
@@ -138,8 +138,16 @@ func (m *Manager) grant(w *model.Waiter, now time.Time, note string) *model.Leas
 	}
 	if s := m.st.Sessions[w.Session]; s != nil {
 		l.BaseFootprintMB = s.FootprintMB
+		for len(s.Grants) > 0 && now.Sub(s.Grants[0]) > 24*time.Hour {
+			s.Grants = s.Grants[1:]
+		}
+		s.Grants = append(s.Grants, now)
 	}
-	if host := daemonHost(l.Kind); host != "" {
+	switch host := daemonHost(l.Kind); host {
+	case model.RKDockerVM:
+		l.DaemonBaseMB = map[string]float64{dockerFullKey: m.dockerFullMB, dockerContainersKey: m.dockerContainersMB}
+	case "":
+	default:
 		l.DaemonBaseMB = map[string]float64{}
 		for id, r := range m.st.Resources {
 			if r.Kind == host {
@@ -237,7 +245,7 @@ func (m *Manager) checkLeases(now time.Time) {
 	grace := minutes(m.cfg.GraceMinutes)
 	idle := minutes(m.cfg.IdleMinutes)
 	for _, l := range m.st.Leases {
-		if l.Offered != nil && (len(l.Resources) > 0 || m.materialisedMB(l) >= 50) {
+		if l.Offered != nil && (len(l.Resources) > 0 || m.startedMB(l) >= 50) {
 			m.takeUp(l) // something started under it
 		}
 		switch {
@@ -248,7 +256,7 @@ func (m *Manager) checkLeases(now time.Time) {
 			m.dropLease(l, fmt.Sprintf("granted from the queue but not taken up in %d min", int(m.grantHold().Minutes())))
 			continue
 		case !model.BuildKinds[l.Kind] && l.Kind != model.KHeavy && len(l.Resources) == 0 &&
-			now.Sub(l.Created) > 15*time.Minute && m.materialisedMB(l) < 50:
+			now.Sub(l.Created) > 15*time.Minute && m.startedMB(l) < 50:
 			m.dropLease(l, "granted 15 min ago but nothing was started under it")
 			continue
 		}
@@ -373,21 +381,32 @@ func (m *Manager) updateFootprints(procs map[int]*sys.Proc, now time.Time) {
 		}
 	}
 	explained := map[string]bool{} // sessions whose growth a lease accounts for
+	// Processes that are resources held by a lease are that lease's, never a build's.
+	bound := map[int]bool{}
+	for _, r := range m.st.Resources {
+		if r.LeaseID != "" && r.PID > 0 {
+			bound[r.PID] = true
+		}
+	}
 	for _, l := range m.st.Leases {
 		if len(l.Resources) == 0 && !inferred(l) {
 			// A build: what it uses is what it started. Only processes started since the grant
 			// count, by footprint, so a simulator, a Gradle daemon or a dev server the session
 			// already had is not charged to the build. A process started after a later build
 			// lease of the same session is that lease's: each process is charged once.
+			m.trackDockerGrowth(l) // every sweep, so a sweep without the session is not a jump
 			if s := m.st.Sessions[l.Session]; s != nil {
-				from, to := l.Created.Add(-2*time.Second), m.nextBuildLease(l)
+				from, to := l.Created.Add(-2*time.Second), m.nextGrant(l)
 				if !to.IsZero() {
 					to = to.Add(-2 * time.Second)
 				}
-				l.UsedMB = m.usedBetween(trees[s.AgentPID], from, to) + m.daemonGrowthMB(l)
+				l.UsedMB = m.usedBetween(trees[s.AgentPID], from, to, bound) + m.daemonGrowthMB(l)
 				l.PeakMB = max(l.PeakMB, l.UsedMB)
 				m.checkOverrun(l, now)
 			}
+		}
+		if inferred(l) {
+			l.UsedMB = m.materialisedMB(l) // the tree's growth: what the app shows for it
 		}
 		// Growth soon after a grant is that lease's work, whatever kind it is (a Gradle build
 		// holds a daemon resource, and was being counted a second time as inferred heavy work).
@@ -484,9 +503,13 @@ func (m *Manager) daemonGrowthMB(l *model.Lease) float64 {
 		return 0
 	}
 	grew := 0.0
-	for id, r := range m.st.Resources {
-		if r.Kind == host && r.Unseen == nil {
-			grew += max(0, r.MemMB-l.DaemonBaseMB[id])
+	if host == model.RKDockerVM {
+		grew = l.DaemonBaseMB[dockerGrewKey] // trackDockerGrowth
+	} else {
+		for id, r := range m.st.Resources {
+			if r.Kind == host && r.Unseen == nil {
+				grew += max(0, r.MemMB-l.DaemonBaseMB[id])
+			}
 		}
 	}
 	n := 0
@@ -496,6 +519,64 @@ func (m *Manager) daemonGrowthMB(l *model.Lease) float64 {
 		}
 	}
 	return grew / float64(max(n, 1))
+}
+
+func b2f(b bool) float64 {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// heldGB is what a session holds of a kind of lease, in all.
+func (m *Manager) heldGB(session, kind string) float64 {
+	gb := 0.0
+	for _, l := range m.st.Leases {
+		if l.Session == session && l.Kind == kind {
+			gb += l.MemGB
+		}
+	}
+	return gb
+}
+
+// Keys of a Docker lease's DaemonBaseMB: the VM's footprint and its containers' memory at the
+// last sweep, and the growth counted as the lease's so far.
+const (
+	dockerFullKey       = "docker-vm:footprint"
+	dockerContainersKey = "docker:containers"
+	dockerGrewKey       = "docker:grew"
+)
+
+// trackDockerGrowth adds a Docker lease's share of what the VM did since the last sweep. Growth
+// of the VM is the lease's, less what its containers grew by (an unrelated stack starting).
+// When containers shrink, the VM shrinking by up to as much is theirs, and the VM keeping what
+// they held is no one's: only what the VM does beyond that counts. Must hold mu.
+func (m *Manager) trackDockerGrowth(l *model.Lease) {
+	b := l.DaemonBaseMB
+	if b == nil || daemonHost(l.Kind) != model.RKDockerVM {
+		return
+	}
+	df, dc := m.dockerFullMB-b[dockerFullKey], m.dockerContainersMB-b[dockerContainersKey]
+	inc := df - dc
+	if dc < 0 {
+		inc = df
+		if df < 0 {
+			inc = df + min(-dc, -df)
+		}
+	}
+	b[dockerGrewKey] = max(0, b[dockerGrewKey]+inc)
+	b[dockerFullKey], b[dockerContainersKey] = m.dockerFullMB, m.dockerContainersMB
+}
+
+// startedMB is what shows something was started under a lease: its use, less any growth of
+// Docker's VM, which someone else's pull or build moves as well. A compose or cluster lease is
+// started when its containers are bound to it.
+func (m *Manager) startedMB(l *model.Lease) float64 {
+	used := m.materialisedMB(l)
+	if len(l.Resources) == 0 && daemonHost(l.Kind) == model.RKDockerVM {
+		used = max(0, used-m.daemonGrowthMB(l))
+	}
+	return used
 }
 
 // daemonHost is the kind of resource a lease's work runs inside rather than in a process its

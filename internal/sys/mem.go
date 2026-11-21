@@ -17,6 +17,8 @@ type MemStats struct {
 	// PressureLevel is the kernel's own verdict: 1 normal, 2 warning, 4 critical.
 	PressureLevel int     `json:"pressure_level"`
 	Swapouts      float64 `json:"-"` // cumulative, in MB
+	// SwapUnread: vm_stat could not be read, so Swapouts is not a reading.
+	SwapUnread bool `json:"-"`
 }
 
 func DiskFreeGB(path string) float64 {

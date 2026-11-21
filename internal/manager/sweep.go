@@ -128,6 +128,13 @@ func (m *Manager) needsFast() bool {
 // FastTick refreshes memory, pressure and process trees, and thaws paused servers someone is
 // trying to reach.
 func (m *Manager) FastTick() {
+	m.tickMu.Lock()
+	defer m.tickMu.Unlock()
+	m.fastTick()
+}
+
+// fastTick is FastTick with tickMu held.
+func (m *Manager) fastTick() {
 	procs := sys.ListProcs()
 	mem := sys.ReadMem()
 	if rec := m.recorder(); rec != nil {
@@ -204,7 +211,9 @@ const (
 )
 
 func (m *Manager) takeMem(mem sys.MemStats, now time.Time) {
-	m.swapRate = m.measureSwap(mem.Swapouts, now)
+	if !mem.SwapUnread {
+		m.swapRate = m.measureSwap(mem.Swapouts, now)
+	}
 	m.mem, m.memAt = mem, now
 	m.measureReturns(now)
 	m.watchGrants(now)
@@ -238,6 +247,8 @@ func (m *Manager) measureSwap(out float64, now time.Time) float64 {
 
 // Sweep is the full pass: discovery, attribution, leases, orphans.
 func (m *Manager) Sweep() {
+	m.tickMu.Lock()
+	defer m.tickMu.Unlock()
 	start := time.Now()
 	procs := sys.ListProcs()
 	if procs != nil {
@@ -340,15 +351,26 @@ func (m *Manager) origins() map[string]origin { return m.dockerOrigin }
 func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[string]bool, now time.Time) {
 	m.failed = found.Failed
 	seen := map[string]bool{}
-	// What the containers hold is inside the VM's footprint, and is counted as theirs.
+	// What the containers hold is inside the VM's footprint, and is counted as theirs. When
+	// Docker did not answer, its containers keep their last view, and so does this figure.
 	containers := 0.0
-	for _, r := range found.Resources {
-		if r.Source == discover.SrcDocker && r.Kind != model.RKDockerVM {
-			containers += r.MemMB
+	if found.Failed[discover.SrcDocker] != nil {
+		for _, r := range m.st.Resources {
+			if r.Source == discover.SrcDocker && r.Kind != model.RKDockerVM {
+				containers += r.MemMB
+			}
+		}
+	} else {
+		for _, r := range found.Resources {
+			if r.Source == discover.SrcDocker && r.Kind != model.RKDockerVM {
+				containers += r.MemMB
+			}
 		}
 	}
+	m.dockerFullMB, m.dockerContainersMB = 0, containers
 	for _, r := range found.Resources {
 		if r.Kind == model.RKDockerVM {
+			m.dockerFullMB = r.MemMB // its footprint, before it is credited
 			m.creditDockerVM(r, containers, now)
 		}
 	}

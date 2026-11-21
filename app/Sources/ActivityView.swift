@@ -33,8 +33,8 @@ struct ActivityView: View {
                 Spacer()
                 if let s = store.status {
                     if s.config.dry_run {
-                        let day = store.readiness.days + 1
-                        LampLabel(lamp: Lamp.waiting.color, text: day <= 7 ? "Dry run, day \(day) of 7" : "Dry run, \(day) days")
+                        let days = store.readiness.days
+                        LampLabel(lamp: Lamp.waiting.color, text: days < 7 ? "Dry run, day \(days + 1) of 7" : "Dry run, \(days) days")
                     } else {
                         LampLabel(lamp: Lamp.inUse.color, text: "Auto-stop on")
                     }

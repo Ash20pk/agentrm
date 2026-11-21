@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -81,15 +82,61 @@ func vzGuest(procs map[int]*sys.Proc, host *sys.Proc, taken map[int]bool) *sys.P
 	return best
 }
 
-// vzGuestMB is what the guest of a Lima (vz) or Tart VM holds, by footprint, or 0 if it runs
-// in a child process instead (qemu, counted in the host's subtree). The pairing is noted in
-// taken.
-func vzGuestMB(procs map[int]*sys.Proc, host *sys.Proc, taken map[int]bool) float64 {
-	g := vzGuest(procs, host, taken)
+// vzGuests pairs each Lima or Tart host process with the Virtualization.framework process
+// running its guest (keyed by the host's PID). Pairs are made closest start times first across
+// all hosts at once, so which host is looked at first does not decide; Docker's guest is
+// never paired, and a host whose guest is its own qemu child gets none.
+func vzGuests(procs map[int]*sys.Proc) map[int]*sys.Proc {
+	taken := map[int]bool{}
+	if d := dockerVMProc(procs); d != nil {
+		taken[d.PID] = true
+	}
+	hasQemu := map[int]bool{}
+	for _, p := range procs {
+		if strings.HasPrefix(filepath.Base(p.Exe), "qemu-system") {
+			hasQemu[p.PPID] = true
+		}
+	}
+	type pair struct {
+		host, guest *sys.Proc
+		gap         time.Duration
+	}
+	var pairs []pair
+	for _, h := range procs {
+		if hasQemu[h.PID] || h.Start.IsZero() || !(limaRe.MatchString(h.Args) || tartRe.MatchString(h.Args)) {
+			continue
+		}
+		for _, g := range procs {
+			if filepath.Base(g.Exe) != "com.apple.Virtualization.VirtualMachine" || g.Start.IsZero() || taken[g.PID] {
+				continue
+			}
+			gap := g.Start.Sub(h.Start)
+			if gap < -2*time.Second || gap > time.Minute {
+				continue
+			}
+			pairs = append(pairs, pair{h, g, max(gap, -gap)})
+		}
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].gap != pairs[j].gap {
+			return pairs[i].gap < pairs[j].gap
+		}
+		return pairs[i].host.PID < pairs[j].host.PID
+	})
+	out := map[int]*sys.Proc{}
+	for _, p := range pairs {
+		if out[p.host.PID] == nil && !taken[p.guest.PID] {
+			out[p.host.PID], taken[p.guest.PID] = p.guest, true
+		}
+	}
+	return out
+}
+
+// guestMB is what a guest process holds, by footprint where it can be read; 0 for none.
+func guestMB(g *sys.Proc) float64 {
 	if g == nil {
 		return 0
 	}
-	taken[g.PID] = true
 	mb := g.RSSMB
 	if fp, ok := footprintOf(g.PID); ok && fp > mb {
 		mb = fp

@@ -47,13 +47,13 @@ func (m *Manager) materialisedMB(l *model.Lease) float64 {
 // shortfall words a refusal for want of memory so its sum adds up as printed: what can be
 // handed out is shown as available less promised less kept free, from the figures as rounded.
 // Where a tenth of a GB is too coarse to show need above what can be handed out, the figures
-// get two decimals.
+// get two decimals, or three.
 func shortfall(needMB, availMB, pendingMB, keepMB float64) string {
-	for _, places := range []float64{10, 100} {
+	for _, places := range []float64{10, 100, 1000} {
 		r := func(mb float64) float64 { return math.Round(mb/1024*places) / places }
 		need, avail, pending, keep := r(needMB), r(availMB), r(pendingMB), r(keepMB)
 		head := max(0, math.Round((avail-pending-keep)*places)/places)
-		if need > head || places == 100 {
+		if need > head || places == 1000 {
 			f := gbText(places)
 			return fmt.Sprintf("%s GB needed, %s GB can be handed out (%s GB available, %s GB promised to leases, %s GB kept free)",
 				f(need), f(head), f(avail), f(pending), f(keep))
@@ -64,6 +64,9 @@ func shortfall(needMB, availMB, pendingMB, keepMB float64) string {
 
 // gbText formats a GB figure to one decimal (places 10) or two (100).
 func gbText(places float64) func(float64) string {
+	if places >= 1000 {
+		return func(x float64) string { return fmt.Sprintf("%.3f", x) }
+	}
 	if places >= 100 {
 		return func(x float64) string { return fmt.Sprintf("%.2f", x) }
 	}
@@ -165,27 +168,47 @@ func (m *Manager) procMB(p *sys.Proc) float64 {
 
 // usedSince is what the processes of a tree started at or after t hold now.
 func (m *Manager) usedSince(tree []*sys.Proc, t time.Time) float64 {
-	return m.usedBetween(tree, t, time.Time{})
+	return m.usedBetween(tree, t, time.Time{}, nil)
 }
 
 // usedBetween is what the processes of a tree started at or after from, and before to (zero:
-// no end), hold now.
-func (m *Manager) usedBetween(tree []*sys.Proc, from, to time.Time) float64 {
+// no end), hold now, leaving out the processes in skip and everything under them.
+func (m *Manager) usedBetween(tree []*sys.Proc, from, to time.Time, skip map[int]bool) float64 {
+	byPID := make(map[int]*sys.Proc, len(tree))
+	for _, p := range tree {
+		byPID[p.PID] = p
+	}
+	skipped := func(p *sys.Proc) bool {
+		for i, q := 0, p; q != nil && i < 64; i, q = i+1, byPID[q.PPID] {
+			if skip[q.PID] {
+				return true
+			}
+		}
+		return false
+	}
 	total := 0.0
 	for _, p := range tree {
-		if !p.Start.IsZero() && !p.Start.Before(from) && (to.IsZero() || p.Start.Before(to)) {
+		if !p.Start.IsZero() && !p.Start.Before(from) && (to.IsZero() || p.Start.Before(to)) && !skipped(p) {
 			total += m.procMB(p)
 		}
 	}
 	return total
 }
 
-// nextBuildLease is when the session's next build lease after l was granted (zero: none). What
-// starts after it is that lease's work, not l's.
-func (m *Manager) nextBuildLease(l *model.Lease) time.Time {
+// nextGrant is when the session was next granted a lease after l (zero: not since). What it
+// starts after that is that lease's work, not l's, whatever kind it is and whether or not it
+// is still held. Two leases granted at the same moment are ordered by ID.
+func (m *Manager) nextGrant(l *model.Lease) time.Time {
 	var next time.Time
-	for _, o := range m.st.Leases {
-		if o == l || o.Session != l.Session || len(o.Resources) > 0 || inferred(o) {
+	if s := m.st.Sessions[l.Session]; s != nil {
+		for _, t := range s.Grants {
+			if t.After(l.Created) && (next.IsZero() || t.Before(next)) {
+				next = t
+			}
+		}
+	}
+	for _, o := range m.st.Leases { // held leases, however they were made
+		if o == l || o.Session != l.Session {
 			continue
 		}
 		if (o.Created.After(l.Created) || o.Created.Equal(l.Created) && o.ID > l.ID) && (next.IsZero() || o.Created.Before(next)) {

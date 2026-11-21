@@ -326,7 +326,7 @@ enum Fmt {
     /// A size with its unit: "30 MB" under a GB, "1.2 GB" from there.
     static func size(_ mb: Double) -> String {
         let v = max(0, mb)
-        return v < 1000 ? "\(Int(v.rounded())) MB" : String(format: "%.1f GB", v / 1024)
+        return v.rounded() < 1000 ? "\(Int(v.rounded())) MB" : String(format: "%.1f GB", v / 1024)
     }
 
     static func when(_ d: Date) -> String {

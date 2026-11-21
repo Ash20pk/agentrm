@@ -34,6 +34,8 @@ func ReadMem() MemStats {
 		m.CompressedMB = mb("Pages occupied by compressor")
 		m.Swapouts = mb("Swapouts")
 		m.WiredMB = mb("Pages wired down")
+	} else {
+		m.SwapUnread = true
 	}
 	if m.TotalMB > 0 {
 		m.FreePercent = int(100 * m.AvailableMB / m.TotalMB)

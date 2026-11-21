@@ -232,7 +232,7 @@ struct VaultTab: View {
         var s = "\(Store.agentName(g.agent)) \(g.session.prefix(12))"
         if let r = g.repo { s += " in \(r)" }
         s += " · granted \(Fmt.rel(g.created))"
-        s += live ? " · ends \(Fmt.rel(g.expires))" : " · ended: \(g.end_reason ?? "expired")"
+        s += live ? " · ends \(Fmt.rel(g.expires))" : " · ended \(Fmt.rel(g.ended ?? g.expires)): \(g.end_reason ?? "expired")"
         if let u = g.uses, u > 0 { s += " · used \(u)×" }
         return s
     }
@@ -259,6 +259,8 @@ struct VaultAccountEditor: View {
     @State private var template: VaultTemplate?
     @State private var picking: Bool
     @State private var details = false
+    @State private var chosen = false      // an API (or Another API) was picked
+    @State private var givenName: String?  // the name the template filled in, to replace on a change
 
     init(original: VaultAccount?, account: VaultAccount, done: @escaping () -> Void) {
         self.original = original
@@ -281,7 +283,8 @@ struct VaultAccountEditor: View {
 
     var body: some View {
         if picking {
-            VaultTemplatePicker(pick: use, cancel: done)
+            // Cancel goes back to the form once an API was chosen, keeping what was typed there.
+            VaultTemplatePicker(pick: use, cancel: { if chosen { picking = false } else { done() } })
         } else {
             form
         }
@@ -424,6 +427,7 @@ struct VaultAccountEditor: View {
         let was = template
         template = t
         picking = false
+        chosen = true
         details = false
         var a = VaultAccountEditor.blank("apikey")
         a.name = account.name
@@ -436,10 +440,14 @@ struct VaultAccountEditor: View {
             a.raw_key = t.raw_key == true ? true : nil
             a.key_env = t.key_env
             a.base_env = t.base_env
-            // A name or note the template gave is replaced by the new one's; one you typed is kept.
-            if a.name.isEmpty || a.name.hasPrefix(was?.id ?? "\u{0}") { a.name = freeName(t.id) }
-            if (a.note ?? "").isEmpty || a.note == was?.name { a.note = t.name }
         }
+        // A name or note the template gave is replaced by the new one's (or cleared for Another
+        // API); one you typed is kept.
+        if a.name.isEmpty || a.name == givenName {
+            a.name = t.map { freeName($0.id) } ?? ""
+            givenName = t == nil ? nil : a.name
+        }
+        if (a.note ?? "").isEmpty || a.note == was?.name { a.note = t?.name }
         account = a
     }
 
@@ -488,6 +496,11 @@ struct VaultAccountEditor: View {
     private func save() {
         error = nil
         account.name = account.name.trimmingCharacters(in: .whitespaces).lowercased()
+        if account.name != original?.name, store.vaultAccounts.contains(where: { $0.name == account.name }) {
+            // Saving would replace that account's secret and settings.
+            error = "An account named \(account.name) already exists: choose another name, or edit that one."
+            return
+        }
         switch account.kind {
         case "github":
             account.repos = list(reposText).isEmpty ? nil : list(reposText)

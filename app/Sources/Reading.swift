@@ -15,6 +15,7 @@ struct Item: Identifiable {
     /// For a countdown: when the next step (pause or stop) happens, and how long the wait is in all.
     var deadline: Date? = nil
     var window: TimeInterval = 0
+    var step: String = ""
 }
 
 /// What the meter, the gauges and the rows show, worked out once from the daemon's status.
@@ -56,11 +57,19 @@ extension Store {
         for l in leases where !backed.contains(l.id) {
             let lamp: Lamp = l.verified == false ? .waiting : .inUse
             let mb = l.used_mb ?? 0
-            byLamp[lamp, default: 0] += mb
+            // A Docker or Gradle build runs inside Docker's VM or a Gradle daemon, whose rows
+            // already count it: shown on its own row, but not counted twice in the meter.
+            if !Self.runsInsideAnother(l.kind) { byLamp[lamp, default: 0] += mb }
             let evidence = l.verified == false ? "no use seen yet" : (l.evidence ?? "in use")
+            var detail = "\(l.agent.capitalized), \(evidence)"
+            if l.declared == true {
+                detail += ", asked for \(Fmt.size(l.mem_gb * 1024))"
+            } else if !l.purpose.hasPrefix("inferred") {
+                detail += ", charged \(Fmt.size(l.mem_gb * 1024))"
+            }
+            if Self.runsInsideAnother(l.kind) { detail += l.kind == "gradle" ? ", inside its Gradle daemon" : ", inside Docker's VM" }
             items.append(Item(id: l.id, name: l.purpose.isEmpty ? Kind.name(l.kind) : l.purpose,
-                              detail: "\(l.agent.capitalized), \(evidence), asked for \(Fmt.size(l.mem_gb * 1024))", mb: mb, lamp: lamp,
-                              resource: nil, actions: [.release(l.id)]))
+                              detail: detail, mb: mb, lamp: lamp, resource: nil, actions: [.release(l.id)]))
         }
 
         let total = max(s.mem.total_mb, 1)
@@ -76,6 +85,10 @@ extension Store {
         return Reading(mbByLamp: byLamp, keptMB: kept, freeMB: free, totalMB: total,
                        segments: Self.segments(byLamp: byLamp, kept: kept, free: free, total: total), items: items)
     }
+
+    /// Lease kinds whose work runs inside another resource (the daemon measures it as that one's
+    /// growth).
+    static func runsInsideAnother(_ kind: String) -> Bool { ["docker-build", "compose", "cluster", "gradle"].contains(kind) }
 
     private func item(for r: Resource, lamp: Lamp, _ s: Status) -> Item {
         // The countdown is the daemon's: what it will do next and when (nil: nothing is coming).
@@ -97,7 +110,7 @@ extension Store {
                 detail += at < Date() ? (would ? ", would stop now" : ", stopping now") : (would ? ", would stop \(Fmt.rel(at))" : ", stops \(Fmt.rel(at))")
             }
             return Item(id: r.id, name: r.name, detail: detail, mb: r.mem_mb, lamp: lamp, resource: r, actions: [.resume],
-                        deadline: step == "stop" && !would ? next : nil, window: window)
+                        deadline: step == "stop" && !would ? next : nil, window: window, step: step)
         case .nobody:
             var detail = "\(Kind.name(r.kind)), nobody claims it"
             if let gone = r.owner_gone_at, let owner = r.owner {
@@ -116,15 +129,25 @@ extension Store {
                 } else {
                     detail += at < Date() ? (step == "stop" ? ", stopping now" : ", pausing now") : ", \(verb)s \(Fmt.rel(at))"
                 }
-            } else if r.orphan_since != nil {
+            } else if r.orphan_since != nil && (r.kind == "vm" || r.ask_only == true) {
+                // Never stopped on AgentRM's own (a VM, an app): yours to stop.
                 detail += ". AgentRM will not stop it: stop it yourself if you are done"
             }
             return Item(id: r.id, name: r.name, detail: detail, mb: r.mem_mb, lamp: lamp, resource: r,
-                        actions: [.keep, .stop], deadline: step != "" && !would ? next : nil, window: window)
+                        actions: [.keep, .stop], deadline: step != "" && !would ? next : nil, window: window, step: step)
         case .system:
             if r.selfRestarting {
-                return Item(id: r.id, name: r.name, detail: r.detail.isEmpty ? Kind.name(r.kind) : r.detail, mb: r.mem_mb,
-                            lamp: lamp, resource: r, actions: [])
+                // Nobody's by design; it comes back by itself once stopped. Its countdown is the
+                // daemon's too (when its own auto-stop level is on).
+                var detail = r.detail.isEmpty ? Kind.name(r.kind) : r.detail
+                if r.pinned == true { detail += ", pinned by you" }
+                if r.pinned != true, step == "stop", let at = next {
+                    let verb = r.kind == "docker-vm" ? "restart" : "end"
+                    detail += would ? ", would \(verb) \(at < Date() ? "now" : Fmt.rel(at))" : ", \(verb)s \(at < Date() ? "now" : Fmt.rel(at))"
+                }
+                return Item(id: r.id, name: r.name, detail: detail, mb: r.mem_mb, lamp: lamp, resource: r,
+                            actions: r.pinned == true ? [.unpin] : [.stop],
+                            deadline: step == "stop" && !would && r.pinned != true ? next : nil, window: window, step: step)
             }
             return Item(id: r.id, name: r.name, detail: "\(Kind.name(r.kind)), pinned by you", mb: r.mem_mb,
                         lamp: lamp, resource: r, actions: [.unpin])
@@ -171,8 +194,13 @@ extension Store {
             if left > 0 { counts[6] += left }
         }
         while counts.reduce(0, +) > n {
-            // Take back from the largest unlit or system run first.
-            if let i = [6, 5, 4, 0, 1].first(where: { counts[$0] > 1 }) { counts[i] -= 1 } else { break }
+            // Take back from the largest unlit or system run first, then from any run of more
+            // than one, then from the smallest lit run: the count always ends at n.
+            if let i = [6, 5, 4, 0, 1, 2, 3].first(where: { counts[$0] > 1 }) {
+                counts[i] -= 1
+            } else if let i = counts.indices.filter({ counts[$0] > 0 }).min(by: { order[$0].1 < order[$1].1 }) {
+                counts[i] -= 1
+            } else { break }
         }
         return zip(order, counts).flatMap { Array(repeating: $0.0.0, count: $0.1) }
     }

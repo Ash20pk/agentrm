@@ -27,7 +27,9 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 	var effects []Effect
 	for _, r := range m.st.Resources {
 		r.NextStep, r.NextAt, r.NextFrom, r.NextDry = "", nil, nil, false
-		if m.pending[r.ID] != "" {
+		if op := m.pending[r.ID]; op != "" {
+			t := now // under way
+			r.NextStep, r.NextAt, r.NextFrom = op, &t, &t
 			continue
 		}
 		if !blocked && r.Urgent {
@@ -170,7 +172,8 @@ func (m *Manager) planNext(r *model.Resource, grace, hold time.Duration, blocked
 			step, from, at = "stop", *r.PausedAt, r.PausedAt.Add(hold)
 		}
 	case !discover.CanAutoStop(r):
-		if r.PausedAt == nil && discover.CanPause(r) {
+		// Paused at once if it can be, unless in dry run, where it is only asked about.
+		if r.PausedAt == nil && discover.CanPause(r) && !m.dryFor(r) {
 			step = "pause"
 		}
 	default:
@@ -182,7 +185,11 @@ func (m *Manager) planNext(r *model.Resource, grace, hold time.Duration, blocked
 	if step == "" {
 		return
 	}
-	r.NextStep, r.NextFrom, r.NextAt, r.NextDry = step, &from, &at, m.dryFor(r)
+	if from.After(at) {
+		from = at // a paused thing turned direct: its step is due
+	}
+	// In dry run, or while everything is let through (bypass, a stale sweep), it only would.
+	r.NextStep, r.NextFrom, r.NextAt, r.NextDry = step, &from, &at, m.dryFor(r) || m.failOpen(now) != ""
 }
 
 // decide logs a pause, stop or reclaim decision for review.
