@@ -265,3 +265,21 @@ func TestNextStepIsWhatHappens(t *testing.T) {
 	m.checkOrphans(c.Now())
 	step(sim, "stop")
 }
+
+// State written before the freed log existed: its stops still count in the totals, at what
+// they gave back.
+func TestFreedLogIsSeededFromPastStops(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.st.Stopped = []*model.Stopped{
+		{Resource: model.Resource{ID: "kind:a", Source: "docker", MemMB: 2048}, StoppedAt: c.Now().Add(-time.Hour)},
+		{Resource: model.Resource{ID: "srv:1", Source: "procs", MemMB: 512}, StoppedAt: c.Now().Add(-10 * 24 * time.Hour)},
+	}
+	m.seedFreed()
+	if mb, n := m.freedMB(c.Now().AddDate(0, 0, -7), c.Now()); n != 1 || mb != 2048*returnDefault {
+		t.Fatalf("week: %d stops, %.0f MB", n, mb)
+	}
+	m.seedFreed() // once only
+	if len(m.st.Freed) != 2 {
+		t.Fatalf("seeded twice: %d", len(m.st.Freed))
+	}
+}

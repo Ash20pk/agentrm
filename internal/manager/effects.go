@@ -219,6 +219,21 @@ func (m *Manager) recordStopped(r model.Resource, why, by string, now time.Time)
 	}
 }
 
+// seedFreed fills the freed log from the stops kept for restoring, once, for state written
+// before the log existed: the week's totals then include them.
+func (m *Manager) seedFreed() {
+	if len(m.st.Freed) > 0 {
+		return
+	}
+	for _, s := range m.st.Stopped {
+		mb := s.FreedMB
+		if mb == 0 {
+			mb = s.Resource.MemMB * m.returnRatio(s.Resource.Source)
+		}
+		m.st.Freed = append(m.st.Freed, model.FreedMark{At: s.StoppedAt, MB: mb})
+	}
+}
+
 // freedMB is what stops between since and until gave back, and how many there were.
 func (m *Manager) freedMB(since, until time.Time) (mb float64, n int) {
 	for _, f := range m.st.Freed {

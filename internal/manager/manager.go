@@ -166,6 +166,7 @@ func New(o Options) *Manager {
 	cfg, notes := store.LoadConfig(o.Dir, m.mem.TotalMB)
 	st, snotes := store.LoadState(o.Dir, now())
 	m.cfg, m.st = cfg, st
+	m.seedFreed()
 	m.notes = append(notes, snotes...)
 	m.applyLogLevel()
 	var bad []string
