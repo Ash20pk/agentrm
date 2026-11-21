@@ -52,45 +52,18 @@ func dockerVMProc(procs map[int]*sys.Proc) *sys.Proc {
 			host = p
 		}
 	}
-	return vzGuest(procs, host, nil)
-}
-
-// vzGuest is the Virtualization.framework process that runs the guest a host process started:
-// it runs under launchd, not under the host, so it is paired by start time (within a minute
-// after the host). nil if none; taken ones are skipped.
-func vzGuest(procs map[int]*sys.Proc, host *sys.Proc, taken map[int]bool) *sys.Proc {
-	if host == nil || host.Start.IsZero() {
+	if host == nil {
 		return nil
 	}
-	var best *sys.Proc
-	var bestGap time.Duration
-	for _, p := range procs {
-		if filepath.Base(p.Exe) != "com.apple.Virtualization.VirtualMachine" || p.Start.IsZero() || taken[p.PID] {
-			continue
-		}
-		gap := p.Start.Sub(host.Start)
-		if gap < -2*time.Second || gap > time.Minute {
-			continue
-		}
-		if gap < 0 {
-			gap = -gap
-		}
-		if best == nil || gap < bestGap {
-			best, bestGap = p, gap
-		}
-	}
-	return best
+	return vzGuests(procs)[host.PID] // paired with the other VMs' hosts, closest start first
 }
 
 // vzGuests pairs each Lima or Tart host process with the Virtualization.framework process
 // running its guest (keyed by the host's PID). Pairs are made closest start times first across
-// all hosts at once, so which host is looked at first does not decide; Docker's guest is
-// never paired, and a host whose guest is its own qemu child gets none.
+// all hosts at once (Docker Desktop's included), so which host is looked at first does not
+// decide, and a host whose guest is its own qemu child gets none.
 func vzGuests(procs map[int]*sys.Proc) map[int]*sys.Proc {
 	taken := map[int]bool{}
-	if d := dockerVMProc(procs); d != nil {
-		taken[d.PID] = true
-	}
 	hasQemu := map[int]bool{}
 	for _, p := range procs {
 		if strings.HasPrefix(filepath.Base(p.Exe), "qemu-system") {
@@ -103,7 +76,11 @@ func vzGuests(procs map[int]*sys.Proc) map[int]*sys.Proc {
 	}
 	var pairs []pair
 	for _, h := range procs {
-		if hasQemu[h.PID] || h.Start.IsZero() || !(limaRe.MatchString(h.Args) || tartRe.MatchString(h.Args)) {
+		dockerHost := filepath.Base(h.Exe) == "com.docker.virtualization" && strings.Contains(h.Exe, "/Docker.app/")
+		base := filepath.Base(h.Exe)
+		lima := strings.HasPrefix(base, "limactl") && limaRe.MatchString(h.Args)
+		tart := base == "tart" && tartRe.MatchString(h.Args)
+		if hasQemu[h.PID] || h.Start.IsZero() || !(dockerHost || lima || tart) {
 			continue
 		}
 		for _, g := range procs {

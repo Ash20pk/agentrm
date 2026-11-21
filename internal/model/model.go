@@ -159,6 +159,9 @@ type Lease struct {
 	// UsedMB is what a build lease uses now: the footprint of what its session started since
 	// the grant.
 	UsedMB float64 `json:"used_mb,omitempty"`
+	// InsideMB is the part of UsedMB that is growth of Docker's VM or a Gradle daemon, which
+	// those resources' own figures already include.
+	InsideMB float64 `json:"inside_mb,omitempty"`
 	// BaseFootprintMB is the session's process-tree memory when the lease was granted.
 	BaseFootprintMB float64 `json:"base_footprint_mb,omitempty"`
 	// DaemonBaseMB is what each Gradle and Kotlin daemon held when a gradle lease was granted, or

@@ -232,6 +232,9 @@ var xmxRe = regexp.MustCompile(`-Xmx(\S+)`)
 var limaRe = regexp.MustCompile(`limactl\S*\s+hostagent\b.*\s(\S+)$`)
 var tartRe = regexp.MustCompile(`\btart\s+run\s+(\S+)`)
 
+// shells are interpreters whose command line is a script, not what they are.
+var shells = map[string]bool{"sh": true, "bash": true, "zsh": true, "dash": true, "fish": true, "-zsh": true, "-bash": true}
+
 var databases = map[string]string{ // process name -> brew formula prefix
 	"postgres": "postgresql", "mysqld": "mysql", "redis-server": "redis", "mongod": "mongodb",
 	"mariadbd": "mariadb", "valkey-server": "valkey", "memcached": "memcached",
@@ -247,6 +250,11 @@ func Processes(cfg model.Config, procs map[int]*sys.Proc) []*model.Resource {
 	for _, p := range procs {
 		base := filepath.Base(p.Exe)
 		a := p.Args
+		if shells[base] {
+			// A shell is never one of these, whatever its command line mentions: an agent's
+			// shell running a command that names limactl or GradleDaemon was taken for a VM.
+			continue
+		}
 		switch {
 		case strings.Contains(a, "org.gradle.launcher.daemon") || strings.Contains(a, "GradleDaemon"):
 			res = append(res, procRes(p, "gradle", model.RKGradle, "Gradle daemon", heap(a), p.RSSMB))
@@ -258,12 +266,12 @@ func Processes(cfg model.Config, procs map[int]*sys.Proc) []*model.Resource {
 			res = append(res, procRes(p, "emu", model.RKEmulator, "Android emulator "+name, "AVD "+name, p.RSSMB+sub[p.PID]))
 		case strings.HasPrefix(base, "qemu-system") && !underApp(procs, p, "Docker.app") && !underLima(procs, p):
 			res = append(res, procRes(p, "vm", model.RKVM, "QEMU VM", trunc(a, 90), p.RSSMB+sub[p.PID]))
-		case limaRe.MatchString(a):
+		case strings.HasPrefix(base, "limactl") && limaRe.MatchString(a):
 			name := limaRe.FindStringSubmatch(a)[1]
 			r := procRes(p, "vm", model.RKVM, "Lima VM "+name, "limactl", p.RSSMB+sub[p.PID]+guestMB(guests[p.PID]))
 			r.ID, r.Restart = "vm:lima-"+name, "limactl start "+name
 			res = append(res, r)
-		case tartRe.MatchString(a):
+		case base == "tart" && tartRe.MatchString(a):
 			name := tartRe.FindStringSubmatch(a)[1]
 			r := procRes(p, "vm", model.RKVM, "Tart VM "+name, "tart", p.RSSMB+sub[p.PID]+guestMB(guests[p.PID]))
 			r.ID, r.Restart = "vm:tart-"+name, "tart run "+name
@@ -351,7 +359,7 @@ func underApp(procs map[int]*sys.Proc, p *sys.Proc, app string) bool {
 // Lima VM's, not as a VM of its own.
 func underLima(procs map[int]*sys.Proc, p *sys.Proc) bool {
 	for i, q := 0, procs[p.PPID]; q != nil && q.PID > 1 && i < 64; i, q = i+1, procs[q.PPID] {
-		if limaRe.MatchString(q.Args) {
+		if strings.HasPrefix(filepath.Base(q.Exe), "limactl") && limaRe.MatchString(q.Args) {
 			return true
 		}
 	}

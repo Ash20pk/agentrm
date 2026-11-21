@@ -353,7 +353,7 @@ struct ItemRow: View {
                 Rectangle().fill(i < filled ? Lamp.paused.color : Ink.off).frame(height: 4)
             }
         }
-        .accessibilityLabel(item.step == "stop" ? "Stops in \(Fmt.clock(d))" : "Pauses in \(Fmt.clock(d))"))
+        .accessibilityLabel("\(["stop": "Stops", "restart": "Restarts"][item.step] ?? "Pauses") in \(Fmt.clock(d))"))
     }
 
     @ViewBuilder

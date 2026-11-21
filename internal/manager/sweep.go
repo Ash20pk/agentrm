@@ -76,12 +76,14 @@ func (m *Manager) Run(ctx context.Context) {
 			}
 		case pid := <-exits:
 			// An agent exited: end its sessions now, with a table read after the exit.
+			m.tickMu.Lock()
 			procs := sys.ListProcs()
 			if rec := m.recorder(); rec != nil {
 				now := m.now()
 				rec.Write(trace.Frame{T: now, Exit: pid, ExitTab: rec.Procs(now, procs, m.traceOwner, m.footprint)})
 			}
 			m.AgentExited(pid, procs)
+			m.tickMu.Unlock()
 		}
 	}
 }
@@ -367,10 +369,11 @@ func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[
 			}
 		}
 	}
-	m.dockerFullMB, m.dockerContainersMB = 0, containers
+	m.dockerFullMB, m.dockerContainersMB, m.dockerMeasured = 0, containers, false
 	for _, r := range found.Resources {
 		if r.Kind == model.RKDockerVM {
 			m.dockerFullMB = r.MemMB // its footprint, before it is credited
+			m.dockerMeasured = procs != nil && r.MemMB > 0
 			m.creditDockerVM(r, containers, now)
 		}
 	}

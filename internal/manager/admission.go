@@ -242,7 +242,13 @@ func (m *Manager) grantWaiters(now time.Time, press bool) {
 	for _, w := range append([]*model.Waiter(nil), m.liveWaiters(now)...) {
 		// It got one some other way. A request for more than the session held waits while the
 		// session holds what it held then; only more than that answers it.
-		if held := m.heldGB(w.Session, w.Kind); held > 0 && (w.HeldGB == 0 || held > w.HeldGB+0.01) {
+		held := m.heldGB(w.Session, w.Kind)
+		if w.HeldGB > 0 && held < w.HeldGB-0.01 {
+			// Part of what it held is gone (released, expired): it now needs that part too.
+			w.NeedMB += (w.HeldGB - held) * 1024
+			w.HeldGB = held
+		}
+		if held > 0 && (w.HeldGB == 0 || held > w.HeldGB+0.01) {
 			m.dropWaiter(w.Session, w.Kind)
 			continue
 		}

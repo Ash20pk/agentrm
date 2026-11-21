@@ -57,9 +57,9 @@ extension Store {
         for l in leases where !backed.contains(l.id) {
             let lamp: Lamp = l.verified == false ? .waiting : .inUse
             let mb = l.used_mb ?? 0
-            // A Docker or Gradle build runs inside Docker's VM or a Gradle daemon, whose rows
-            // already count it: shown on its own row, but not counted twice in the meter.
-            if !Self.runsInsideAnother(l.kind) { byLamp[lamp, default: 0] += mb }
+            // What a Docker or Gradle build adds to Docker's VM or a Gradle daemon is in their rows
+            // already: the meter counts only the rest (the processes it started itself).
+            byLamp[lamp, default: 0] += max(0, mb - (l.inside_mb ?? 0))
             let evidence = l.verified == false ? "no use seen yet" : (l.evidence ?? "in use")
             var detail = "\(l.agent.capitalized), \(evidence)"
             if l.declared == true {
@@ -67,7 +67,7 @@ extension Store {
             } else if !l.purpose.hasPrefix("inferred") {
                 detail += ", charged \(Fmt.size(l.mem_gb * 1024))"
             }
-            if Self.runsInsideAnother(l.kind) { detail += l.kind == "gradle" ? ", inside its Gradle daemon" : ", inside Docker's VM" }
+            if (l.inside_mb ?? 0) > 0 { detail += l.kind == "gradle" ? ", mostly inside its Gradle daemon" : ", mostly inside Docker's VM" }
             items.append(Item(id: l.id, name: l.purpose.isEmpty ? Kind.name(l.kind) : l.purpose,
                               detail: detail, mb: mb, lamp: lamp, resource: nil, actions: [.release(l.id)]))
         }
@@ -85,10 +85,6 @@ extension Store {
         return Reading(mbByLamp: byLamp, keptMB: kept, freeMB: free, totalMB: total,
                        segments: Self.segments(byLamp: byLamp, kept: kept, free: free, total: total), items: items)
     }
-
-    /// Lease kinds whose work runs inside another resource (the daemon measures it as that one's
-    /// growth).
-    static func runsInsideAnother(_ kind: String) -> Bool { ["docker-build", "compose", "cluster", "gradle"].contains(kind) }
 
     private func item(for r: Resource, lamp: Lamp, _ s: Status) -> Item {
         // The countdown is the daemon's: what it will do next and when (nil: nothing is coming).
@@ -123,11 +119,12 @@ extension Store {
             if r.started_by == "you" {
                 detail += ". You started it: AgentRM leaves it to you"
             } else if step != "", let at = next {
-                let verb = step == "stop" ? "stop" : "pause"
+                let verb = step // "pause", "stop" or "restart"
+                let ing = ["pause": "pausing", "stop": "stopping", "restart": "restarting"][step] ?? step
                 if would {
                     detail += at < Date() ? ", would \(verb) now" : ", would \(verb) \(Fmt.rel(at))"
                 } else {
-                    detail += at < Date() ? (step == "stop" ? ", stopping now" : ", pausing now") : ", \(verb)s \(Fmt.rel(at))"
+                    detail += at < Date() ? ", \(ing) now" : ", \(verb)s \(Fmt.rel(at))"
                 }
             } else if r.orphan_since != nil && (r.kind == "vm" || r.ask_only == true) {
                 // Never stopped on AgentRM's own (a VM, an app): yours to stop.
@@ -146,7 +143,9 @@ extension Store {
                     detail += would ? ", would \(verb) \(at < Date() ? "now" : Fmt.rel(at))" : ", \(verb)s \(at < Date() ? "now" : Fmt.rel(at))"
                 }
                 return Item(id: r.id, name: r.name, detail: detail, mb: r.mem_mb, lamp: lamp, resource: r,
-                            actions: r.pinned == true ? [.unpin] : [.stop],
+                            // Restart offered only when the daemon would consider it (nothing runs in
+                            // it): otherwise it is refused.
+                            actions: r.pinned == true ? [.unpin] : (r.orphan_since != nil ? [.stop] : []),
                             deadline: step == "stop" && !would && r.pinned != true ? next : nil, window: window, step: step)
             }
             return Item(id: r.id, name: r.name, detail: "\(Kind.name(r.kind)), pinned by you", mb: r.mem_mb,

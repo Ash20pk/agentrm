@@ -197,7 +197,9 @@ func (m *Manager) usedBetween(tree []*sys.Proc, from, to time.Time, skip map[int
 
 // nextGrant is when the session was next granted a lease after l (zero: not since). What it
 // starts after that is that lease's work, not l's, whatever kind it is and whether or not it
-// is still held. Two leases granted at the same moment are ordered by ID.
+// is still held. A lease a sweep recorded for something already running (attribute, claims)
+// is not a grant: the build's later processes stay the build's. Two leases granted at the
+// same moment are ordered by ID.
 func (m *Manager) nextGrant(l *model.Lease) time.Time {
 	var next time.Time
 	if s := m.st.Sessions[l.Session]; s != nil {
@@ -207,8 +209,8 @@ func (m *Manager) nextGrant(l *model.Lease) time.Time {
 			}
 		}
 	}
-	for _, o := range m.st.Leases { // held leases, however they were made
-		if o == l || o.Session != l.Session {
+	for _, o := range m.st.Leases { // builds made without grant(); not a sweep's record of a server
+		if o == l || o.Session != l.Session || len(o.Resources) > 0 || inferred(o) {
 			continue
 		}
 		if (o.Created.After(l.Created) || o.Created.Equal(l.Created) && o.ID > l.ID) && (next.IsZero() || o.Created.Before(next)) {

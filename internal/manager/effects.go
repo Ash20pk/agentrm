@@ -239,7 +239,7 @@ func (m *Manager) seedFreed() {
 // unfree takes a restored stop out of the freed totals: it gave nothing back in the end.
 func (m *Manager) unfree(s *model.Stopped) {
 	for i, f := range m.st.Freed {
-		if f.ID == s.Resource.ID && f.At.Equal(s.StoppedAt) {
+		if (f.ID == s.Resource.ID || f.ID == "") && f.At.Equal(s.StoppedAt) { // "": written before IDs
 			m.st.Freed = append(m.st.Freed[:i], m.st.Freed[i+1:]...)
 			return
 		}

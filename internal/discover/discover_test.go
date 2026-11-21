@@ -118,6 +118,43 @@ func TestVMGuestPairingIsGlobal(t *testing.T) {
 	}
 }
 
+// Docker Desktop and a Lima VM starting together: each gets its own guest (Docker used to be
+// paired first, on its own, and could take Lima's).
+func TestDockerGuestIsPairedWithTheOthers(t *testing.T) {
+	t0 := time.Date(2026, 11, 18, 9, 0, 0, 0, time.UTC)
+	vz := "/System/Library/Frameworks/Virtualization.framework/Versions/A/XPCServices/com.apple.Virtualization.VirtualMachine.xpc/Contents/MacOS/com.apple.Virtualization.VirtualMachine"
+	procs := map[int]*sys.Proc{
+		1:  {PID: 1, Exe: "launchd"},
+		10: {PID: 10, PPID: 1, Exe: "/Applications/Docker.app/Contents/MacOS/com.docker.virtualization", Start: t0},
+		11: {PID: 11, PPID: 1, Exe: vz, RSSMB: 4000, Start: t0.Add(40 * time.Second)},
+		20: {PID: 20, PPID: 1, Exe: "/opt/homebrew/bin/limactl", Args: "/opt/homebrew/bin/limactl hostagent --pidfile x a", RSSMB: 10, Start: t0.Add(5 * time.Second)},
+		21: {PID: 21, PPID: 1, Exe: vz, RSSMB: 1000, Start: t0.Add(10 * time.Second)},
+	}
+	noFootprint(t, nil)
+	if d := dockerVMProc(procs); d == nil || d.PID != 11 {
+		t.Fatalf("Docker's guest: %+v", d)
+	}
+	for _, r := range Processes(model.DefaultConfig(), procs) {
+		if r.ID == "vm:lima-a" && r.MemMB != 1010 {
+			t.Fatalf("Lima: %.0f MB", r.MemMB)
+		}
+	}
+}
+
+// An agent's shell whose command names these tools is not one of them (it was listed as a Lima
+// VM, and given a lease).
+func TestAShellIsNotWhatItMentions(t *testing.T) {
+	procs := map[int]*sys.Proc{
+		1: {PID: 1, Exe: "launchd"},
+		5: {PID: 5, PPID: 1, Exe: "/bin/zsh", Args: "/bin/zsh -c limactl hostagent --pidfile x a && java GradleDaemon && tart run v && pwd -P >| /tmp/claude-3c15-cwd", RSSMB: 5},
+		6: {PID: 6, PPID: 1, Exe: "/usr/bin/python3", Args: "python3 -c print('limactl hostagent --pidfile x b')", RSSMB: 5},
+	}
+	noFootprint(t, nil)
+	if rs := Processes(model.DefaultConfig(), procs); len(rs) != 0 {
+		t.Fatalf("found %d: %s", len(rs), rs[0].ID)
+	}
+}
+
 // A booted simulator is sized by its launchd_sim and what runs under it, not the estimate.
 func TestSimulatorsAreMeasured(t *testing.T) {
 	udid := "0F1E2D3C-AAAA-BBBB-CCCC-123456789ABC"

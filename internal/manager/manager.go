@@ -74,6 +74,7 @@ type Manager struct {
 	// Docker's VM footprint and what its containers hold, as of the last sweep: a Docker
 	// lease's use is how the first grew beyond the second (daemonGrowthMB).
 	dockerFullMB, dockerContainersMB float64
+	dockerMeasured                   bool      // the last sweep measured the VM
 	memAt                            time.Time // when m.mem was read
 	// freshMem: a request for memory reads it again first when it is older than memFresh
 	// (live only: tests and replays bring their own readings).
@@ -411,13 +412,15 @@ func (m *Manager) HandleCtx(ctx context.Context, path string, peerPID int, req a
 	}
 	if path == "/acquire" && m.memStale() {
 		// Between sweeps (30 s when idle) memory can change by gigabytes: a request is judged
-		// on a reading a few seconds old at most. A fast tick reads and records it as usual,
-		// after any tick under way; requests arriving together share one.
-		m.tickMu.Lock()
-		if m.memStale() {
-			m.fastTick()
+		// on a reading a few seconds old at most. A fast tick reads and records it as usual.
+		// Never waited for: while a sweep or another request's tick is under way (a sweep can
+		// take a minute running its stops), the request is judged on what is known.
+		if m.tickMu.TryLock() {
+			if m.memStale() {
+				m.fastTick()
+			}
+			m.tickMu.Unlock()
 		}
-		m.tickMu.Unlock()
 	}
 	return m.handleFacts(ctx, path, h, facts, req)
 }

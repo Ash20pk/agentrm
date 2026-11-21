@@ -105,7 +105,7 @@ func TestAskingAgainDoesNotStackLeases(t *testing.T) {
 func TestDockerBuildIsMeasuredInDockersVM(t *testing.T) {
 	m, c := newTest(t, 8)
 	t0 := c.Now()
-	m.dockerFullMB = 1300 // the VM's footprint; its containers hold nothing
+	m.dockerFullMB, m.dockerMeasured = 1300, true // the VM's footprint; its containers hold nothing
 	m.learnSession(100, "s", "claude")
 	procs := map[int]*sys.Proc{100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: t0.Add(-time.Hour)}}
 	m.updateFootprints(procs, t0)
@@ -290,7 +290,7 @@ func TestFreedLogIsSeededFromPastStops(t *testing.T) {
 // work: charged to the lease, each read as an overrun and distrusted the session.
 func TestDockerLeaseIsNotChargedForContainers(t *testing.T) {
 	m, c := newTest(t, 8)
-	m.dockerFullMB, m.dockerContainersMB = 6144, 4096
+	m.dockerFullMB, m.dockerContainersMB, m.dockerMeasured = 6144, 4096, true
 	m.learnSession(100, "s", "claude")
 	procs := map[int]*sys.Proc{100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: c.Now().Add(-time.Hour)}}
 	if r := acquire(t, m, agent("s"), model.KDockerBuild, 1); !r.Granted {
@@ -354,7 +354,7 @@ func TestFailedSwapReadingIsIgnored(t *testing.T) {
 // An unused compose lease is not "started" by someone else growing Docker's VM.
 func TestDockerVMGrowthIsNotTakeUp(t *testing.T) {
 	m, c := newTest(t, 8)
-	m.dockerFullMB = 2000
+	m.dockerFullMB, m.dockerMeasured = 2000, true
 	m.learnSession(100, "s", "claude")
 	procs := map[int]*sys.Proc{100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: c.Now().Add(-time.Hour)}}
 	m.updateFootprints(procs, c.Now())
@@ -469,5 +469,123 @@ func TestNextStepWhileHeldAndUnderWay(t *testing.T) {
 	m.checkOrphans(c.Now())
 	if r.NextStep != "stop" || r.NextAt == nil || !r.NextAt.Equal(c.Now()) {
 		t.Fatalf("under way: %q at %v", r.NextStep, r.NextAt)
+	}
+}
+
+// The VM not measured for a sweep (Docker restarting, the process table unread, the daemon just
+// started): what it holds when measured again is a new base, not the lease's growth.
+func TestDockerVMGapIsNotGrowth(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.learnSession(100, "s", "claude")
+	procs := map[int]*sys.Proc{100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: c.Now().Add(-time.Hour)}}
+	// Granted before the first sweep (the daemon just restarted): nothing measured yet.
+	if r := acquire(t, m, agent("s"), model.KDockerBuild, 1); !r.Granted {
+		t.Fatal(r.Reason)
+	}
+	l := m.findLease("s", model.KDockerBuild)
+	sweep := func(full, cont float64, measured bool) float64 {
+		m.dockerFullMB, m.dockerContainersMB, m.dockerMeasured = full, cont, measured
+		c.Add(30 * time.Second)
+		m.updateFootprints(procs, c.Now())
+		return l.UsedMB
+	}
+	for i, st := range []struct {
+		full, cont float64
+		measured   bool
+	}{{6144, 4096, true}, {0, 4096, false}, {6144, 4096, true}, {0, 0, false}, {2048, 0, true}, {6144, 4096, true}} {
+		if u := sweep(st.full, st.cont, st.measured); u != 0 {
+			t.Fatalf("step %d (%+v): charged %.0f MB", i, st, u)
+		}
+	}
+	if u := sweep(7144, 4096, true); u != 1000 {
+		t.Fatalf("real growth: %.0f MB, want 1000", u)
+	}
+	if l.Overran {
+		t.Fatal("flagged as an overrun")
+	}
+}
+
+// A compose lease holding its containers: once they stop, what the VM keeps is not its use.
+func TestComposeDownIsNotCharged(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.dockerFullMB, m.dockerMeasured = 2000, true
+	m.learnSession(100, "s", "claude")
+	procs := map[int]*sys.Proc{100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: c.Now().Add(-time.Hour)}}
+	if r := acquire(t, m, agent("s"), model.KCompose, 3); !r.Granted {
+		t.Fatal(r.Reason)
+	}
+	l := m.findLease("s", model.KCompose)
+	addRes(m, "compose:app", model.RKContainers, 3000, l.ID)
+	m.dockerFullMB, m.dockerContainersMB = 5000, 3000
+	c.Add(time.Minute)
+	m.updateFootprints(procs, c.Now())
+	// compose down: the containers go, the VM keeps their memory.
+	delete(m.st.Resources, "compose:app")
+	l.Resources = nil
+	m.dockerContainersMB = 0
+	c.Add(time.Minute)
+	m.updateFootprints(procs, c.Now())
+	if l.UsedMB != 0 {
+		t.Fatalf("charged %.0f MB the VM kept", l.UsedMB)
+	}
+}
+
+// A Docker build's work is the VM's growth: a queued one is taken up by its own build.
+func TestDockerBuildIsTakenUpByItsBuild(t *testing.T) {
+	m, c := newTest(t, 8)
+	m.dockerFullMB, m.dockerMeasured = 2000, true
+	m.learnSession(100, "s", "claude")
+	procs := map[int]*sys.Proc{100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: c.Now().Add(-time.Hour)}}
+	m.updateFootprints(procs, c.Now())
+	if r := acquire(t, m, agent("s"), model.KDockerBuild, 2); !r.Granted {
+		t.Fatal(r.Reason)
+	}
+	l := m.findLease("s", model.KDockerBuild)
+	off := c.Now()
+	l.Offered = &off
+	m.dockerFullMB = 3500
+	c.Add(30 * time.Second)
+	m.updateFootprints(procs, c.Now())
+	m.checkLeases(c.Now())
+	if l.Offered != nil {
+		t.Fatal("a running Docker build was not taken up")
+	}
+}
+
+// Holding 1 GB and waiting for 6: if the 1 GB goes, the request waits for the whole 6.
+func TestALargerAskNeedsWhatItNoLongerHolds(t *testing.T) {
+	m, c := newTest(t, 3)
+	acquire(t, m, agent("s"), model.KServer, 1)
+	if r := acquire(t, m, agent("s"), model.KServer, 6); r.Granted {
+		t.Fatal("granted without room")
+	}
+	delete(m.st.Leases, m.findLease("s", model.KServer).ID)
+	m.mem.AvailableMB = 12 * 1024
+	m.grantWaiters(c.Now(), false)
+	if held := m.heldGB("s", model.KServer); held != 6 {
+		t.Fatalf("holds %.1f GB, want 6", held)
+	}
+}
+
+// A lease a sweep records for a server already running does not cut off a build's processes.
+func TestRecordedLeaseDoesNotCutABuild(t *testing.T) {
+	m, c := newTest(t, 8)
+	t0 := c.Now()
+	m.footprint = func(pid int) (float64, bool) { return map[int]float64{103: 900}[pid], pid == 103 }
+	m.learnSession(100, "s", "claude")
+	if r := acquire(t, m, agent("s"), model.KCargoBuild, 2); !r.Granted {
+		t.Fatal(r.Reason)
+	}
+	bld := m.findLease("s", model.KCargoBuild)
+	m.st.Leases["rec"] = &model.Lease{ID: "rec", Session: "s", Kind: model.KServer, MemGB: 0.1, Purpose: "started without a lease",
+		Created: t0.Add(time.Minute), Expires: t0.Add(time.Hour), LastUsed: t0, Resources: []string{"srv:1"}}
+	procs := map[int]*sys.Proc{
+		100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude", Start: t0.Add(-time.Hour)},
+		103: {PID: 103, PPID: 100, Exe: "rustc", Args: "rustc", Start: t0.Add(2 * time.Minute)},
+	}
+	c.Add(3 * time.Minute)
+	m.updateFootprints(procs, c.Now())
+	if bld.UsedMB != 900 {
+		t.Fatalf("build charged %.0f MB, want its rustc's 900", bld.UsedMB)
 	}
 }

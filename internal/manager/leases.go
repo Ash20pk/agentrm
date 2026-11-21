@@ -146,6 +146,9 @@ func (m *Manager) grant(w *model.Waiter, now time.Time, note string) *model.Leas
 	switch host := daemonHost(l.Kind); host {
 	case model.RKDockerVM:
 		l.DaemonBaseMB = map[string]float64{dockerFullKey: m.dockerFullMB, dockerContainersKey: m.dockerContainersMB}
+		if !m.dockerMeasured {
+			l.DaemonBaseMB[dockerRebaseKey] = 1 // the first measurement is its base
+		}
 	case "":
 	default:
 		l.DaemonBaseMB = map[string]float64{}
@@ -389,18 +392,19 @@ func (m *Manager) updateFootprints(procs map[int]*sys.Proc, now time.Time) {
 		}
 	}
 	for _, l := range m.st.Leases {
+		m.trackDockerGrowth(l) // every sweep, held containers or not, session seen or not
 		if len(l.Resources) == 0 && !inferred(l) {
 			// A build: what it uses is what it started. Only processes started since the grant
 			// count, by footprint, so a simulator, a Gradle daemon or a dev server the session
 			// already had is not charged to the build. A process started after a later build
 			// lease of the same session is that lease's: each process is charged once.
-			m.trackDockerGrowth(l) // every sweep, so a sweep without the session is not a jump
 			if s := m.st.Sessions[l.Session]; s != nil {
 				from, to := l.Created.Add(-2*time.Second), m.nextGrant(l)
 				if !to.IsZero() {
 					to = to.Add(-2 * time.Second)
 				}
-				l.UsedMB = m.usedBetween(trees[s.AgentPID], from, to, bound) + m.daemonGrowthMB(l)
+				l.InsideMB = m.daemonGrowthMB(l)
+				l.UsedMB = m.usedBetween(trees[s.AgentPID], from, to, bound) + l.InsideMB
 				l.PeakMB = max(l.PeakMB, l.UsedMB)
 				m.checkOverrun(l, now)
 			}
@@ -545,15 +549,33 @@ const (
 	dockerFullKey       = "docker-vm:footprint"
 	dockerContainersKey = "docker:containers"
 	dockerGrewKey       = "docker:grew"
+	dockerRebaseKey     = "docker:rebase" // 1: the next measurement is a new base, not growth
 )
 
 // trackDockerGrowth adds a Docker lease's share of what the VM did since the last sweep. Growth
 // of the VM is the lease's, less what its containers grew by (an unrelated stack starting).
 // When containers shrink, the VM shrinking by up to as much is theirs, and the VM keeping what
 // they held is no one's: only what the VM does beyond that counts. Must hold mu.
+//
+// Nothing is counted while the VM is not measured (Docker stopped or restarting, the process
+// table unread, before the daemon's first sweep): the next measurement is a new base. A lease
+// holding its containers is measured by them; its base still follows the VM, so that what the
+// VM keeps once they stop is not counted as growth either.
 func (m *Manager) trackDockerGrowth(l *model.Lease) {
+	if daemonHost(l.Kind) != model.RKDockerVM {
+		return
+	}
+	if l.DaemonBaseMB == nil {
+		l.DaemonBaseMB = map[string]float64{dockerRebaseKey: 1}
+	}
 	b := l.DaemonBaseMB
-	if b == nil || daemonHost(l.Kind) != model.RKDockerVM {
+	if !m.dockerMeasured {
+		b[dockerRebaseKey] = 1
+		return
+	}
+	if _, ok := b[dockerFullKey]; !ok || b[dockerRebaseKey] == 1 || len(l.Resources) > 0 {
+		delete(b, dockerRebaseKey)
+		b[dockerFullKey], b[dockerContainersKey] = m.dockerFullMB, m.dockerContainersMB
 		return
 	}
 	df, dc := m.dockerFullMB-b[dockerFullKey], m.dockerContainersMB-b[dockerContainersKey]
@@ -568,12 +590,12 @@ func (m *Manager) trackDockerGrowth(l *model.Lease) {
 	b[dockerFullKey], b[dockerContainersKey] = m.dockerFullMB, m.dockerContainersMB
 }
 
-// startedMB is what shows something was started under a lease: its use, less any growth of
-// Docker's VM, which someone else's pull or build moves as well. A compose or cluster lease is
-// started when its containers are bound to it.
+// startedMB is what shows something was started under a lease: its use, except that a compose
+// or cluster lease is started when its containers are bound to it, not by growth of Docker's
+// VM, which someone else's pull moves as well. (A Docker build's work is that growth.)
 func (m *Manager) startedMB(l *model.Lease) float64 {
 	used := m.materialisedMB(l)
-	if len(l.Resources) == 0 && daemonHost(l.Kind) == model.RKDockerVM {
+	if len(l.Resources) == 0 && (l.Kind == model.KCompose || l.Kind == model.KCluster) {
 		used = max(0, used-m.daemonGrowthMB(l))
 	}
 	return used

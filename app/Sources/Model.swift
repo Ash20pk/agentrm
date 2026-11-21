@@ -54,6 +54,8 @@ struct Lease: Codable, Identifiable {
     var used_mb: Double?
     /// The holder chose the size itself (otherwise AgentRM's estimate, or inferred).
     var declared: Bool?
+    /// The part of used_mb that is growth of Docker's VM or a Gradle daemon (their rows have it).
+    var inside_mb: Double?
 }
 
 struct Resource: Codable, Identifiable {
