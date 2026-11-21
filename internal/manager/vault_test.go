@@ -285,6 +285,29 @@ func TestVaultAPIKeyThroughProxy(t *testing.T) {
 	}
 }
 
+// raw_key: the key goes in Authorization with nothing before it (Linear, AssemblyAI).
+func TestVaultAPIKeyRaw(t *testing.T) {
+	var gotKey string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotKey = r.Header.Get("Authorization")
+	}))
+	defer up.Close()
+	acct := model.VaultAccount{Name: "linear", Kind: model.VaultAPIKey, APIURL: up.URL, RawKey: true,
+		KeyEnv: "LINEAR_API_KEY", BaseEnv: "LINEAR_API_URL", Scopes: []string{"full"}}
+	m, _ := vaultTest(t, acct)
+	g := grantFor(t, m, vaultAgent("s1"), api.Req{Account: "linear"}, map[string]string{"key": "lin_api_real"})
+	req, _ := http.NewRequest("POST", g.Env["LINEAR_API_URL"]+"/graphql", nil)
+	req.Header.Set("Authorization", g.Env["LINEAR_API_KEY"])
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 || gotKey != "lin_api_real" {
+		t.Fatalf("%d, key %q", resp.StatusCode, gotKey)
+	}
+}
+
 // GitHub: the token is minted when you approve, and revoked at GitHub when the grant ends
 // before its hour is up.
 func TestVaultGitHubRevokedOnEnd(t *testing.T) {

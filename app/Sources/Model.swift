@@ -134,6 +134,7 @@ struct VaultAccount: Codable, Identifiable, Hashable {
     var api_url: String?
     var header: String?
     var prefix: String?
+    var raw_key: Bool?
     var key_env: String?
     var base_env: String?
     var region: String?
@@ -143,6 +144,22 @@ struct VaultAccount: Codable, Identifiable, Hashable {
     var user_env: String?
     var pass_env: String?
     var id: String { name }
+}
+
+/// A well-known API an API key account can be filled in for: `agentrm vault templates --json`,
+/// from internal/vault/templates.json.
+struct VaultTemplate: Codable, Identifiable, Hashable {
+    var id: String
+    var name: String
+    var category: String
+    var api_url: String
+    var header: String?
+    var prefix: String?
+    var raw_key: Bool?
+    var key_env: String
+    var base_env: String
+    var key_url: String?
+    var note: String?
 }
 
 /// What an agent asked the vault for.

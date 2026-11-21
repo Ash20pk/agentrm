@@ -16,6 +16,7 @@ import (
 	"agentrm/internal/api"
 	"agentrm/internal/model"
 	"agentrm/internal/sys"
+	"agentrm/internal/vault"
 )
 
 const vaultUsage = `agentrm vault — short-lived access to accounts, approved by a person
@@ -28,6 +29,7 @@ const vaultUsage = `agentrm vault — short-lived access to accounts, approved b
                                                print the access as shell exports (approved
                                                separately: what is printed goes into your transcript)
   agentrm vault revoke GRANT | --all           end access before its time
+  agentrm vault templates [--json]             the APIs the app can fill in an API key account for
 
 Scopes: GitHub permissions (contents:read,pull_requests:write; default contents:read) with
 --repo names; an API key "full" or "read" (GET only); AWS a role name or ARN; a login "use".
@@ -78,6 +80,8 @@ func runVault(args []string) int {
 	switch sub {
 	case "list", "ls", "grants":
 		return fail(vaultList(*asJSON))
+	case "templates": // the AgentRM app reads these for its "Add an API key" list
+		return fail(vaultTemplates(os.Stdout, *asJSON))
 	case "run", "reveal":
 		reveal := sub == "reveal"
 		if arg(0) == "" {
@@ -117,7 +121,7 @@ func runVault(args []string) int {
 		req.ApprovalID, req.Approve, req.TTLMinutes = arg(0), approve, *minutes
 		if *approve {
 			var in struct {
-				Material map[string]string  `json:"material"`
+				Material map[string]string   `json:"material"`
 				Account  *model.VaultAccount `json:"account"` // as saved in the app
 				Shown    *model.VaultAsk     `json:"shown"`   // the request as the app showed it
 			}
@@ -251,6 +255,25 @@ func printExports(w io.Writer, g *api.VaultResp) {
 	if len(keys) > 0 {
 		fmt.Fprintf(w, "export %s=\"${%s:+$%s,}%s\"\n", sys.VaultVarsEnv, sys.VaultVarsEnv, sys.VaultVarsEnv, strings.Join(keys, ","))
 	}
+}
+
+func vaultTemplates(w io.Writer, asJSON bool) error {
+	ts, err := vault.Templates()
+	if err != nil {
+		return err
+	}
+	if asJSON {
+		return json.NewEncoder(w).Encode(ts)
+	}
+	cat := ""
+	for _, t := range ts {
+		if t.Category != cat {
+			cat = t.Category
+			fmt.Fprintf(w, "\n%s\n", cat)
+		}
+		fmt.Fprintf(w, "  %-16s %-26s %s, sets %s and %s\n", t.ID, t.Name, t.APIURL, t.KeyEnv, t.BaseEnv)
+	}
+	return nil
 }
 
 func vaultList(asJSON bool) error {

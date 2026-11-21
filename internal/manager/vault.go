@@ -559,7 +559,7 @@ func (m *Manager) proxyLookup(tok string) (vault.Route, string, bool) {
 	if header == "" {
 		header = "Authorization"
 	}
-	if prefix == "" && strings.EqualFold(header, "Authorization") {
+	if prefix == "" && !live.acct.RawKey && strings.EqualFold(header, "Authorization") {
 		prefix = "Bearer "
 	}
 	t := now

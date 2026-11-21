@@ -131,7 +131,7 @@ struct VaultTab: View {
     private var firstRun: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Start with an API key").font(Face.body(15, .semibold))
-            Text("Paste a key (OpenAI, Anthropic, OpenRouter or your own API). Agents get a token for AgentRM's local proxy instead of the key, so they never see it, and revoking stops them at once.")
+            Text("Pick the API (OpenAI, Anthropic, Gemini, Stripe and 50 more, or your own) and paste the key. Agents get a token for AgentRM's local proxy instead of the key, so they never see it, and revoking stops them at once.")
                 .font(Face.body(13)).foregroundStyle(Ink.dim).fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 8) {
                 Button("Add an API key") { add("apikey") }.buttonStyle(.key(.amber))
@@ -255,11 +255,16 @@ struct VaultAccountEditor: View {
     @State private var readOnly = false
     @State private var error: String?
     @State private var saving = false
+    // API key: the template it was filled in from; a new one starts on the list of them.
+    @State private var template: VaultTemplate?
+    @State private var picking: Bool
+    @State private var details = false
 
     init(original: VaultAccount?, account: VaultAccount, done: @escaping () -> Void) {
         self.original = original
         _account = State(initialValue: account)
         self.done = done
+        _picking = State(initialValue: original == nil && account.kind == "apikey")
         _reposText = State(initialValue: (account.repos ?? []).joined(separator: ", "))
         _permsText = State(initialValue: (account.permissions ?? [:]).sorted { $0.key < $1.key }.map { "\($0.key):\($0.value)" }.joined(separator: ", "))
         _rolesText = State(initialValue: account.kind == "aws" ? (account.scopes ?? []).joined(separator: "\n") : "")
@@ -275,8 +280,28 @@ struct VaultAccountEditor: View {
     }
 
     var body: some View {
+        if picking {
+            VaultTemplatePicker(pick: use, cancel: done)
+        } else {
+            form
+        }
+    }
+
+    private var title: String {
+        if let original { return "Edit \(original.name)" }
+        if let template { return "Add \(template.name)" }
+        return "Add \(VaultText.kindName(account.kind))"
+    }
+
+    private var form: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text(original == nil ? "Add \(VaultText.kindName(account.kind))" : "Edit \(original!.name)").font(Face.body(18, .semibold))
+            HStack {
+                Text(title).font(Face.body(18, .semibold))
+                Spacer()
+                if original == nil && account.kind == "apikey" {
+                    Button("Choose another API") { picking = true }.buttonStyle(.link)
+                }
+            }
             Form {
                 TextField("Name agents ask for", text: $account.name, prompt: Text("github-openbox"))
                 TextField("Note for agents", text: opt(\.note), prompt: Text("what it is for"))
@@ -327,22 +352,41 @@ struct VaultAccountEditor: View {
 
     @ViewBuilder private var apikey: some View {
         Section {
-            Menu("Fill in for…") {
-                Button("OpenAI") { preset("https://api.openai.com/v1", "OPENAI_API_KEY", "OPENAI_BASE_URL", nil, nil) }
-                Button("Anthropic") { preset("https://api.anthropic.com", "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "x-api-key", nil) }
-                Button("OpenRouter") { preset("https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", "OPENROUTER_BASE_URL", nil, nil) }
+            SecureField(keep.isEmpty ? "API key" : keep, text: $secret)
+            if let t = template, let k = t.key_url, let url = URL(string: k) {
+                Link("Get a \(t.name) key ↗", destination: url).font(Face.body(12))
             }
-            TextField("API address", text: opt(\.api_url), prompt: Text("https://api.openai.com/v1"))
-            TextField("Key variable", text: opt(\.key_env), prompt: Text("OPENAI_API_KEY"))
-            TextField("Address variable", text: opt(\.base_env), prompt: Text("OPENAI_BASE_URL"))
+            if let note = template?.note {
+                Text(note).font(Face.body(12)).foregroundStyle(Ink.dim).fixedSize(horizontal: false, vertical: true)
+            }
+            Toggle("Read-only (GET requests only)", isOn: $readOnly)
+        } header: {
+            Text("Key")
+        }
+        if template == nil || details {
+            apikeyDetails
+        } else {
+            Section {
+                Button("Show details: \(account.api_url ?? "") · \(account.key_env ?? "")") { details = true }.buttonStyle(.link)
+            }
+        }
+    }
+
+    @ViewBuilder private var apikeyDetails: some View {
+        Section {
+            TextField("API address", text: opt(\.api_url), prompt: Text("https://api.example.com/v1"))
+            TextField("Key variable", text: opt(\.key_env), prompt: Text("EXAMPLE_API_KEY"))
+            TextField("Address variable", text: opt(\.base_env), prompt: Text("EXAMPLE_BASE_URL"))
             TextField("Header", text: opt(\.header), prompt: Text("Authorization"))
             TextField("Before the key", text: opt(\.prefix), prompt: Text("Bearer  (for Authorization)"))
-            Toggle("Read-only (GET requests only)", isOn: $readOnly)
+            Toggle("The key alone in Authorization, no \"Bearer\"", isOn: Binding(
+                get: { account.raw_key ?? false }, set: { account.raw_key = $0 ? true : nil }))
+        } header: {
+            Text("Details")
         } footer: {
             Text("Agents get a token for AgentRM's local proxy and its address in these variables; the proxy adds the real key. Tools must let the API address be set.")
                 .font(Face.body(11)).foregroundStyle(Ink.label)
         }
-        Section("Key") { SecureField(keep.isEmpty ? "API key" : keep, text: $secret) }
     }
 
     @ViewBuilder private var aws: some View {
@@ -375,13 +419,37 @@ struct VaultAccountEditor: View {
         Binding(get: { account[keyPath: kp] ?? "" }, set: { account[keyPath: kp] = $0.isEmpty ? nil : $0 })
     }
 
-    private func preset(_ url: String, _ key: String, _ base: String, _ header: String?, _ prefix: String?) {
-        account.api_url = url
-        account.key_env = key
-        account.base_env = base
-        account.header = header
-        account.prefix = prefix
-        if account.name.isEmpty { account.name = key.lowercased().replacingOccurrences(of: "_api_key", with: "").replacingOccurrences(of: "_", with: "-") }
+    /// Fills the account in from a template (nil: another API, filled in by hand).
+    private func use(_ t: VaultTemplate?) {
+        let was = template
+        template = t
+        picking = false
+        details = false
+        var a = VaultAccountEditor.blank("apikey")
+        a.name = account.name
+        a.note = account.note
+        a.max_minutes = account.max_minutes
+        if let t {
+            a.api_url = t.api_url
+            a.header = t.header
+            a.prefix = t.prefix
+            a.raw_key = t.raw_key == true ? true : nil
+            a.key_env = t.key_env
+            a.base_env = t.base_env
+            // A name or note the template gave is replaced by the new one's; one you typed is kept.
+            if a.name.isEmpty || a.name.hasPrefix(was?.id ?? "\u{0}") { a.name = freeName(t.id) }
+            if (a.note ?? "").isEmpty || a.note == was?.name { a.note = t.name }
+        }
+        account = a
+    }
+
+    /// The template's name, or name-2, name-3… if an account already has it.
+    private func freeName(_ base: String) -> String {
+        let taken = Set(store.vaultAccounts.map(\.name))
+        if !taken.contains(base) { return base }
+        var n = 2
+        while taken.contains("\(base)-\(n)") { n += 1 }
+        return "\(base)-\(n)"
     }
 
     private func choosePEM() {
@@ -445,6 +513,83 @@ struct VaultAccountEditor: View {
                 self.error = error.localizedDescription
             }
             saving = false
+        }
+    }
+}
+
+/// The APIs an API key account can be filled in for, searchable, by category. The list is
+/// internal/vault/templates.json, read through the helper.
+struct VaultTemplatePicker: View {
+    let pick: (VaultTemplate?) -> Void
+    let cancel: () -> Void
+    @State private var all: [VaultTemplate] = []
+    @State private var query = ""
+    @State private var failed: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text("Add an API key").font(Face.body(18, .semibold))
+            Text("Pick the API and paste the key: the rest is filled in.").font(Face.body(13)).foregroundStyle(Ink.dim)
+            TextField("Search \(all.count) APIs", text: $query).textFieldStyle(.roundedBorder)
+            if let failed { Text(failed).font(Face.body(12, .semibold)).foregroundStyle(Color(hex: 0xFF8A8D)) }
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(groups, id: \.0) { cat, ts in
+                        Text(cat.uppercased()).font(Face.mono(10, .semibold)).tracking(1).foregroundStyle(Ink.label)
+                            .padding(.top, 10).padding(.bottom, 4)
+                        ForEach(ts) { t in row(t.name, t.api_url) { pick(t) } }
+                    }
+                    Text("NOT LISTED").font(Face.mono(10, .semibold)).tracking(1).foregroundStyle(Ink.label)
+                        .padding(.top, 10).padding(.bottom, 4)
+                    row("Another API", "fill in the address, variables and header yourself") { pick(nil) }
+                }
+            }
+            .frame(height: 380)
+            HStack {
+                Spacer()
+                Button("Cancel") { cancel() }.buttonStyle(.key).keyboardShortcut(.cancelAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 560)
+        .background(Ink.bg)
+        .environment(\.colorScheme, .dark)
+        .task { await load() }
+    }
+
+    private var groups: [(String, [VaultTemplate])] {
+        let q = query.trimmingCharacters(in: .whitespaces).lowercased()
+        let hits = q.isEmpty ? all : all.filter {
+            $0.name.lowercased().contains(q) || $0.id.contains(q) || $0.api_url.lowercased().contains(q) || $0.category.lowercased().contains(q)
+        }
+        var order: [String] = []
+        var by: [String: [VaultTemplate]] = [:]
+        for t in hits {
+            if by[t.category] == nil { order.append(t.category) }
+            by[t.category, default: []].append(t)
+        }
+        return order.map { ($0, by[$0]!) }
+    }
+
+    private func row(_ name: String, _ detail: String, _ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Text(name).font(Face.body(14, .semibold))
+                Text(detail).font(Face.mono(11)).foregroundStyle(Ink.label).lineLimit(1)
+                Spacer()
+            }
+            .padding(.vertical, 7).padding(.horizontal, 8)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func load() async {
+        do {
+            let d = try await CLI.run(["vault", "templates", "--json"])
+            all = try JSONDecoder().decode([VaultTemplate].self, from: d)
+        } catch {
+            failed = "Could not read the list of APIs: \(error.localizedDescription). Choose Another API to fill it in yourself."
         }
     }
 }

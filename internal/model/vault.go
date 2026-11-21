@@ -35,8 +35,10 @@ type VaultAccount struct {
 	APIURL string `json:"api_url,omitempty"`
 
 	// API key, through the proxy
-	Header  string `json:"header,omitempty"`   // the header the key goes in (default Authorization)
-	Prefix  string `json:"prefix,omitempty"`   // before the key in it (default "Bearer " for Authorization)
+	Header string `json:"header,omitempty"` // the header the key goes in (default Authorization)
+	Prefix string `json:"prefix,omitempty"` // before the key in it (default "Bearer " for Authorization)
+	// RawKey: the key goes in Authorization as it is, with no "Bearer " (Linear, AssemblyAI).
+	RawKey  bool   `json:"raw_key,omitempty"`
 	KeyEnv  string `json:"key_env,omitempty"`  // the variable a tool reads the key from (OPENAI_API_KEY)
 	BaseEnv string `json:"base_env,omitempty"` // the variable it reads the API's address from (OPENAI_BASE_URL)
 
@@ -67,12 +69,12 @@ type VaultAsk struct {
 	// AgentPID is the agent process that asked. A grant is reused only by that same process:
 	// a session's name is the agent's word (its hooks send it), and could be claimed by
 	// another agent once the first is gone.
-	AgentPID int    `json:"agent_pid,omitempty"`
+	AgentPID int `json:"agent_pid,omitempty"`
 	// AgentStart is when that process started (sys.ProcStartID): a PID alone may since have
 	// been given to another process.
 	AgentStart uint64 `json:"agent_start,omitempty"`
-	Repo     string `json:"repo,omitempty"` // the project it asked from
-	Cwd     string `json:"cwd,omitempty"`
+	Repo       string `json:"repo,omitempty"` // the project it asked from
+	Cwd        string `json:"cwd,omitempty"`
 }
 
 // VaultGrant is access you gave: kept as a record (the newest 200), never with the secret.

@@ -47,10 +47,21 @@ agent never holds; the app offers it first. With the other kinds the agent holds
 for as long as the grant lasts, and could print or copy it: the app says so when you add one
 and on every approval.
 
-**API key.** Choose OpenAI, Anthropic or OpenRouter to fill in the address and variables, or
-enter your own. The tool the agent runs must let its API address be set by a variable (most
-SDKs and CLIs do: `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`...). Tick read-only for keys agents
-should only query with.
+**API key.** Pick the API from the list (OpenAI, Anthropic, Gemini, Stripe and about 55 more,
+searchable) and paste the key: the address, variables and header are filled in and folded away
+under Details. Choose Another API to enter your own. The tool the agent runs must let its API
+address be set by a variable (most SDKs and CLIs do: `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`...);
+where a template knows one does not, it says so. Tick read-only for keys agents should only
+query with.
+
+The list is [`internal/vault/templates.json`](../internal/vault/templates.json), kept by hand
+and built into AgentRM; `agentrm vault templates` prints it. To add an API, add a line there,
+keeping its category's entries together: `id` (the account name it suggests), `name`,
+`category`, `api_url` (https, no trailing slash), `key_env` and `base_env` (the variables the
+API's own SDK reads), and where the key does not go as `Authorization: Bearer <key>`: `header`,
+`prefix` (with its trailing space), or `raw_key` for a bare key in Authorization. `key_url`
+(where to make a key) and `note` are shown in the app. `go test ./internal/vault/` checks every
+entry is an account the vault accepts.
 
 **GitHub App.** Create one at github.com/settings/apps/new (or your organisation's), with no
 webhook, and the most permissions you would ever let an agent have (for example Contents: write,
