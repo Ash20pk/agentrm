@@ -14,7 +14,7 @@ import (
 
 func TestRoundTripWithDeltas(t *testing.T) {
 	dir := t.TempDir()
-	w := NewWriter(dir, 3)
+	w := NewWriter(dir, 36500) // the frames are dated in the past; the writer prunes by the real clock
 	t0 := time.Date(2026, 11, 17, 10, 0, 0, 0, time.Local)
 	owners := map[int]Owner{700: {Agent: "claude", Session: "s", AgentPID: 500}}
 	owner := func(p *sys.Proc) (Owner, bool) { o, ok := owners[p.PID]; return o, ok }
@@ -99,10 +99,10 @@ func TestRedact(t *testing.T) {
 func TestCrashedFileDoesNotSpoilTheNext(t *testing.T) {
 	dir := t.TempDir()
 	t0 := time.Date(2026, 11, 17, 10, 0, 0, 0, time.Local)
-	w := NewWriter(dir, 3)
+	w := NewWriter(dir, 36500) // the frames are dated in the past; the writer prunes by the real clock
 	w.Write(Frame{T: t0, Exit: 1})
 	w.Flush() // then the daemon dies: no gzip trailer
-	w2 := NewWriter(dir, 3)
+	w2 := NewWriter(dir, 36500) // the frames are dated in the past; the writer prunes by the real clock
 	w2.Write(Frame{T: t0.Add(time.Minute), Exit: 2})
 	w2.Close()
 	rd, err := Open(dir)
