@@ -28,6 +28,7 @@ struct Config: Codable {
     var require_app_approval: Bool?
     var owner_gone_grace_minutes: Int?
     var auto_stop: [String: Bool]?
+    var max_swap_mb_per_min: Double?
 }
 
 struct Lease: Codable, Identifiable {
@@ -49,6 +50,8 @@ struct Lease: Codable, Identifiable {
     var branch: String?
     var task_done_why: String?
     var backfill: Bool?
+    /// What a lease with nothing discoverable behind it (a build) uses now, measured.
+    var used_mb: Double?
 }
 
 struct Resource: Codable, Identifiable {
@@ -70,6 +73,16 @@ struct Resource: Codable, Identifiable {
     var first_seen: Date?
     var ask_only: Bool?
     var pid: Int?
+    /// What the daemon will do next if nothing changes ("pause" or "stop"), when, and since when
+    /// it has been waiting; next_dry: in dry run, it only would. Nil: nothing is coming.
+    var next_step: String?
+    var next_at: Date?
+    var next_from: Date?
+    var next_dry: Bool?
+
+    /// Comes back by itself once stopped (Docker's VM, Xcode's helpers): not leased, decided
+    /// about on its own path.
+    var selfRestarting: Bool { kind == "docker-vm" || kind == "xcode-helper" }
 }
 
 struct AgentSession: Codable, Identifiable {
@@ -220,6 +233,10 @@ struct StoppedItem: Codable, Identifiable {
     var stopped_at: Date
     var why: String
     var by: String?
+    /// What the stop gave back (part of what Docker counted for a container). Older records
+    /// lack it: then what it held.
+    var freed_mb: Double?
+    var freed: Double { freed_mb ?? resource.mem_mb }
     var id: String { resource.id + "@" + String(stopped_at.timeIntervalSince1970) }
 }
 
@@ -253,11 +270,16 @@ struct Status: Codable {
     var leaks: [Leak]?
     var vault_accounts: [VaultAccount]?
     var vault_grants: [VaultGrant]?
+    var freed_today_mb: Double?
+    var freed_week_mb: Double?
+
+    /// The swap-out rate above which the daemon refuses work (its config, default 300 MB/min).
+    var swapLimit: Double { config.max_swap_mb_per_min ?? 300 }
 
     enum CodingKeys: String, CodingKey {
         case mem, headroom_mb, pending_mb, swap_rate_mb_min, waiters, config, leases, resources, sessions,
              events, last_sweep, daemon_version, sources, stopped, approvals, notes, prediction, trust_levels, leaks, fail_open,
-             vault_accounts, vault_grants
+             vault_accounts, vault_grants, freed_today_mb, freed_week_mb
         case selfUsage = "self"
     }
 }

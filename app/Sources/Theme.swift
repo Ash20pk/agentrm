@@ -180,10 +180,13 @@ struct LEDMeter: View {
         .accessibilityValue(summary)
     }
 
+    /// Evenly spaced labels that end at the whole: the marks are spread across the full width,
+    /// so the step must divide the count (18 GB: 0, 6, 12, 18; with a step of 4 "16" stood
+    /// where 18 is).
     private var scaleMarks: [Int] {
         let n = segments.count
-        let step = max(1, n / 4)
-        return Array(stride(from: 0, through: n, by: step))
+        let parts = [4, 3, 5, 6, 2].first { n % $0 == 0 } ?? 1
+        return (0...parts).map { n * $0 / parts }
     }
 
     @ViewBuilder
@@ -319,6 +322,12 @@ enum Fmt {
     }
 
     static func gb(_ mb: Double) -> String { String(format: "%.1f", max(0, mb) / 1024) }
+
+    /// A size with its unit: "30 MB" under a GB, "1.2 GB" from there.
+    static func size(_ mb: Double) -> String {
+        let v = max(0, mb)
+        return v < 1000 ? "\(Int(v.rounded())) MB" : String(format: "%.1f GB", v / 1024)
+    }
 
     static func when(_ d: Date) -> String {
         if Calendar.current.isDateInToday(d) { return "Today " + d.formatted(date: .omitted, time: .shortened) }

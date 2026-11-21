@@ -149,7 +149,7 @@ struct MenuView: View {
         return HStack(spacing: 8) {
             Readout(label: "Grant", value: Fmt.gb(grant), unit: "GB",
                     color: grant < 512 ? Lamp.nobody.color : Lamp.inUse.color)
-                .help("Memory a new lease can get now: available, minus promises, minus \(String(format: "%.1f", s.config.headroom_gb)) GB kept free.")
+                .help("Memory a new lease can get now: available, minus promises, minus \(String(format: "%g", s.config.headroom_gb)) GB kept free.")
             VStack(alignment: .leading, spacing: 6) {
                 Silk("Pressure")
                 PressureLamps(level: s.mem.pressure_level ?? 1).padding(.top, 4)
@@ -157,7 +157,7 @@ struct MenuView: View {
                     .font(Face.body(12)).foregroundStyle((s.mem.pressure_level ?? 1) >= 4 ? Lamp.nobody.textColor : Ink.dim)
             }
             .frame(maxWidth: .infinity, alignment: .leading).padding(10).panel()
-            Readout(label: "Swap", value: "\(swap)", unit: "MB/m", color: swap > 300 ? Lamp.nobody.color : Ink.text)
+            Readout(label: "Swap", value: "\(swap)", unit: "MB/m", color: Double(swap) > s.swapLimit ? Lamp.nobody.color : Ink.text)
         }
         .fixedSize(horizontal: false, vertical: true)
     }
@@ -185,7 +185,7 @@ struct MenuView: View {
     private func stoppedPanel(_ stopped: [StoppedItem]) -> some View {
         let today = stopped.filter { Calendar.current.isDateInToday($0.stopped_at) }
         let shown = (today.isEmpty ? stopped : today).suffix(3).reversed()
-        let freed = today.reduce(0) { $0 + $1.resource.mem_mb }
+        let freed = store.status?.freed_today_mb ?? today.reduce(0) { $0 + $1.freed }
         return VStack(spacing: 0) {
             HStack {
                 Silk(today.isEmpty ? "Stopped earlier" : "Stopped today")
@@ -329,7 +329,7 @@ struct ItemRow: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 4)
-            Text(Fmt.gb(item.mb)).font(Face.mono(13)).foregroundStyle(Ink.text)
+            Text(Fmt.size(item.mb)).font(Face.mono(13)).foregroundStyle(Ink.text)
             ForEach(Array(item.actions.enumerated()), id: \.offset) { _, a in key(a) }
         }
         .padding(.horizontal, 12).padding(.vertical, 9)
@@ -338,12 +338,13 @@ struct ItemRow: View {
         .contextMenu { if let r = item.resource { more(r) } }
         .help(item.resource.map { "\(Kind.name($0.kind)): \($0.detail)" } ?? "")
         .accessibilityElement(children: .contain)
-        .accessibilityLabel("\(item.name), \(item.lamp.name), \(Fmt.gb(item.mb)) GB")
+        .accessibilityLabel("\(item.name), \(item.lamp.name), \(Fmt.size(item.mb))")
     }
 
     /// Ten ice-blue cells filling up towards the pause or the stop, when one is really coming.
     private var countdown: AnyView? {
-        guard let d = item.deadline, item.window > 0, item.lamp == .paused || !dryRun else { return nil }
+        // The daemon gives a deadline only for a step that will really happen (not in dry run).
+        guard let d = item.deadline, item.window > 0 else { return nil }
         let left = max(0, d.timeIntervalSinceNow)
         let filled = Int(((1 - left / item.window) * 10).rounded()).clamped(0, 10)
         return AnyView(HStack(spacing: 2) {
@@ -393,7 +394,7 @@ struct KeepSheet: View {
                 LampDot(Lamp.nobody)
                 Text("Keep \(resource.name)").font(Face.body(18, .semibold))
                 Spacer()
-                Text("\(Fmt.gb(resource.mem_mb)) GB").font(Face.mono(13)).foregroundStyle(Ink.dim)
+                Text(Fmt.size(resource.mem_mb)).font(Face.mono(13)).foregroundStyle(Ink.dim)
             }
             Picker("For", selection: $hours) {
                 Text("1 h").tag(1); Text("4 h").tag(4); Text("8 h").tag(8); Text("Always").tag(0)

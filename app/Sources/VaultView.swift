@@ -231,8 +231,8 @@ struct VaultTab: View {
     private func detail(_ g: VaultGrant, live: Bool) -> String {
         var s = "\(Store.agentName(g.agent)) \(g.session.prefix(12))"
         if let r = g.repo { s += " in \(r)" }
-        s += " · \(Fmt.clock(g.created))"
-        s += live ? " until \(Fmt.clock(g.expires))" : " · ended: \(g.end_reason ?? "expired")"
+        s += " · granted \(Fmt.rel(g.created))"
+        s += live ? " · ends \(Fmt.rel(g.expires))" : " · ended: \(g.end_reason ?? "expired")"
         if let u = g.uses, u > 0 { s += " · used \(u)×" }
         return s
     }

@@ -93,7 +93,7 @@ final class Store: ObservableObject {
 
     var underPressure: Bool {
         guard let s = status else { return false }
-        return (s.mem.pressure_level ?? 1) >= 4 || (s.swap_rate_mb_min ?? 0) > 300
+        return (s.mem.pressure_level ?? 1) >= 4 || (s.swap_rate_mb_min ?? 0) > s.swapLimit
     }
 
     func refresh() async {
