@@ -1,3 +1,5 @@
+<img src="docs/logo.png" alt="AgentRM icon: an LED memory meter" width="128" align="right">
+
 # AgentRM
 
 A resource manager for coding agents on macOS (and Linux): Activity Monitor for the agentic era.
