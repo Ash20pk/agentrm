@@ -457,8 +457,13 @@ func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[
 
 // attribute binds a resource that has no lease to the session that started it.
 func (m *Manager) attribute(r *model.Resource, procs map[int]*sys.Proc, now time.Time, isNew bool) {
+	if r.OwnerGoneAt != nil {
+		// Already known to be what an ended session left (withLeftovers, endSession): the
+		// collector has it. A lease would make it a root again and keep it running.
+		return
+	}
 	s := m.startedBy(r, procs, now, isNew)
-	if ended := m.sessionEnded(s); ended != nil {
+	if ended := m.starterGone(s, r, procs, now); ended != nil {
 		// Its starter is gone: it is not a root, so it keeps nothing alive. Credit it and let
 		// the collector have it.
 		r.StartedBy = s

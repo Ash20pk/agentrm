@@ -80,8 +80,12 @@ extension Store {
         let used = max(0, total - s.mem.available_mb)
         let tracked = byLamp.values.reduce(0, +)
         byLamp[.system, default: 0] += max(0, used - tracked)
-        let kept = min(s.config.headroom_gb * 1024, max(0, s.mem.available_mb))
-        let free = max(0, s.mem.available_mb - kept)
+        // Unlit is what a new lease could get now: the same figure as the number in the menu bar
+        // (available, less what is promised to leases and not used yet, less the margin kept
+        // free). The rest of what is available is held back, hatched.
+        let available = max(0, s.mem.available_mb)
+        let free = min(available, max(0, s.headroom_mb))
+        let kept = available - free
 
         // Most urgent first: nobody, paused (soonest to stop), waiting, in use, pinned.
         items.sort { ($0.lamp.rawValue, -$0.mb) < ($1.lamp.rawValue, -$1.mb) }

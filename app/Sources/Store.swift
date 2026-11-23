@@ -116,15 +116,25 @@ final class Store: ObservableObject {
         case .success(let s):
             status = s
             daemonError = nil
+            failedRefreshes = 0
             notifications.post(newEvents(s.events ?? []))
             record()
         case .failure(let error):
-            status = nil
-            daemonError = error.localizedDescription
+            // One slow or failed `agentrm status` (a sweep holding the lock, a busy Mac) is not
+            // the daemon being down: the last reading stays up for a few tries, so the menu bar
+            // does not flicker to "off" and back. Only repeated failures clear it.
+            failedRefreshes += 1
+            if failedRefreshes >= Self.failuresBeforeOff || status == nil
+                || error.localizedDescription.contains("API version") {
+                status = nil
+                daemonError = error.localizedDescription
+            }
         }
         loginItemStatus = service.status
     }
 
+    private var failedRefreshes = 0
+    private static let failuresBeforeOff = 3
     private var refreshesInFlight = 0
     private var refreshesStarted = 0
     private var refreshApplied = 0

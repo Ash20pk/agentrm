@@ -696,6 +696,11 @@ func printStatus(showStopped bool) error {
 		if s.Priority > 0 {
 			u = " [urgent]"
 		}
+		if s.EndedAt != nil {
+			fmt.Printf("  %-14s %-8s ended %-8s ago  %s (%s)\n", short(s.ID), s.Agent,
+				time.Since(*s.EndedAt).Round(time.Second), s.Cwd, trunc(s.EndReason, 50))
+			continue
+		}
 		fmt.Printf("  %-14s %-8s using %5.1f GB  seen %-8s ago  %s%s\n", short(s.ID), s.Agent, s.FootprintMB/1024,
 			time.Since(s.LastSeen).Round(time.Second), s.Cwd, u)
 	}

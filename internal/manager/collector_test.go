@@ -523,3 +523,92 @@ func TestClearedSessionHandedBackIsLive(t *testing.T) {
 		t.Fatal("the session it was handed back from is still live")
 	}
 }
+
+// Homebrew's Python runs from Python.framework/…/Python.app: an interpreter, not an app, so what
+// it leaves is collected, not only asked about.
+func TestFrameworkPythonLeftoverIsNotAnApp(t *testing.T) {
+	const py = "/opt/homebrew/Cellar/python@3.13/3.13.12_1/Frameworks/Python.framework/Versions/3.13/Resources/Python.app/Contents/MacOS/Python"
+	if isApp(py) {
+		t.Fatal("Homebrew's Python was taken for an app")
+	}
+	if !isApp("/Applications/Docker.app/Contents/MacOS/com.docker.backend") {
+		t.Fatal("a real app was not taken for one")
+	}
+	m, c := newTest(t, 8)
+	t0 := c.Now().Add(-time.Hour)
+	procs := map[int]*sys.Proc{
+		1:   {PID: 1, Exe: "/sbin/launchd"},
+		700: {PID: 700, PPID: 1, Exe: py, Args: "Python -c from multiprocessing.spawn import spawn_main", Start: t0, RSSMB: 90},
+	}
+	// Recorded by the old check, which took it for an app.
+	m.st.Leftovers = map[string]*model.Leftover{"700": {PID: 700, Start: t0, Session: "gone", Agent: "claude", Found: t0, AskOnly: true}}
+	for _, r := range m.withLeftovers(nil, procs) {
+		if r.ID == "left:700" && r.AskOnly {
+			t.Fatal("a leftover recorded as an app by the old check is still only asked about")
+		}
+	}
+}
+
+// A leftover whose environment names a session AgentRM has no record of, whose agent is gone,
+// is collected: it is not given a lease of that session, which nobody could ever release.
+func TestLeftoverOfAnUnknownSessionIsNotAdopted(t *testing.T) {
+	m, c := newTest(t, 8)
+	t0 := c.Now().Add(-30 * time.Hour)
+	procs := map[int]*sys.Proc{
+		1:   {PID: 1, Exe: "/sbin/launchd"},
+		700: {PID: 700, PPID: 1, Exe: "/opt/homebrew/bin/python3", Args: "python3 worker.py", Start: t0, RSSMB: 90},
+	}
+	fakeInfos(m, map[int]sys.ProcInfo{700: {Agent: "claude", Session: "ghost", AgentPID: 96653}})
+	m.infos.refresh(procs)
+	r := &model.Resource{ID: "left:700", Kind: model.RKLeftover, PID: 700, MemMB: 90}
+	m.attribute(r, procs, c.Now(), false)
+	if r.LeaseID != "" {
+		t.Fatalf("leftover of a gone, unknown session was given lease %s", r.LeaseID)
+	}
+	if r.Owner != "ghost" || r.OwnerGoneAt == nil {
+		t.Fatalf("leftover of a gone, unknown session was not marked for the collector: %+v", r)
+	}
+	for _, l := range m.st.Leases {
+		t.Fatalf("a lease was recorded for it: %+v", l)
+	}
+}
+
+// Leases older versions recorded for such leftovers are released, and what they held collected.
+func TestGhostLeaseIsReleased(t *testing.T) {
+	m, c := newTest(t, 8)
+	t0 := c.Now().Add(-30 * time.Hour)
+	procs := map[int]*sys.Proc{
+		1:   {PID: 1, Exe: "/sbin/launchd"},
+		700: {PID: 700, PPID: 1, Exe: "/opt/homebrew/bin/python3", Args: "python3 worker.py", Start: t0, RSSMB: 90},
+	}
+	fakeInfos(m, map[int]sys.ProcInfo{700: {Agent: "claude", Session: "ghost", AgentPID: 96653}})
+	r := addRes(m, "left:700", model.RKLeftover, 90, "")
+	r.PID = 700
+	l := &model.Lease{ID: "g1", Session: "ghost", Agent: "claude", Kind: "heavy", Purpose: "started without a lease",
+		Resources: []string{r.ID}, Created: c.Now(), Expires: c.Now().Add(time.Hour)}
+	m.st.Leases[l.ID] = l
+	r.LeaseID = l.ID
+	m.infos.refresh(procs)
+	m.dropGhostLeases(procs, c.Now())
+	if m.st.Leases["g1"] != nil || r.LeaseID != "" {
+		t.Fatal("a lease of a session nobody runs was kept")
+	}
+	if r.Owner != "ghost" || r.OwnerGoneAt == nil {
+		t.Fatalf("what the ghost lease held was not handed to the collector: %+v", r)
+	}
+
+	// The same, but its agent is running and has not been heard from yet: kept.
+	m2, c2 := newTest(t, 8)
+	procs2 := agentTree(c2.Now().Add(-time.Hour))
+	fakeInfos(m2, map[int]sys.ProcInfo{601: {Agent: "claude", Session: "fresh", AgentPID: 500}})
+	r2 := addRes(m2, "srv:5173", model.RKServer, 400, "")
+	r2.PID = 601
+	m2.st.Leases["g2"] = &model.Lease{ID: "g2", Session: "fresh", Agent: "claude", Kind: "server", Purpose: "started without a lease",
+		Resources: []string{r2.ID}, Created: c2.Now(), Expires: c2.Now().Add(time.Hour)}
+	r2.LeaseID = "g2"
+	m2.infos.refresh(procs2)
+	m2.dropGhostLeases(procs2, c2.Now())
+	if m2.st.Leases["g2"] == nil {
+		t.Fatal("the lease of a running agent not heard from yet was dropped")
+	}
+}

@@ -270,13 +270,29 @@ func guiApp(exe string) (string, bool) {
 	if exe == "" {
 		return "", false
 	}
-	if i := strings.Index(exe, ".app/Contents/"); i >= 0 {
-		return filepath.Base(exe[:i+4]), true
+	if bundle, ok := AppBundle(exe); ok {
+		return filepath.Base(bundle), true
 	}
 	if base := filepath.Base(exe); linuxGUI[base] {
 		return base, true
 	}
 	return "", false
+}
+
+// AppBundle returns the .app bundle an executable runs from, if it is an app. A bundle inside a
+// framework is not one: Homebrew's and python.org's Python run every script from
+// Python.framework/…/Python.app/Contents/MacOS/Python, which is an interpreter, not an app a
+// person opened.
+func AppBundle(exe string) (string, bool) {
+	i := strings.Index(exe, ".app/Contents/")
+	if i < 0 {
+		return "", false
+	}
+	bundle := exe[:i+4]
+	if strings.Contains(bundle, ".framework/") {
+		return "", false
+	}
+	return bundle, true
 }
 
 func isGUIApp(exe string) bool {

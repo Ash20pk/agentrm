@@ -127,7 +127,8 @@ struct MenuView: View {
                 ForEach(Lamp.allCases.sorted { $0.legendOrder < $1.legendOrder }, id: \.self) { lamp in
                     if let mb = r.mbByLamp[lamp], mb >= 50 { legend(LampDot(lamp), lamp.name, mb) }
                 }
-                legend(LampDot(color: Ink.off, glow: false), "Free", r.freeMB + r.keptMB)
+                if r.keptMB >= 50 { legend(LampDot(color: Color(hex: 0x3A3F46), glow: false), "Held back", r.keptMB) }
+                legend(LampDot(color: Ink.off, glow: false), "Free", r.freeMB)
             }
         }
         .padding(.horizontal, 12).padding(.top, 14).padding(.bottom, 10)
