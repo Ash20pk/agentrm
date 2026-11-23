@@ -61,6 +61,8 @@ struct MenuIcon: View {
     private var text: String {
         guard let s = store.status else { return "off" }
         if !store.pendingApprovals.isEmpty { return "approve?" }
+        // Let through: nothing is being managed, so a headroom figure would mislead.
+        if s.fail_open != nil { return "open" }
         if store.underPressure { return "swap \(Int(s.swap_rate_mb_min ?? 0))" }
         return "\(Fmt.gb(max(0, s.headroom_mb)))G"
     }
@@ -69,6 +71,7 @@ struct MenuIcon: View {
         guard let s = store.status, let r = store.reading else { return "AgentRM: daemon not running" }
         var parts = ["AgentRM", "\(Fmt.gb(max(0, s.headroom_mb))) GB free to grant"]
         if !store.pendingApprovals.isEmpty { parts.append("approval waiting") }
+        if let open = s.fail_open { parts.append("not managing memory: \(open)") }
         if store.underPressure { parts.append("memory pressure") }
         if r.nobodyMB > 0 { parts.append("\(Fmt.gb(r.nobodyMB)) GB owned by nobody") }
         return parts.joined(separator: ", ")

@@ -132,7 +132,7 @@ func (m *Manager) leakNeverWatched(p *sys.Proc) string {
 		return "an agent"
 	case systemBinary(exe):
 		return "a system process"
-	case strings.Contains(exe, ".app/Contents/") && !leakDevHelper.MatchString(text):
+	case isApp(exe) && !leakDevHelper.MatchString(text):
 		return "an app"
 	case leakExpected.MatchString(text):
 		return "its growth is expected"

@@ -221,6 +221,53 @@ func (m *Manager) checkLiveness(procs map[int]*sys.Proc, now time.Time) {
 	}
 	m.findEnvLeftovers(procs, now)
 	m.findStaleAgents(procs, now)
+	m.dropGhostLeases(procs, now)
+}
+
+// ghostHoldsLive says whether anything a lease holds still runs under, or names in its
+// environment, an agent that is running. Must hold mu.
+func (m *Manager) ghostHoldsLive(l *model.Lease, procs map[int]*sys.Proc) bool {
+	for _, rid := range l.Resources {
+		r := m.st.Resources[rid]
+		if r == nil || r.PID <= 0 {
+			continue
+		}
+		p := procs[r.PID]
+		if p == nil {
+			continue
+		}
+		if apid, _ := sys.AgentAncestor(procs, r.PID); apid > 0 {
+			return true
+		}
+		if _, _, alive, ok := m.envOwner(p, procs); ok && alive {
+			return true
+		}
+	}
+	return false
+}
+
+// dropGhostLeases releases the leases AgentRM recorded for something a session started
+// without one, when that session has no record: nobody can answer for such a lease, so it
+// would keep what it holds running for good. What it held is marked left behind, for the
+// collector. (Older versions recorded these for leftovers whose environment named a session
+// they had never seen.) Must hold mu.
+func (m *Manager) dropGhostLeases(procs map[int]*sys.Proc, now time.Time) {
+	for _, l := range m.st.Leases {
+		if l.Session == "" || l.Session == "you" || m.st.Sessions[l.Session] != nil || l.Purpose != "started without a lease" {
+			continue
+		}
+		if m.ghostHoldsLive(l, procs) {
+			continue // an agent that has not been heard from yet, not a ghost
+		}
+		held := append([]string(nil), l.Resources...)
+		m.dropLease(l, "its session is not known to be running")
+		t := now
+		for _, rid := range held {
+			if r := m.st.Resources[rid]; r != nil && r.LeaseID == "" && r.Owner == "" {
+				r.Owner, r.OwnerGoneAt = l.Session, &t
+			}
+		}
+	}
 }
 
 // sessionGone ends a session whose agent process is gone and collects what it left. Must hold mu.
@@ -432,6 +479,14 @@ func (m *Manager) treeSize(root *sys.Proc, children map[int][]int, procs map[int
 	return total
 }
 
+// isApp says whether a leftover runs from an app bundle, which AgentRM only asks about. The
+// check is made again on every sweep, so a leftover recorded as an app by an older check (an
+// interpreter inside a framework) is stopped like any other process now.
+func isApp(exe string) bool {
+	_, ok := sys.AppBundle(exe)
+	return ok
+}
+
 func childrenOf(procs map[int]*sys.Proc) map[int][]int {
 	children := map[int][]int{}
 	for _, p := range procs {
@@ -451,7 +506,7 @@ func (m *Manager) track(p *sys.Proc, session, agent, via string, mb float64, now
 	}
 	info := m.infos.get(p)
 	lo := &model.Leftover{PID: p.PID, Start: p.Start, Session: session, Agent: agent, Found: now, Via: via,
-		AskOnly: strings.Contains(p.Exe, ".app/Contents/"), Argv: info.Argv, Env: info.EnvList()}
+		AskOnly: isApp(p.Exe), Argv: info.Argv, Env: info.EnvList()}
 	m.st.Leftovers[key] = lo
 	what := "kept running after it ended"
 	if via == "env" {
@@ -617,12 +672,12 @@ func (m *Manager) withLeftovers(found []*model.Resource, procs map[int]*sys.Proc
 			if len(r.RestartArgv) == 0 && len(lo.Argv) > 0 {
 				r.RestartArgv, r.RestartEnv = lo.Argv, lo.Env
 			}
-			r.AskOnly = r.AskOnly || lo.AskOnly
+			r.AskOnly = r.AskOnly || (lo.AskOnly && isApp(p.Exe))
 			continue
 		}
 		r := &model.Resource{ID: "left:" + key, Kind: model.RKLeftover, Source: "procs",
 			Name: filepath.Base(p.Exe), Detail: trunc(p.Args, 90), PID: p.PID, ProcStart: p.Start, MemMB: m.treeSize(p, children, procs, m.procMB), CPU: p.CPU,
-			Cwd: lo.Cwd, StartedBy: lo.Session, AskOnly: lo.AskOnly, RestartArgv: lo.Argv, RestartEnv: lo.Env,
+			Cwd: lo.Cwd, StartedBy: lo.Session, AskOnly: lo.AskOnly && isApp(p.Exe), RestartArgv: lo.Argv, RestartEnv: lo.Env,
 			Restart: "agentrm restore left:" + key}
 		if gone != nil {
 			r.Owner, r.OwnerGoneAt = lo.Session, gone
@@ -770,6 +825,32 @@ func (m *Manager) end(c api.Caller, r api.Req) (any, []Effect, error) {
 func (m *Manager) sessionEnded(id string) *time.Time {
 	if s := m.st.Sessions[id]; s != nil {
 		return s.EndedAt
+	}
+	return nil
+}
+
+// starterGone says when the session that started r ended, or nil if it is still live. A
+// session with no record is not taken to be live: a leftover's environment can name a session
+// AgentRM never saw, or one it has forgotten, and adopting the leftover into a lease of that
+// session would keep it running for good, held by nobody who can answer. It is live only if
+// the agent its environment names is still running.
+func (m *Manager) starterGone(s string, r *model.Resource, procs map[int]*sys.Proc, now time.Time) *time.Time {
+	if s == "" || s == "you" {
+		return nil
+	}
+	if rec := m.st.Sessions[s]; rec != nil {
+		return rec.EndedAt
+	}
+	if r.PID <= 0 || procs == nil {
+		return nil
+	}
+	p := procs[r.PID]
+	if p == nil {
+		return nil
+	}
+	if _, _, alive, ok := m.envOwner(p, procs); ok && !alive {
+		t := now
+		return &t
 	}
 	return nil
 }

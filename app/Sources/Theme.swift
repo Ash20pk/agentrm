@@ -219,7 +219,7 @@ struct LEDMeter: View {
         for s in segments {
             switch s {
             case .lit(let l): counts[l.name, default: 0] += 1
-            case .kept: counts["kept free", default: 0] += 1
+            case .kept: counts["held back", default: 0] += 1
             case .off: counts["free", default: 0] += 1
             }
         }
