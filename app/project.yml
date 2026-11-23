@@ -13,7 +13,7 @@ configFiles:
   Release: Config/Signing.xcconfig
 settings:
   base:
-    MARKETING_VERSION: "0.1.0"
+    MARKETING_VERSION: "0.2.0"
     SPARKLE_PUBLIC_KEY: "pqtVj+5kJKOZOudbQdRwtZz2UfY900t64n7VyyoLxTg="
     # CFBundleVersion, which Sparkle compares. Local builds stay at 1; scripts/release.sh
     # overrides it with major*10000 + minor*100 + patch of MARKETING_VERSION (0.1.0 → 100).
