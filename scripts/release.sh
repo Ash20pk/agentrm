@@ -104,7 +104,9 @@ done
 APP="$OUT/app/AgentRM.app"
 xcrun stapler validate "$APP"
 spctl --assess --type execute -v "$APP"
-codesign -dv "$APP/Contents/Helpers/agentrm" 2>&1 | grep -q "Developer ID Application" ||
+# Captured first: piping into grep -q under pipefail fails when grep exits early (SIGPIPE).
+HELPER_SIG=$(codesign -dv --verbose=2 "$APP/Contents/Helpers/agentrm" 2>&1) || true
+grep -q "Authority=Developer ID Application" <<<"$HELPER_SIG" ||
   die "the bundled agentrm helper is not Developer ID signed"
 
 ZIP="$OUT/AgentRM-$VERSION.zip"
