@@ -31,51 +31,6 @@ import (
 // minLearnMB is the smallest peak worth learning from.
 const minLearnMB = 100
 
-// materialisedMB is how much of a lease's estimate is already real, measured use.
-func (m *Manager) materialisedMB(l *model.Lease) float64 {
-	used := 0.0
-	for _, rid := range l.Resources {
-		if r := m.st.Resources[rid]; r != nil {
-			used += r.MemMB
-		}
-	}
-	if len(l.Resources) == 0 {
-		// Builds and not-yet-visible resources: growth of the session's process tree since the grant.
-		if s := m.st.Sessions[l.Session]; s != nil {
-			used = max(0, s.FootprintMB-l.BaseFootprintMB)
-		}
-	}
-	return used
-}
-
-// pendingMB is the memory promised to leases that they have not taken yet.
-func (m *Manager) pendingMB() float64 {
-	total := 0.0
-	for _, l := range m.st.Leases {
-		total += max(0, l.MemGB*1024-m.materialisedMB(l))
-	}
-	return total
-}
-
-func (m *Manager) headroomMB() float64 {
-	return m.mem.AvailableMB - m.pendingMB() - m.cfg.HeadroomGB*1024
-}
-
-func (m *Manager) usableMB() float64 {
-	return m.mem.TotalMB - m.mem.WiredMB - m.cfg.HeadroomGB*1024
-}
-
-// heldMB is what a session holds: for each lease, the larger of its promise and its real use.
-func (m *Manager) heldMB(session string) float64 {
-	total := 0.0
-	for _, l := range m.st.Leases {
-		if l.Session == session {
-			total += max(l.MemGB*1024, m.materialisedMB(l))
-		}
-	}
-	return total
-}
-
 // thrashing reports whether the machine is short of memory right now, and why.
 //
 // macOS sits at "warning" for hours while memory compression copes, with nothing being swapped
@@ -112,7 +67,9 @@ func (m *Manager) liveWaiters(now time.Time) []*model.Waiter {
 	for _, w := range m.waiters {
 		heard := w.LastSeen
 		// Your own session is touched by everything you do in the app, so only the request counts.
-		if s := m.st.Sessions[w.Session]; s != nil && w.Session != "you" && s.LastSeen.After(heard) {
+		// A restore waits on its own retry only: the session getting on with other work does not
+		// keep it (it was never granted from the queue, yet held up everyone behind it).
+		if s := m.st.Sessions[w.Session]; s != nil && w.Session != "you" && !w.Retry && s.LastSeen.After(heard) {
 			heard = s.LastSeen
 		}
 		if len(m.parked[w]) > 0 || now.Sub(heard) < keep {
@@ -209,8 +166,7 @@ func (m *Manager) fits(session, kind, cwd string, needMB float64, me *model.Wait
 		}
 	}
 	if needMB > head {
-		return false, fmt.Sprintf("not enough memory: %.1f GB needed, %.1f GB can be handed out (%.1f GB available, %.1f GB promised to other leases, %.1f GB kept free)",
-			needMB/1024, max(0, head)/1024, m.mem.AvailableMB/1024, m.pendingMB()/1024, m.cfg.HeadroomGB), false
+		return false, "not enough memory: " + shortfall(needMB, m.mem.AvailableMB, m.pendingMB(), m.cfg.HeadroomGB*1024), false
 	}
 	if needMB > head-aheadMB {
 		if m.canBackfill(session, kind, cwd, me, waiters) {
@@ -284,8 +240,16 @@ func (m *Manager) howToWait(w *model.Waiter) string {
 // Must hold mu.
 func (m *Manager) grantWaiters(now time.Time, press bool) {
 	for _, w := range append([]*model.Waiter(nil), m.liveWaiters(now)...) {
-		if m.findLease(w.Session, w.Kind) != nil {
-			m.dropWaiter(w.Session, w.Kind) // it got one some other way
+		// It got one some other way. A request for more than the session held waits while the
+		// session holds what it held then; only more than that answers it.
+		held := m.heldGB(w.Session, w.Kind)
+		if w.HeldGB > 0 && held < w.HeldGB-0.01 {
+			// Part of what it held is gone (released, expired): it now needs that part too.
+			w.NeedMB += (w.HeldGB - held) * 1024
+			w.HeldGB = held
+		}
+		if held > 0 && (w.HeldGB == 0 || held > w.HeldGB+0.01) {
+			m.dropWaiter(w.Session, w.Kind)
 			continue
 		}
 		if w.Retry || m.busy(w.Kind) != "" {
@@ -296,6 +260,16 @@ func (m *Manager) grantWaiters(now time.Time, press bool) {
 			m.noteBackfill(w.Session, m.waiters, now)
 			m.lastBackfill = true
 		}
+		note := fmt.Sprintf(" (from the queue, after %s)", now.Sub(w.Since).Round(time.Second))
+		switch why := m.failOpen(now); {
+		case ok:
+		case why != "":
+			ok, note = true, " (from the queue: "+why+")"
+		case m.waitedEnough(w, now):
+			// Estimates said no for long enough; the Mac itself is not short. Let it run.
+			ok, note = true, fmt.Sprintf(" (waited %s, the most a request waits while the Mac is not swapping)",
+				now.Sub(w.Since).Round(time.Minute))
+		}
 		if !ok {
 			if press && now.Sub(w.Pressed) >= time.Minute {
 				w.Pressed = now
@@ -303,7 +277,7 @@ func (m *Manager) grantWaiters(now time.Time, press bool) {
 			}
 			continue
 		}
-		l := m.grant(w, now, fmt.Sprintf(" (from the queue, after %s)", now.Sub(w.Since).Round(time.Second)))
+		l := m.grant(w, now, note)
 		t := now
 		l.Offered = &t
 		by := now.Add(m.grantHold())
@@ -416,12 +390,15 @@ func (m *Manager) awaitGrant(ctx context.Context, ch chan *api.AcquireResp, c ap
 	if got != nil {
 		m.takeUp(m.st.Leases[got.Lease.ID])
 		m.dirty = true
-		return got, nil
+		return snapshot(got), nil
 	}
 	// Time is up, or the request left the queue some other way: answer as of now.
 	r.WaitSeconds = 0
 	out, _, err := m.acquire(c, r)
 	m.dirty = true
+	if out != nil {
+		out = snapshot(out).(*api.AcquireResp) // encoded after the deferred unlock
+	}
 	return out, err
 }
 
@@ -439,8 +416,16 @@ func (m *Manager) reclaim(needMB float64, forSession string, now time.Time) stri
 
 	var orphans []*model.Resource
 	for _, r := range m.st.Resources {
-		// Only what AgentRM will really stop frees memory: not pinned, not exempt, not a VM.
-		if r.LeaseID == "" && !r.Pinned && !m.neverStop(r) && r.OrphanSince != nil && discover.CanAutoStop(r) && r.StartedBy != "you" {
+		// Only what AgentRM will really stop frees memory: not pinned, not exempt, not a VM, and
+		// not something last seen on a source that no longer answers (it cannot be stopped, and
+		// counting on it would leave the request waiting on memory that never comes).
+		if r.LeaseID == "" && r.Unseen == nil && !r.Pinned && !m.neverStop(r) && r.OrphanSince != nil && discover.CanAutoStop(r) && r.StartedBy != "you" {
+			orphans = append(orphans, r)
+		}
+	}
+	for _, r := range m.st.Resources {
+		if discover.SelfRestarting(r) && r.Unseen == nil && !r.Pinned && !m.neverStop(r) && r.OrphanSince != nil &&
+			!m.dryFor(r) && r.MemMB >= selfRestartMinMB && m.restartBlocker(r, now) == "" && m.pending[r.ID] == "" {
 			orphans = append(orphans, r)
 		}
 	}
@@ -449,12 +434,17 @@ func (m *Manager) reclaim(needMB float64, forSession string, now time.Time) stri
 		if freed >= needMB {
 			break
 		}
-		if early := deadline.Add(-grace); r.OrphanSince.After(early) {
-			r.OrphanSince = &early
+		// Dry run decides nothing: it neither shortens clocks nor marks anything for a direct
+		// stop, which would otherwise take effect the moment dry run is turned off.
+		if !m.dryFor(r) {
+			if early := deadline.Add(-grace); r.OrphanSince.After(early) {
+				r.OrphanSince = &early
+			}
+			r.Urgent = true
 		}
-		r.Urgent = true
-		freed += r.MemMB
-		done = append(done, fmt.Sprintf("unclaimed %s (%.1f GB)", r.ID, r.MemMB/1024))
+		back := r.MemMB * m.returnRatio(r.Source) // what macOS really gets back
+		freed += back
+		done = append(done, fmt.Sprintf("unclaimed %s (%.1f GB, ~%.1f GB back)", r.ID, r.MemMB/1024, back/1024))
 	}
 
 	type cand struct {
@@ -481,7 +471,7 @@ func (m *Manager) reclaim(needMB float64, forSession string, now time.Time) stri
 		over := m.cfg.MaxSessionShare > 0 && m.heldMB(l.Session) > share
 		rank := m.costRank(l)
 		if rank == 1 || !l.Verified || idle >= minIdle || over && idle >= minIdle/2 {
-			cands = append(cands, cand{l, m.materialisedMB(l), idle, over, p, rank})
+			cands = append(cands, cand{l, m.releaseGivesMB(l), idle, over, p, rank})
 		}
 	}
 	sortCands(cands, func(c cand) int { return c.rank }, func(a, b cand) bool {
@@ -513,9 +503,12 @@ func (m *Manager) reclaim(needMB float64, forSession string, now time.Time) stri
 			m.dropLease(l, "its holder offered it at low cost to a waiting request")
 			continue
 		}
-		asked := deadline.Add(-grace)
-		if l.IdleAsked == nil || l.IdleAsked.After(asked) {
-			l.IdleAsked = &asked
+		if !m.cfg.DryRun {
+			// Pressed: its idle deadline moves up to the pressure grace period.
+			asked := deadline.Add(-grace)
+			if l.IdleAsked == nil || l.IdleAsked.After(asked) {
+				l.IdleAsked = &asked
+			}
 		}
 		why := fmt.Sprintf("unused %s", c.idle.Round(time.Minute))
 		if c.over {
@@ -548,54 +541,47 @@ func projectOf(cwd string) string {
 	return filepath.Base(cwd)
 }
 
-// estimateGB is the memory a new lease is expected to need: what past leases of this kind in
-// this project really used, else of this kind anywhere (mean plus twice the typical deviation,
-// and at least 15% over the mean), else the configured default.
-func (m *Manager) estimateGB(kind, cwd string) float64 {
-	for _, key := range []string{kind + "@" + projectOf(cwd), kind} {
-		if strings.HasSuffix(key, "@") {
-			continue
-		}
-		if mb := m.st.Learned[key]; mb > 0 {
-			return max(max(mb+2*m.st.LearnedDev[key], mb*1.15)/1024, 0.25)
-		}
-	}
-	if gb := m.cfg.KindMemGB[kind]; gb > 0 {
-		return gb
-	}
-	return 1
-}
-
-// effectiveGB is the memory a request is charged. A requester may declare its own figure, but
-// never below what this kind really used, and a session caught using far more than it declared
-// loses the right to declare for an hour.
-func (m *Manager) effectiveGB(kind, cwd string, declared float64, session string, now time.Time) float64 {
-	est := m.estimateGB(kind, cwd)
-	if declared <= 0 {
-		return est
-	}
-	if s := m.st.Sessions[session]; s != nil && now.Before(s.DistrustUntil) {
-		return max(declared, est)
-	}
-	for _, key := range []string{kind + "@" + projectOf(cwd), kind} {
-		if mean := m.st.Learned[key]; mean > 0 {
-			return max(declared, mean/1024)
-		}
-	}
-	return declared
-}
-
 // checkOverrun flags a lease that took far more than its holder declared.
 func (m *Manager) checkOverrun(l *model.Lease, now time.Time) {
-	if !l.Declared || l.Overran || l.PeakMB <= 1.5*l.MemGB*1024+256 {
+	m.checkOverrunOf([]*model.Lease{l}, l.PeakMB, l.MemGB, now)
+}
+
+// checkOverrunOf judges a session's leases of one kind together (oldest first, as measureBuilds
+// orders them), on what they use and asked for in all: an agent that asks for more gets a lease
+// for the difference, and which of them its build's memory is in cannot be told. Only leases
+// that all declared their need are judged; the newest is told.
+func (m *Manager) checkOverrunOf(ls []*model.Lease, usedMB, askedGB float64, now time.Time) {
+	for _, o := range ls {
+		if !o.Declared || o.Overran {
+			return
+		}
+	}
+	if len(ls) == 0 || usedMB <= 1.5*askedGB*1024+256 {
 		return
 	}
-	l.Overran = true
+	for _, o := range ls {
+		o.Overran = true
+	}
+	l := ls[len(ls)-1]
 	if s := m.st.Sessions[l.Session]; s != nil {
 		s.DistrustUntil = now.Add(time.Hour)
 	}
-	m.event("OVERRAN lease %s (%s) declared %.1f GB and used %.1f GB. Memory figures from %s are ignored until %s.",
-		l.ID, l.Kind, l.MemGB, l.PeakMB/1024, short(l.Session), now.Add(time.Hour).Format("15:04"))
+	which, what := "lease "+l.ID, "lease "+l.ID
+	if len(ls) > 1 {
+		which = fmt.Sprintf("leases (%d, newest %s)", len(ls), l.ID)
+		what = fmt.Sprintf("leases (%d, newest %s) asked for %.1f GB in all and are", len(ls), l.ID, askedGB)
+	} else {
+		what += fmt.Sprintf(" asked for %.1f GB and is", askedGB)
+	}
+	m.event("OVERRAN %s (%s) declared %.1f GB and used %.1f GB. Memory figures from %s are ignored until %s.",
+		which, l.Kind, askedGB, usedMB/1024, short(l.Session), now.Add(time.Hour).Format("15:04"))
+	// macOS cannot cap a process's memory, so the lease cannot stop it; the agent is told now,
+	// while it can still act, and its real use already counts against what others are granted.
+	m.st.Questions["overran:"+l.ID] = &model.Question{Created: now, For: l.Session,
+		Delivered: map[string]bool{}, Answers: map[string]string{},
+		Text: fmt.Sprintf("[agentrm] Your %s %s using %.1f GB. Until %s your requests are "+
+			"charged at least AgentRM's estimate. Next time ask for about %.1f GB (agentrm acquire --kind %s --mem %.1f).",
+			l.Kind, what, usedMB/1024, now.Add(time.Hour).Format("15:04"), suggestGB(usedMB, askedGB), l.Kind, suggestGB(usedMB, askedGB))}
 }
 
 // learn folds a finished lease's peak into the estimates for its kind and its project.
@@ -604,8 +590,10 @@ func (m *Manager) learn(l *model.Lease) {
 	if rk, ok := strings.CutPrefix(kind, "claim:"); ok {
 		kind = model.ResourceToLease[rk]
 	}
+	m.scoreCharge(l, kind)
+	m.writeReceipt(l, kind, m.now())
 	// Only leases that really ran something teach anything.
-	if kind == "" || l.PeakMB < minLearnMB || (model.LeaseToResource[kind] != "" && !l.HadResources) {
+	if kind == "" || l.PeakMB < minLearnMB || (model.LeaseToResource[kind] != "" && !l.HadResources) || inVM(l) {
 		return
 	}
 	keys := []string{kind}

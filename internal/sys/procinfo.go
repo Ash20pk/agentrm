@@ -19,6 +19,20 @@ type ProcInfo struct {
 	Agent    string // "claude", or "" when nothing says
 	Session  string // the agent's session ID
 	AgentPID int    // the agent process
+	// vaultVars are the variables `agentrm vault run` set (AGENTRM_VAULT_VARS): they carry
+	// access whatever their names, so they are never kept.
+	vaultVars []string
+}
+
+// VaultVarsEnv names the variables `agentrm vault run` gave a command.
+const VaultVarsEnv = "AGENTRM_VAULT_VARS"
+
+// finish drops what the vault gave the process. The list may come after the variables it
+// names, so this runs once the whole environment is read.
+func (p *ProcInfo) finish() {
+	for _, k := range p.vaultVars {
+		delete(p.Env, k)
+	}
 }
 
 // Owned reports whether an agent's environment marks the process: with its session or PID,
@@ -61,6 +75,9 @@ func (p *ProcInfo) addEnv(k, v string) {
 	case "CLAUDE_PID":
 		p.AgentPID, _ = strconv.Atoi(v)
 		p.Agent = "claude"
+		return
+	case VaultVarsEnv:
+		p.vaultVars = strings.Split(v, ",")
 		return
 	case "CLAUDECODE":
 		if p.Agent == "" {

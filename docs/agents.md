@@ -30,6 +30,13 @@ may do less than a person.
 Agents without hooks (Aider, OpenCode, older versions) are covered by the PATH shim
 (`agentrm setup shim`) and the MCP server (`agentrm mcp`).
 
+## Accounts: the vault
+
+An agent that needs GitHub, an API key, AWS or a login asks the vault instead of the person:
+`agentrm vault list`, then `agentrm vault run <account> --purpose "<why>" -- <command>`. The
+person approves with Touch ID; the command runs with short-lived access. Each session is told
+once, in its inbox, which accounts exist. See [vault.md](vault.md).
+
 ## The lease API, for orchestrators
 
 Tools that run several agents (Conductor, Claude Squad, a CI runner, your own scripts) can take
@@ -58,6 +65,15 @@ that agent's lease; from your own process, it is yours.
 | `/status` | | Everything `agentrm status` shows, as JSON |
 
 The CLI (`agentrm acquire --wait`, `agentrm yield`, …) is a thin client of the same API.
+
+**Memory figures and receipts.** A request that sets `mem_gb` is charged exactly that; AgentRM's
+own estimate is used only when it is left out. When a lease ends, AgentRM appends one line to
+`~/.agentrm/receipts/<project>.txt`: what was asked, what the work really used (footprint of what
+it started), and what to ask next time. Read it before asking. If the ask was far off (used under
+60% or over 125%), the session also gets the figure in its inbox. macOS cannot cap a process's
+memory, so a lease cannot stop an overrun: real use counts against what others are granted as it
+runs, the session is told at once, and for an hour its requests are charged at least AgentRM's
+estimate.
 
 A sketch of an orchestrator loop: before starting an agent's heavy step, `acquire` with
 `wait_seconds`; start the step when it returns granted; `release` when the step ends; answer

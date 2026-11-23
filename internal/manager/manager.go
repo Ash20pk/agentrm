@@ -11,15 +11,19 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"agentrm/internal/api"
+	"agentrm/internal/discover"
 	"agentrm/internal/evidence"
 	"agentrm/internal/model"
 	"agentrm/internal/shell"
@@ -57,13 +61,31 @@ type Manager struct {
 	eventSeq  int
 	failed    map[string]error // discovery sources that failed on the last sweep
 
-	agentSessions   map[int]string
-	recent          map[string][]cmdRecord
-	hookSeen        map[string]time.Time // agent kind -> last hook call
-	waiters         []*model.Waiter
-	swapRate        float64
-	lastSwapouts    float64
-	lastSwapAt      time.Time
+	agentSessions map[int]string
+	recent        map[string][]cmdRecord
+	hookSeen      map[string]time.Time // agent kind -> last hook call
+	claimRefused  map[string]bool      // "pid session": a hook that named another agent's session, reported once
+	waiters       []*model.Waiter
+	swapRate      float64
+	swapSamples   []swapSample // cumulative swap-outs over the last minute or so (takeMem)
+	// tickMu makes reading the machine, recording it and applying it one at a time: the sweep
+	// loop and a request refreshing memory would otherwise record deltas out of order.
+	tickMu sync.Mutex
+	// Docker's VM footprint and what its containers hold, as of the last sweep: how much of a
+	// Docker lease's promise is no longer held back (daemonGrowthMB).
+	dockerFullMB, dockerContainersMB float64
+	dockerMeasured                   bool // the last sweep measured the VM
+	// dockerStale: Docker did not answer, so dockerContainersMB is its last view, not a
+	// measurement: no Docker lease is credited with the VM's growth until it answers.
+	dockerStale bool
+	// tickFrame is what the tick under way read, written to the trace once it holds mu
+	// (writeTick). Set and read only by the goroutine holding tickMu.
+	tickFrame *trace.Frame
+	tickRec   *trace.Writer // the writer it was read for: its process table is a delta from that one's last
+	memAt     time.Time     // when m.mem was read
+	// freshMem: a request for memory reads it again first when it is older than memFresh
+	// (live only: tests and replays bring their own readings).
+	freshMem        bool
 	activity        *evidence.Activity
 	classifier      *shell.Classifier
 	dockerOrigin    map[string]origin          // resource ID -> who started it
@@ -76,7 +98,7 @@ type Manager struct {
 	exits           *sys.ExitWatcher           // the kernel's word that an agent exited; nil in tests
 	stale           map[int]bool               // agent processes with no terminal, silent for hours
 	selfPID         int
-	rec             *trace.Writer                             // what the daemon sees, for replay; nil unless recording
+	recP            atomic.Pointer[trace.Writer]              // what the daemon sees, for replay; nil unless recording (read without mu)
 	onDecide        func(*model.Decision)                     // replay watches decisions as they are taken
 	onGrant         func(needMB, headroomMB float64)          // tests check every grant fits
 	backfilled      map[*model.Waiter]map[string]bool         // head of the queue -> sessions that went ahead of it
@@ -86,7 +108,23 @@ type Manager struct {
 	self            sys.SelfUsage
 	tamper          tamperState
 	dockerEventsErr string
+	returnProbes    []*returnProbe   // stops whose effect on available memory is being measured
+	grantProbes     []*grantProbe    // recent grants, watched for the Mac starting to swap
+	preps           map[string]*prep // open predictions of a session's next heavy request (prepare.go)
 	cfgDirty        bool
+	restartedAt     map[string]*restartMark   // what AgentRM restarted (it comes back by itself), and when
+	leakTracks      map[procKey]*leakTrack    // large processes watched for leaks (leaks.go)
+	leakProcs       map[int]*sys.Proc         // the process table the leak watch last saw
+	procUID         func(pid int) (int, bool) // who a process runs as; nil in tests
+
+	// The vault (vault.go): live credentials, in memory only, and the API-key proxy.
+	vaultLive   map[string]*vaultLive // grant ID -> credential
+	vaultTok    map[string]string     // proxy token -> grant ID
+	vaultClient *http.Client          // nil: the default; tests point it at fakes
+	vaultWG     sync.WaitGroup        // revocations in flight
+	proxyOnce   sync.Once
+	proxyBase   string
+	proxyErr    error
 
 	dirty    bool
 	saver    *store.Saver
@@ -118,9 +156,10 @@ func New(o Options) *Manager {
 		agentSessions: map[int]string{}, recent: map[string][]cmdRecord{}, failed: map[string]error{},
 		activity: evidence.NewActivity(), dockerOrigin: map[string]origin{}, pending: map[string]string{},
 		connSeen: map[string]map[string]bool{}, footBase: map[string]float64{}, wouldDecided: map[string]bool{},
-		missing: map[string]int{}, hookSeen: map[string]time.Time{}, infos: newInfoCache(nil), stale: map[int]bool{}, selfPID: os.Getpid(),
+		missing: map[string]int{}, hookSeen: map[string]time.Time{}, claimRefused: map[string]bool{}, infos: newInfoCache(nil), stale: map[int]bool{}, selfPID: os.Getpid(),
 		parked: map[*model.Waiter][]chan *api.AcquireResp{}, backfilled: map[*model.Waiter]map[string]bool{},
-		kick: make(chan struct{}, 1), readFast: sys.ReadFast,
+		kick: make(chan struct{}, 1), readFast: sys.ReadFast, restartedAt: map[string]*restartMark{}, preps: map[string]*prep{},
+		vaultLive: map[string]*vaultLive{}, vaultTok: map[string]string{},
 	}
 	m.notify = o.Notify
 	if m.notify == nil {
@@ -137,10 +176,11 @@ func New(o Options) *Manager {
 		m.classifier, _ = shell.NewClassifier(nil)
 		return m
 	}
-	m.mem = sys.ReadMem()
+	m.mem, m.freshMem = sys.ReadMem(), true
 	cfg, notes := store.LoadConfig(o.Dir, m.mem.TotalMB)
 	st, snotes := store.LoadState(o.Dir, now())
 	m.cfg, m.st = cfg, st
+	m.seedFreed()
 	m.notes = append(notes, snotes...)
 	m.applyLogLevel()
 	var bad []string
@@ -150,6 +190,7 @@ func New(o Options) *Manager {
 	}
 	m.infos = newInfoCache(sys.ReadProcInfo)
 	m.footprint = sys.Footprint
+	m.procUID = sys.ProcUID
 	if w, err := sys.NewExitWatcher(); err == nil {
 		m.exits = w
 	} else {
@@ -169,6 +210,7 @@ func New(o Options) *Manager {
 		}
 	}
 	m.st.AgentSessions = kept
+	m.vaultRestarted(now())
 	m.tamperInit()
 	for _, n := range m.notes {
 		m.log.Warn(n)
@@ -233,18 +275,23 @@ func (m *Manager) persist() {
 // in New.
 func (m *Manager) applyRecording() {
 	switch {
-	case m.cfg.RecordTrace && m.rec == nil && m.dir != "":
-		m.rec = trace.NewWriter(trace.Dir(m.dir), max(1, m.cfg.TraceDays))
-	case !m.cfg.RecordTrace && m.rec != nil:
-		m.rec.Close()
-		m.rec = nil
+	case m.cfg.RecordTrace && m.recorder() == nil && m.dir != "":
+		m.recP.Store(trace.NewWriter(trace.Dir(m.dir), max(1, m.cfg.TraceDays)))
+	case !m.cfg.RecordTrace && m.recorder() != nil:
+		m.recP.Swap(nil).Close()
 	}
 }
 
-// Close writes the state and marks a clean shutdown.
+// recorder is the trace writer, or nil. Read it once into a local: recording can be turned off
+// between two reads (by a config change, under mu, while a sweep runs outside it).
+func (m *Manager) recorder() *trace.Writer { return m.recP.Load() }
+
+// Close thaws what AgentRM froze, writes the state and marks a clean shutdown.
 func (m *Manager) Close() {
-	if m.rec != nil {
-		m.rec.Close()
+	m.resumePaused()
+	m.vaultClose()
+	if rec := m.recP.Swap(nil); rec != nil {
+		rec.Close()
 	}
 	m.persist()
 	if m.saver != nil {
@@ -253,6 +300,24 @@ func (m *Manager) Close() {
 	m.tamperCleanShutdown()
 	if c, ok := m.evlog.(io.Closer); ok {
 		_ = c.Close()
+	}
+}
+
+// resumePaused thaws everything AgentRM paused. A frozen process stays frozen until something
+// sends it SIGCONT, and once the daemon is gone (quit, disabled, uninstalled) nothing would:
+// a dev server would hang every request on its port forever. What is still unclaimed is paused
+// again by the next daemon, after a fresh grace period.
+func (m *Manager) resumePaused() {
+	m.mu.Lock()
+	var effects []Effect
+	for _, r := range m.st.Resources {
+		if r.PausedAt != nil && m.pending[r.ID] == "" {
+			effects = append(effects, m.thawEffect(r, "AgentRM is shutting down, and leaves nothing frozen behind"))
+		}
+	}
+	m.mu.Unlock()
+	if len(effects) > 0 {
+		m.afterAsync(RunEffects(effects))
 	}
 }
 
@@ -271,8 +336,12 @@ func OSANotify(title, msg string) {
 
 type handler func(c api.Caller, r api.Req) (any, []Effect, error)
 
-// errApproval asks the dispatcher to hold a privileged request for a click in the app.
-type errApproval struct{ what string }
+// errApproval asks the dispatcher to hold a privileged request for a click in the app. a is set
+// when the handler made the approval itself (a vault request).
+type errApproval struct {
+	what string
+	a    *model.Approval
+}
 
 func (e *errApproval) Error() string { return e.what }
 
@@ -280,6 +349,9 @@ func (e *errApproval) Error() string { return e.what }
 type ErrNeedsApproval struct{ Approval *model.Approval }
 
 func (e *ErrNeedsApproval) Error() string {
+	if v := e.Approval.Vault; v != nil {
+		return fmt.Sprintf("asked the person for %s (vault request %s); they approve it with Touch ID in AgentRM", v.Account, e.Approval.ID)
+	}
 	return fmt.Sprintf("%s needs your approval in the AgentRM app (approval %s); click Approve there",
 		e.Approval.What, e.Approval.ID)
 }
@@ -306,7 +378,14 @@ func (m *Manager) routes() map[string]handler {
 		"/priority": m.setPriority,
 		"/review":   m.review,
 		"/approve":  m.approve,
+		"/bypass":   m.bypass,
 		"/approval": m.approvalStatus,
+		"/leak":     m.leakAct,
+		// The vault. Its answer (with the secret) is served apart: see HandleCtx.
+		"/vault/request":  m.vaultRequest,
+		"/vault/list":     m.vaultList,
+		"/vault/revoke":   m.vaultRevokeReq,
+		"/vault/accounts": m.vaultSetAccounts,
 		"/whoami": func(c api.Caller, r api.Req) (any, []Effect, error) {
 			return c, nil, nil
 		},
@@ -322,37 +401,116 @@ func (m *Manager) Handle(path string, peerPID int, req api.Req) (any, error) {
 // HandleCtx is Handle for a caller that may go away: ctx ends when its connection does. Only a
 // request that waits (acquire with WaitSeconds) looks at it.
 func (m *Manager) HandleCtx(ctx context.Context, path string, peerPID int, req api.Req) (any, error) {
+	facts := gatherFacts(peerPID)
+	if sys.PeerSuspect(ctx) {
+		facts.viaApp = false // accepted just after the daemon was frozen: see sys.PeerSuspect
+	}
+	if path == "/vault/answer" {
+		// It carries a secret: never traced, and it mints outside the lock.
+		return m.vaultAnswer(ctx, facts, req)
+	}
 	h, ok := m.routes()[path]
 	if !ok {
 		return nil, fmt.Errorf("unknown request %s", path)
 	}
-	facts := gatherFacts(peerPID)
 	req.Repo, req.Branch = "", ""
-	if req.Cwd != "" && (path == "/touch" || path == "/acquire" || path == "/renew" || path == "/claim") {
+	if req.Cwd != "" && (path == "/touch" || path == "/acquire" || path == "/renew" || path == "/claim" || path == "/vault/request") {
 		req.Repo, req.Branch = sys.GitHead(req.Cwd) // a file read: outside the lock
+	}
+	if path == "/acquire" && m.memStale() {
+		// Between sweeps (30 s when idle) memory can change by gigabytes: a request is judged
+		// on a reading a few seconds old at most. A fast tick reads and records it as usual.
+		// Never waited for: while a sweep or another request's tick is under way (a sweep can
+		// take a minute running its stops), memory alone is read again (peekMem).
+		if m.tickMu.TryLock() {
+			if m.memStale() {
+				m.fastTick()
+			}
+			m.tickMu.Unlock()
+		} else {
+			m.peekMem()
+		}
 	}
 	return m.handleFacts(ctx, path, h, facts, req)
 }
 
+// peekMem reads memory again while a tick is under way: what is available, not the swap rate,
+// whose samples are the ticks' own and would be taken out of order.
+// Whether it is taken is decided under mu, and only a reading taken is written to the trace, at
+// the time it was taken: a replay takes each one as it comes.
+func (m *Manager) peekMem() { m.peek(sys.ReadMem()) }
+
+// peek is peekMem on what was read.
+func (m *Manager) peek(mem sys.MemStats) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.now()
+	if now.Sub(m.memAt) <= memFresh {
+		return // a tick took a fresher one meanwhile
+	}
+	if rec := m.recorder(); rec != nil {
+		rec.Write(trace.Frame{T: now, Mem: &mem})
+	}
+	m.peekWith(mem, now)
+}
+
+// peekWith takes a memory reading peekMem took (live, or from a trace). Must hold mu.
+func (m *Manager) peekWith(mem sys.MemStats, now time.Time) {
+	mem.SwapUnread = true // not a swap sample (and not in a trace: set here, for live and replay)
+	m.takeMem(mem, now)
+}
+
+// writeTick writes the frame of the tick under way, once it holds mu: what the tick read goes
+// into the trace in the order it is taken, after any reading a request took meanwhile (peekMem).
+// Must hold mu.
+func (m *Manager) writeTick(now time.Time) {
+	f := m.tickFrame
+	if f == nil {
+		return
+	}
+	m.tickFrame = nil
+	if rec := m.recorder(); rec != nil && rec == m.tickRec {
+		f.T = now
+		rec.Write(*f)
+	}
+}
+
+// memFresh is how old a memory reading a request for memory may be judged on.
+const memFresh = 5 * time.Second
+
+func (m *Manager) memStale() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.freshMem && m.now().Sub(m.memAt) > memFresh
+}
+
 // readOnly requests change nothing and are not recorded.
-var readOnly = map[string]bool{"/status": true, "/whoami": true, "/approval": true, "/receipt": true}
+var readOnly = map[string]bool{"/status": true, "/whoami": true, "/approval": true, "/receipt": true, "/vault/list": true}
 
 // handleFacts serves a request from a caller already traced (live, or from a trace).
 func (m *Manager) handleFacts(ctx context.Context, path string, h handler, facts facts, req api.Req) (any, error) {
-	if m.rec != nil && !readOnly[path] {
-		m.rec.Write(trace.Frame{T: m.now(), Request: &trace.Request{Path: path, Req: req, Facts: trace.Facts{
-			PID: facts.pid, AgentPID: facts.agentPID, Agent: facts.agent, GUI: facts.gui, App: facts.app, ViaApp: facts.viaApp}}})
-	}
 	m.mu.Lock()
+	// Written under mu: requests, ticks and readings go into the trace in the order they are taken.
+	if rec := m.recorder(); rec != nil && !readOnly[path] && !strings.HasPrefix(path, "/vault/") {
+		rec.Write(trace.Frame{T: m.now(), Request: &trace.Request{Path: path, Req: req, Facts: trace.Facts{
+			PID: facts.pid, AgentPID: facts.agentPID, Agent: facts.agent, GUI: facts.gui, App: facts.app, AppPID: facts.appPID, ViaApp: facts.viaApp}}})
+	}
 	caller := m.resolve(facts, &req)
 	resp, effects, err := h(caller, req)
 	var ea *errApproval
 	if errors.As(err, &ea) {
-		a := m.newApproval(path, req, caller, ea.what)
+		a := ea.a
+		if a == nil {
+			a = m.newApproval(path, req, caller, ea.what)
+		}
 		m.mu.Unlock()
 		return nil, &ErrNeedsApproval{Approval: a}
 	}
 	m.dirty = true
+	// The response is encoded after the lock is released, while sweeps change the state it
+	// points into: concurrent map iteration and write is a fatal error in Go, not a recoverable
+	// one. So the caller gets a copy taken now.
+	resp = snapshot(resp)
 	var parked chan *api.AcquireResp
 	if a, ok := resp.(*api.AcquireResp); ok && path == "/acquire" && err == nil && req.WaitSeconds > 0 && !a.Granted && a.Queue > 0 {
 		parked = m.park(caller.Session, req.Kind)
@@ -384,6 +542,10 @@ func (m *Manager) status(c api.Caller, r api.Req) (any, []Effect, error) {
 	if m.dockerEventsErr != "" {
 		src["docker-events"] = m.dockerEventsErr
 	}
+	now := m.now()
+	y, mo, d := now.Date()
+	today, _ := m.freedMB(time.Date(y, mo, d, 0, 0, 0, 0, now.Location()), now)
+	week, _ := m.freedMB(now.AddDate(0, 0, -7), now)
 	return &api.Status{
 		APIVersion: api.Version, DaemonVersion: m.version,
 		Mem: m.mem, HeadroomMB: m.headroomMB(), PendingMB: m.pendingMB(), SwapRate: m.swapRate,
@@ -391,7 +553,9 @@ func (m *Manager) status(c api.Caller, r api.Req) (any, []Effect, error) {
 		Sessions: m.st.Sessions, Questions: m.st.Questions, LastSweep: m.lastSweep, Events: m.events,
 		Learned: m.st.Learned, Stopped: m.st.Stopped, Approvals: m.st.Approvals, Sources: src,
 		Self: m.self, StartedAt: m.started, Notes: m.notes, Prediction: m.predictionScore(),
-		TrustLevels: m.trustLevels(m.now()),
+		TrustLevels: m.trustLevels(m.now()), Accuracy: m.st.Accuracy, FailOpen: m.failOpen(m.now()),
+		Leaks: m.leakList(), VaultAccounts: m.vaultAccountList(), VaultGrants: m.st.VaultGrants,
+		FreedTodayMB: today, FreedWeekMB: week,
 	}, nil, nil
 }
 
@@ -403,7 +567,7 @@ func (m *Manager) holders() string {
 	}
 	var orphans []string
 	for _, r := range m.st.Resources {
-		if r.LeaseID == "" && r.MemMB > 200 {
+		if r.LeaseID == "" && r.MemMB > 200 && !discover.SelfRestarting(r) {
 			orphans = append(orphans, fmt.Sprintf("%s %.1f GB", r.ID, r.MemMB/1024))
 		}
 	}
@@ -454,3 +618,21 @@ func remove(xs []string, x string) []string {
 }
 
 func minutes(n int) time.Duration { return time.Duration(n) * time.Minute }
+
+// snapshot deep-copies a response through its JSON form, so nothing in it aliases the state.
+// The JSON form is all a client ever sees, so nothing is lost.
+func snapshot(v any) any {
+	rv := reflect.ValueOf(v)
+	if v == nil || rv.Kind() != reflect.Pointer || rv.IsNil() {
+		return v
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return v
+	}
+	out := reflect.New(rv.Elem().Type())
+	if json.Unmarshal(b, out.Interface()) != nil {
+		return v
+	}
+	return out.Interface()
+}

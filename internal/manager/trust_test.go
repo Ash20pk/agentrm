@@ -103,7 +103,10 @@ func TestCollectStopsWhatEndedSessionsLeft(t *testing.T) {
 
 func TestReceiptSumsTheWeek(t *testing.T) {
 	m, c := newTest(t, 8)
-	m.st.Stopped = append(m.st.Stopped, &model.Stopped{Resource: model.Resource{ID: "kind:dev", MemMB: 2048}, StoppedAt: c.Now()})
+	// A cluster Docker counted at 2 GB gives back half (nothing learned yet); a process all 1 GB.
+	m.recordStopped(model.Resource{ID: "kind:dev", Source: "docker", MemMB: 2048}, "test", "", c.Now())
+	m.recordStopped(model.Resource{ID: "srv:1", Source: "procs", MemMB: 1024}, "test", "", c.Now())
+	m.st.Stopped = m.st.Stopped[:0] // the totals do not depend on the list kept for restoring
 	m.event("ENDED session s (claude): it ended.")
 	m.event("LEFTOVER node (pid 7, 0.4 GB) was started by session s")
 	m.event("GRANT ab cluster 3.0 GB to b (claude) (from the queue, after 1m30s): test")
@@ -111,7 +114,7 @@ func TestReceiptSumsTheWeek(t *testing.T) {
 	m.event("RESTORED kind:dev (kind) for s")
 	out, _, _ := m.receipt(you, api.Req{Days: 7})
 	r := out.(*api.Receipt)
-	if r.Stopped != 1 || r.FreedGB != 2 || r.SessionsEnded != 1 || r.Leftovers != 1 || r.Queued != 1 ||
+	if r.Stopped != 2 || r.FreedGB != 2 || r.SessionsEnded != 1 || r.Leftovers != 1 || r.Queued != 1 ||
 		r.WaitMean != 90*time.Second || r.Restored != 1 {
 		t.Fatalf("%+v", r)
 	}

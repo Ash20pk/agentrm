@@ -1,3 +1,4 @@
 Config/Local.xcconfig
 AgentRM.xcodeproj/
 build/
+build-release/

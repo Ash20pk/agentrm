@@ -28,6 +28,7 @@ struct Config: Codable {
     var require_app_approval: Bool?
     var owner_gone_grace_minutes: Int?
     var auto_stop: [String: Bool]?
+    var max_swap_mb_per_min: Double?
 }
 
 struct Lease: Codable, Identifiable {
@@ -49,6 +50,12 @@ struct Lease: Codable, Identifiable {
     var branch: String?
     var task_done_why: String?
     var backfill: Bool?
+    /// What a lease with nothing discoverable behind it (a build) uses now, measured.
+    var used_mb: Double?
+    /// The holder chose the size itself (otherwise AgentRM's estimate, or inferred).
+    var declared: Bool?
+    /// The part of used_mb that is growth of Docker's VM or a Gradle daemon (their rows have it).
+    var inside_mb: Double?
 }
 
 struct Resource: Codable, Identifiable {
@@ -62,13 +69,26 @@ struct Resource: Codable, Identifiable {
     var pinned: Bool?
     var started_by: String?
     var paused_at: Date?
+    var unseen: Date?
     var source: String?
     var restart: String?
     var owner: String?
     var owner_gone_at: Date?
     var first_seen: Date?
     var ask_only: Bool?
+    /// Why it could not be restarted now (something runs in it); nil: Restart is accepted.
+    var restart_blocked: String?
     var pid: Int?
+    /// What the daemon will do next if nothing changes ("pause" or "stop"), when, and since when
+    /// it has been waiting; next_dry: in dry run, it only would. Nil: nothing is coming.
+    var next_step: String?
+    var next_at: Date?
+    var next_from: Date?
+    var next_dry: Bool?
+
+    /// Comes back by itself once stopped (Docker's VM, Xcode's helpers): not leased, decided
+    /// about on its own path.
+    var selfRestarting: Bool { kind == "docker-vm" || kind == "xcode-helper" }
 }
 
 struct AgentSession: Codable, Identifiable {
@@ -112,6 +132,106 @@ struct Approval: Codable, Identifiable {
     var expires: Date
     var from: String?
     var state: String
+    var path: String?
+    /// Set for an agent asking the vault for access to an account (approved with Touch ID).
+    var vault: VaultAsk?
+    var error: String?
+}
+
+/// An account in the vault, without its secret (that is in the Keychain). Mirrors
+/// internal/model/vault.go; nil fields are left out when sent back.
+struct VaultAccount: Codable, Identifiable, Hashable {
+    var name: String
+    var kind: String
+    var note: String?
+    var max_minutes: Int?
+    var scopes: [String]?
+    var app_id: String?
+    var installation_id: String?
+    var repos: [String]?
+    var permissions: [String: String]?
+    var api_url: String?
+    var header: String?
+    var prefix: String?
+    var raw_key: Bool?
+    var key_env: String?
+    var base_env: String?
+    var region: String?
+    var external_id: String?
+    var username: String?
+    var url: String?
+    var user_env: String?
+    var pass_env: String?
+    var id: String { name }
+}
+
+/// A well-known API an API key account can be filled in for: `agentrm vault templates --json`,
+/// from internal/vault/templates.json.
+struct VaultTemplate: Codable, Identifiable, Hashable {
+    var id: String
+    var name: String
+    var category: String
+    var api_url: String
+    var header: String?
+    var prefix: String?
+    var raw_key: Bool?
+    var key_env: String
+    var base_env: String
+    var key_url: String?
+    var note: String?
+}
+
+/// What an agent asked the vault for.
+struct VaultAsk: Codable, Hashable {
+    var account: String
+    var kind: String
+    var scope: String
+    var repos: [String]?
+    var minutes: Int
+    var purpose: String
+    var reveal: Bool?
+    var session: String
+    var agent: String
+    var repo: String?
+}
+
+/// Access given (a record: never the secret).
+struct VaultGrant: Codable, Identifiable {
+    var id: String
+    var account: String
+    var kind: String
+    var scope: String
+    var repos: [String]?
+    var minutes: Int
+    var purpose: String
+    var reveal: Bool?
+    var session: String
+    var agent: String
+    var repo: String?
+    var created: Date
+    var expires: Date
+    var ended: Date?
+    var end_reason: String?
+    var uses: Int?
+    var last_used: Date?
+    var note: String?
+    var live: Bool { ended == nil && expires > Date() }
+}
+
+/// A process whose memory keeps climbing with nothing to explain it (status "leaks"; absent
+/// from older daemons). Every field but the id is optional so a changed daemon still decodes.
+struct Leak: Codable, Identifiable {
+    var id: String
+    var pid: Int?
+    var name: String?
+    var resource: String?
+    var since: Date?
+    var start_mb: Double?
+    var now_mb: Double?
+    var rate_mb_per_hour: Double?
+    var action: String?
+    var approval: String?
+    var dismissed: Bool?
 }
 
 struct StoppedItem: Codable, Identifiable {
@@ -119,6 +239,10 @@ struct StoppedItem: Codable, Identifiable {
     var stopped_at: Date
     var why: String
     var by: String?
+    /// What the stop gave back (part of what Docker counted for a container). Older records
+    /// lack it: then what it held.
+    var freed_mb: Double?
+    var freed: Double { freed_mb ?? resource.mem_mb }
     var id: String { resource.id + "@" + String(stopped_at.timeIntervalSince1970) }
 }
 
@@ -133,6 +257,7 @@ struct Status: Codable {
     var headroom_mb: Double
     var pending_mb: Double
     var swap_rate_mb_min: Double?
+    var fail_open: String?
     var waiters: [Waiter]?
     var config: Config
     var leases: [String: Lease]?
@@ -148,10 +273,23 @@ struct Status: Codable {
     var selfUsage: SelfUsage?
     var prediction: String?
     var trust_levels: [TrustLevel]?
+    var leaks: [Leak]?
+    var vault_accounts: [VaultAccount]?
+    var vault_grants: [VaultGrant]?
+    var freed_today_mb: Double?
+    var freed_week_mb: Double?
+
+    /// The swap-out rate above which the daemon refuses work (its config, default 300 MB/min).
+    /// 0 or less: the daemon does not refuse for swapping, so neither does the app warn.
+    var swapLimit: Double {
+        let l = config.max_swap_mb_per_min ?? 300
+        return l > 0 ? l : .infinity
+    }
 
     enum CodingKeys: String, CodingKey {
         case mem, headroom_mb, pending_mb, swap_rate_mb_min, waiters, config, leases, resources, sessions,
-             events, last_sweep, daemon_version, sources, stopped, approvals, notes, prediction, trust_levels
+             events, last_sweep, daemon_version, sources, stopped, approvals, notes, prediction, trust_levels, leaks, fail_open,
+             vault_accounts, vault_grants, freed_today_mb, freed_week_mb
         case selfUsage = "self"
     }
 }
@@ -235,7 +373,9 @@ enum CLI {
     }
 
     /// Runs the helper off the main thread and returns stdout.
-    static func run(_ args: [String], timeout: TimeInterval = 15) async throws -> Data {
+    /// `input` is written to the helper's stdin and closed: the way a secret reaches it, never argv
+    /// (any process can read another's arguments).
+    static func run(_ args: [String], timeout: TimeInterval = 15, input: Data? = nil) async throws -> Data {
         try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
                 let p = Process()
@@ -244,16 +384,31 @@ enum CLI {
                 let out = Pipe(), err = Pipe()
                 p.standardOutput = out
                 p.standardError = err
+                let inPipe = input.map { _ in Pipe() }
+                if let inPipe { p.standardInput = inPipe }
                 do {
                     try p.run()
                 } catch {
                     cont.resume(throwing: error)
                     return
                 }
+                if let inPipe, let input {
+                    inPipe.fileHandleForWriting.write(input)
+                    try? inPipe.fileHandleForWriting.close()
+                }
                 let killer = DispatchWorkItem { if p.isRunning { p.terminate() } }
                 DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
+                // Drain both pipes at once: read one to the end first and a child that fills the
+                // other's buffer (64 KB) blocks on it forever.
+                let errBox = DataBox()
+                let errDone = DispatchSemaphore(value: 0)
+                DispatchQueue.global(qos: .userInitiated).async {
+                    errBox.data = err.fileHandleForReading.readDataToEndOfFile()
+                    errDone.signal()
+                }
                 let data = out.fileHandleForReading.readDataToEndOfFile()
-                let errData = err.fileHandleForReading.readDataToEndOfFile()
+                errDone.wait()
+                let errData = errBox.data
                 p.waitUntilExit()
                 killer.cancel()
                 if p.terminationStatus == 0 {
@@ -266,6 +421,9 @@ enum CLI {
             }
         }
     }
+
+    /// Holds what one reader thread read, handed over through a semaphore.
+    private final class DataBox: @unchecked Sendable { var data = Data() }
 
     static func text(_ args: [String]) async -> String {
         guard let d = try? await run(args) else { return "" }

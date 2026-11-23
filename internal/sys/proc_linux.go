@@ -73,7 +73,18 @@ func readProc(pid int, now time.Time) *Proc {
 		args = []string{"[" + strings.TrimSpace(string(comm)) + "]"} // a kernel thread
 	}
 	p.Exe, p.Args = args[0], strings.Join(args, " ")
+	p.Path = ExePath(pid)
 	return p
+}
+
+// ExePath returns the real path of the executable pid runs (/proc/<pid>/exe), which the
+// process cannot choose, unlike its argv[0]. "" when the process is gone or not readable.
+func ExePath(pid int) string {
+	path, err := os.Readlink("/proc/" + strconv.Itoa(pid) + "/exe")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSuffix(path, " (deleted)")
 }
 
 // ListProcs reads the whole process table from /proc.
@@ -121,10 +132,9 @@ func ReadProcInfo(pid int) (ProcInfo, bool) {
 		return ProcInfo{}, false
 	}
 	var info ProcInfo
-	for _, a := range strings.Split(strings.TrimRight(string(cmd), "\x00"), "\x00") {
-		if a != "" {
-			info.Argv = append(info.Argv, a)
-		}
+	if len(cmd) > 0 {
+		// Each argument ends in a NUL; an empty argument is two NULs in a row and is kept.
+		info.Argv = strings.Split(strings.TrimSuffix(string(cmd), "\x00"), "\x00")
 	}
 	env, err := os.ReadFile(dir + "/environ")
 	if err != nil {
@@ -135,6 +145,7 @@ func ReadProcInfo(pid int) (ProcInfo, bool) {
 			info.addEnv(k, v)
 		}
 	}
+	info.finish()
 	return info, true
 }
 
@@ -170,7 +181,7 @@ func QuickAncestry(pid int) (agentPID int, agent string, gui bool) {
 		if k := AgentKind(p); k != "" {
 			return p.PID, k, false
 		}
-		if isGUIApp(p.Exe) {
+		if isGUIApp(p.Path) {
 			gui = true
 		}
 		pid = p.PPID

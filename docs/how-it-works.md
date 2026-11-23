@@ -90,11 +90,21 @@ nothing is lost, and claiming it, pinning it, running a command that uses it, or
 its port resumes it instantly. After `pause_minutes` more it is **stopped**: containers are
 stopped (not removed), simulators shut down, Homebrew services stopped through `brew`, processes
 get SIGTERM, Ollama models are unloaded. Everything stopped is listed and can be restored with
-`agentrm restore`, through admission like any request.
+`agentrm restore`, through admission like any request. A restore that fails stays listed.
+
+A process is paused and stopped with its whole tree, the way its memory is counted: `npm run dev`
+is npm, a shell and vite, and freezing npm alone would leave vite serving. The tree is frozen
+parent first, so nothing respawns what is being stopped, then sent SIGTERM, then thawed children
+first. Nothing is signalled on a PID alone: the process is read again right before, and must
+still have the start time AgentRM recorded, or the PID is now someone else's and is left alone.
+Containers of a group are paused and stopped one by one, so one already paused or gone does not
+fail the rest. Gradle and Kotlin daemons are never paused (a frozen daemon holds its locks and
+every other build waits on it); they are stopped, and the next build starts its own.
 
 If a request is waiting for memory the pause is skipped, because a paused process still holds
 its memory. VMs are never stopped automatically (for QEMU that is a hard power-off); they are
-paused where possible and you are asked.
+paused where possible and you are asked. When the daemon shuts down cleanly it thaws everything
+it paused first: a daemon that is then quit, disabled or uninstalled would never thaw it.
 
 Every pause and stop decision, taken or (in dry run) not, is kept for `agentrm review`, where you
 mark it right or wrong. That is the evidence for turning auto-stop on.
@@ -135,7 +145,10 @@ same agent process takes over its leases and what it started. Then:
   session instead of being listed twice. Leftovers are sized by their footprint (what Activity
   Monitor shows, compressed memory included), not by `ps`'s resident size, which an idle
   process macOS has compressed makes look small. AgentRM records each one's command line,
-  directory and environment (secrets removed), so `agentrm restore left:<pid>` starts it again.
+  directory and environment (secrets removed), so `agentrm restore left:<pid>` starts it again,
+  with the program looked up on the PATH it had, never on AgentRM's. Only leftovers and dev
+  servers are started again this way; never an agent, a headless browser, a Gradle daemon or an
+  app, and never a process that rewrote its own command line (`postgres: writer`).
 
 Sweeping is the usual staged, reversible path, timed by the evidence:
 
@@ -152,6 +165,31 @@ A session that talks again (resumed) is a root once more, and what it left is no
 collected as left behind. What is never paused or stopped automatically: VMs, things you
 started, apps an agent launched, pinned and never-stop items; AgentRM asks about them instead. The Activity window's
 Collected tab lists each ended session with what it left and what happened to it.
+
+## Leak watch
+
+A long-lived dev process whose memory keeps climbing (a stuck tsserver or language server, a dev
+server that leaks, a Python process left running) holds more every hour and is never idle, so
+nothing above catches it. On each sweep AgentRM samples, every 5 minutes at most, the footprint of
+processes of 500 MB or more, keeping about two hours of samples per process (by PID and start
+time, so a reused PID starts afresh). A process is flagged as leaking when, over at least an hour
+and 12 samples, it grew by at least 500 MB and by half of where it started, the fitted trend
+accounts for most of that, at least four steps in five did not go down (dips under 2% count as
+flat), and it is still climbing in the second half of the window. A garbage collector's sawtooth,
+a cache filling once, or one jump is not a leak.
+
+Growth that something explains is not flagged: a process in the tree of a session holding a lease,
+a running build, a pinned, never-stop or leased resource, and kinds that are meant to grow (the
+Docker VM, emulators, simulators, browsers, Xcode, model servers, databases). AgentRM itself,
+agents, system and root processes, and apps are never watched; a language server an editor runs
+from inside its bundle is.
+
+A leak is only ever asked about: a `LEAK` event, a `LEAKING` line in `agentrm status`, and an
+approval in the app. Accepting restarts it if AgentRM knows how (a dev server or leftover whose
+command it recorded), else stops it with SIGTERM, start time checked. Only a person can accept, in
+the app or with `agentrm leak accept|dismiss LEAK` (from a terminal that waits for a click in the
+app). In dry run, and while everything is let through, leaks are reported and nothing is asked
+or done.
 
 ## Liveness by task
 
@@ -181,9 +219,18 @@ learned stop timing below.
   first-order Markov chain over the kinds commands classify to) and how long each kind of lease
   lives. Every lease gets an expected end; one that has outlived nine in ten of its kind and is
   idle is marked probably finished. When a session's likely next request would not fit,
-  holders are asked what yielding would cost before it arrives (asked only: nothing is taken on
-  a guess). `agentrm status` shows how the predictor does against the obvious baseline, the
-  project's most frequent kind.
+  holders are asked what yielding would cost before it arrives, and room is made ahead of it:
+  unclaimed things idle for `pressure_idle_minutes` are paused, cheapest first (what an ended
+  session left, then the longest idle). Only paused, never stopped, on a guess; dry run, the
+  trust levels, pins, never-stop and things you started apply as to any automatic pause, and
+  nothing held by a lease is touched. Each prediction is scored (`predict:<kind>` on the
+  ACCURACY line: did the request come within 10 minutes), and nothing is paused for a kind
+  until at least 5 of its predictions were scored and 70% came true; below that AgentRM only
+  logs what it would have paused. What was paused is resumed (UNPREPARED) when the request does
+  not come within the window, or once the work it made room for is done (at most 30 minutes).
+  A paused process still holds its memory until macOS compresses or swaps it out, so a pause
+  gives back less than a stop would, and later. `agentrm status` shows
+  how the predictor does against the obvious baseline, the project's most frequent kind.
 - **When to stop.** Waiting costs the memory held for as long as it is held; stopping something
   then needed costs its restart time. Per resource kind, AgentRM records how long things sat
   idle before being used again (and which never were), and picks the wait that minimises the

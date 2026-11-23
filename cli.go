@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	"agentrm/internal/api"
+	"agentrm/internal/manager"
 	"agentrm/internal/model"
 	"agentrm/internal/setup"
 	"agentrm/internal/store"
@@ -43,12 +45,19 @@ Measuring policies (see docs/replay.md)
   agentrm compare [TRACE] [--config FILE]      AgentRM and a parent-PID reaper on the same trace
 
 Acting (pinning, settings and overriding others ask for approval in the app)
+  agentrm bypass [MINUTES|off]                 let everything through for a while (default 60 min)
   agentrm stop RESOURCE                        stop something now (it can be restored)
   agentrm resume RESOURCE | --all              thaw something AgentRM paused
   agentrm restore RESOURCE | --last            bring back something AgentRM stopped
+  agentrm leak accept|dismiss LEAK|PID         restart (or stop) a process flagged as leaking, or leave it
   agentrm pin RESOURCE | unpin RESOURCE        never / again pause or stop it
   agentrm priority SESSION urgent|normal       an urgent session goes first in the queue
   agentrm config [--dry-run=true|false] [--grace MIN] [--headroom GB] [--idle MIN] [--pause MIN]
+
+Vault (short-lived access to accounts; see agentrm vault)
+  agentrm vault list                           accounts you may ask for, and your grants
+  agentrm vault run ACCOUNT --purpose "why" -- COMMAND   run with access, approved with Touch ID
+  agentrm vault revoke GRANT | --all           end access early
 
 Setup
   agentrm setup claude|codex|gemini|cursor|path|shim [--uninstall]
@@ -90,7 +99,7 @@ func runCLI(cmd string, args []string) int {
 	policy := fs.String("policy", "agentrm", "replay: agentrm or reaper")
 	cost := fs.String("cost", "", "yield: none, low or high")
 	days := fs.Int("days", 7, "receipt: how many days back")
-	autoStop := fs.String("auto-stop", "", "config: level=on|off (owner_gone, unclaimed, idle_lease)")
+	autoStop := fs.String("auto-stop", "", "config: level=on|off (owner_gone, unclaimed, idle_lease, engine_restart, xcode_helpers)")
 	restartSecs := fs.Int("restart-seconds", 0, "yield: how long bringing it back would take")
 	configFile := fs.String("config", "", "replay: a config.json to replay with (default: this Mac's)")
 	if err := fs.Parse(args); err != nil {
@@ -258,15 +267,22 @@ func runCLI(cmd string, args []string) int {
 	case "config":
 		req.GraceMinutes, req.HeadroomGB, req.IdleMinutes = *grace, *headroom, *idle
 		if *dryRun != "" {
-			v := *dryRun == "true"
+			v, perr := parseBool(*dryRun)
+			if perr != nil {
+				return fail(fmt.Errorf("--dry-run: %w", perr))
+			}
 			req.DryRun = &v
 		}
 		if *pause >= 0 {
 			req.PauseMinutes = pause
 		}
 		if *autoStop != "" {
-			level, v, _ := strings.Cut(*autoStop, "=")
-			req.AutoStop = map[string]bool{level: v == "on" || v == "true"}
+			level, s, ok := strings.Cut(*autoStop, "=")
+			v, perr := parseBool(s)
+			if !ok || level == "" || perr != nil {
+				return fail(fmt.Errorf("--auto-stop wants level=on|off, got %q", *autoStop))
+			}
+			req.AutoStop = map[string]bool{level: v}
 		}
 		var cfg model.Config
 		if err = callApproved("/config", req, &cfg); err == nil {
@@ -287,6 +303,16 @@ func runCLI(cmd string, args []string) int {
 			}
 			printReview(&r)
 		}
+	case "leak":
+		ok := arg(0) == "accept"
+		if (!ok && arg(0) != "dismiss") || arg(1) == "" {
+			return fail(fmt.Errorf("usage: agentrm leak accept|dismiss LEAK|PID (see agentrm status)"))
+		}
+		req.ResourceID, req.Approve = arg(1), &ok
+		var r api.CountResp
+		if err = callApproved("/leak", req, &r); err == nil {
+			fmt.Println(r.Note)
+		}
 	case "approve", "deny":
 		ok := cmd == "approve"
 		req.ApprovalID, req.Approve = arg(0), &ok
@@ -296,6 +322,30 @@ func runCLI(cmd string, args []string) int {
 		}
 	case "setup":
 		err = runSetup(arg(0), arg(1), *uninstall, *asJSON)
+	case "bypass":
+		// agentrm bypass [MINUTES|off]: let everything through for a while (default an hour).
+		n := 60
+		switch a := arg(0); a {
+		case "", "on":
+		case "off", "0":
+			n = 0
+		default:
+			v, perr := strconv.Atoi(a)
+			if perr != nil || v < 0 {
+				return fail(fmt.Errorf("agentrm bypass [MINUTES|off]"))
+			}
+			n = v
+		}
+		req.UntilMinutes = n
+		var r api.BypassResp
+		if err = api.Call("/bypass", req, &r); err == nil {
+			if r.Until.IsZero() {
+				fmt.Println("AgentRM is managing memory again")
+			} else {
+				fmt.Printf("everything is let through until %s; nothing is paused or stopped automatically. End it early: agentrm bypass off\n",
+					r.Until.Format("15:04"))
+			}
+		}
 	case "collect":
 		var r api.CountResp
 		if err = callApproved("/collect", req, &r); err == nil {
@@ -329,6 +379,18 @@ func runCLI(cmd string, args []string) int {
 		return 2
 	}
 	return fail(err)
+}
+
+// parseBool reads a yes/no flag value. Anything it does not recognise is an error, never a
+// silent "false": `--dry-run=yes` once turned dry run off.
+func parseBool(s string) (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "true", "t", "yes", "y", "on", "1":
+		return true, nil
+	case "false", "f", "no", "n", "off", "0":
+		return false, nil
+	}
+	return false, fmt.Errorf("%q is not true or false (also accepted: yes/no, on/off, 1/0)", s)
 }
 
 func fail(err error) int {
@@ -438,14 +500,20 @@ func runSetup(what, sub string, uninstall, asJSON bool) error {
 		fmt.Println("repaired: everything installed now points at", setup.SelfPath())
 		return nil
 	case "uninstall":
-		errs := setup.Uninstall()
-		for _, e := range errs {
+		r := setup.Uninstall()
+		for _, d := range r.Done {
+			fmt.Println(d)
+		}
+		for _, e := range r.Errs {
 			fmt.Fprintln(os.Stderr, "agentrm:", e)
 		}
-		if len(errs) == 0 {
-			fmt.Println("removed the Claude hooks, the Codex note, the CLI link and the PATH shim; paused resources were resumed.")
-			fmt.Println("To remove the app, quit it and move it to the Bin.")
+		if len(r.Errs) > 0 {
+			return fmt.Errorf("uninstall did not finish: %d problem(s) above; fix them and run agentrm setup uninstall again", len(r.Errs))
 		}
+		if len(r.Done) == 0 {
+			fmt.Println("nothing of AgentRM's was installed.")
+		}
+		fmt.Println("To remove the app, quit it and move it to the Bin.")
 		return nil
 	case "mcp":
 		bin := setup.SelfPath()
@@ -509,6 +577,12 @@ func printStatus(showStopped bool) error {
 	}
 	fmt.Printf("DAEMON   %s · %s · itself %.0f MB, %.1f%% CPU, last sweep %.0f ms\n", st.DaemonVersion,
 		swept, st.Self.RSSMB, st.Self.CPUPercent, st.Self.SweepMS)
+	if st.FailOpen != "" {
+		fmt.Println("OPEN    ", st.FailOpen+": every request is granted, nothing is paused or stopped")
+	}
+	if line := manager.AccuracyLine(st.Accuracy); line != "" {
+		fmt.Println("ACCURACY", line)
+	}
 	for src, why := range st.Sources {
 		if why != "" {
 			fmt.Printf("SOURCE   %s unavailable: %s (its resources are kept as last seen)\n", src, why)
@@ -528,6 +602,14 @@ func printStatus(showStopped bool) error {
 		if a.State == "pending" {
 			fmt.Printf("APPROVE  %s: %s (from %s; answer in the AgentRM app)\n", a.ID, a.What, orNone(a.From))
 		}
+	}
+	for _, l := range st.Leaks {
+		ask := fmt.Sprintf("%s it: agentrm leak accept %s", l.Action, l.ID)
+		if l.Dismissed {
+			ask = "left alone"
+		}
+		fmt.Printf("LEAKING  %s (pid %d) %.1f → %.1f GB since %s, %+.0f MB/h · %s\n", l.Name, l.PID, l.StartMB/1024,
+			l.NowMB/1024, l.Since.Format("15:04"), l.RateMBh, ask)
 	}
 	fmt.Println()
 
@@ -584,6 +666,8 @@ func printStatus(showStopped bool) error {
 	for _, r := range rs {
 		owner := "lease " + r.LeaseID
 		switch {
+		case r.Unseen != nil:
+			owner = fmt.Sprintf("UNSEEN %s (%s not answering; last view)", time.Since(*r.Unseen).Round(time.Minute), r.Source)
 		case r.Pinned:
 			owner = "pinned"
 		case r.PausedAt != nil:

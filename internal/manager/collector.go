@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"agentrm/internal/api"
+	"agentrm/internal/discover"
 	"agentrm/internal/model"
 	"agentrm/internal/sys"
 	"agentrm/internal/trace"
@@ -99,6 +100,17 @@ func (c *infoCache) refresh(procs map[int]*sys.Proc) {
 	}
 }
 
+// getStarted is the entry for the process that has pid and started at start: never another
+// process that has the PID since. Empty if that process was never read, or start is unknown.
+func (c *infoCache) getStarted(pid int, start time.Time) sys.ProcInfo {
+	if c.direct || start.IsZero() {
+		return sys.ProcInfo{}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.m[procKey{pid, start.Unix()}]
+}
+
 func (c *infoCache) get(p *sys.Proc) sys.ProcInfo {
 	if p == nil {
 		return sys.ProcInfo{}
@@ -165,7 +177,9 @@ func (m *Manager) checkLiveness(procs map[int]*sys.Proc, now time.Time) {
 			byAgent[apid] = append(byAgent[apid], p)
 			// The environment names the agent's real session, which is what the hooks would
 			// say: learn it, so a session is one session however it was first seen.
-			if info := m.infos.get(p); info.Session != "" && m.agentSessions[apid] == "" && sys.AgentKind(procs[apid]) == "claude" {
+			// An environment can be set by hand: a session another live agent holds is not learned.
+			if info := m.infos.get(p); info.Session != "" && m.agentSessions[apid] == "" && sys.AgentKind(procs[apid]) == "claude" &&
+				m.sessionHolder(info.Session, apid, procs) == 0 {
 				m.learnSession(apid, info.Session)
 			}
 		}
@@ -257,7 +271,7 @@ func (m *Manager) recordTree(id string, agentPID int, procs map[int]*sys.Proc, c
 	tree := map[int]model.TreeProc{}
 	for pid, tp := range m.st.Trees[id] {
 		if p := procs[pid]; p != nil && sys.SameProcess(p, tp.Start) {
-			tp.PeakMB = max(tp.PeakMB, p.RSSMB)
+			tp.PeakMB = max(tp.PeakMB, m.procMB(p))
 			tree[pid] = tp
 		}
 	}
@@ -272,7 +286,7 @@ func (m *Manager) recordTree(id string, agentPID int, procs map[int]*sys.Proc, c
 			continue
 		}
 		if p := procs[pid]; p != nil {
-			tree[pid] = model.TreeProc{Start: p.Start, PeakMB: p.RSSMB}
+			tree[pid] = model.TreeProc{Start: p.Start, PeakMB: m.procMB(p)}
 			stack = append(stack, children[pid]...)
 		}
 	}
@@ -339,6 +353,8 @@ func (m *Manager) handOver(from, to string) {
 		// Handed back to a session that was cleared before (it is the one talking): live again.
 		nw.EndedAt, nw.EndReason = nil, ""
 	}
+	// A cleared conversation's vault grants end with it: the new one asks for its own.
+	m.vaultEndSession(from, "its session was cleared", m.now())
 	if old := m.st.Sessions[from]; old != nil {
 		now := m.now()
 		old.EndedAt, old.EndReason = &now, "cleared: continued as "+short(to)
@@ -375,8 +391,9 @@ func (m *Manager) endSession(s *model.Session, why string, now time.Time) {
 		marked++
 		mb += r.MemMB
 	}
-	// A session that ended waits for nothing.
+	// A session that ended waits for nothing, and holds no access.
 	m.dropWaitersOf(s.ID)
+	m.vaultEndSession(s.ID, "its session ended: "+why, now)
 	m.event("ENDED session %s (%s): %s. Released %d lease(s); %d thing(s) it started or held (%.1f GB) are now collected.",
 		short(s.ID), s.Agent, why, n, marked, mb/1024)
 	if marked > 0 {
@@ -395,22 +412,6 @@ func (m *Manager) dropWaitersOf(session string) {
 			m.dropWaiter(w.Session, w.Kind)
 		}
 	}
-}
-
-// peakOf is the most memory a process was seen using: now, or while its agent ran.
-func peakOf(p *sys.Proc, tree map[int]model.TreeProc) float64 {
-	return max(p.RSSMB, tree[p.PID].PeakMB)
-}
-
-// held is what a process holds now: its footprint (compressed memory included) where that can
-// be read, its resident size otherwise.
-func (m *Manager) held(p *sys.Proc) float64 {
-	if m.footprint != nil {
-		if fp, ok := m.footprint(p.PID); ok {
-			return max(p.RSSMB, fp)
-		}
-	}
-	return p.RSSMB
 }
 
 // treeSize is what a process and everything under it hold.
@@ -480,7 +481,7 @@ func (m *Manager) findLeftovers(s *model.Session, procs map[int]*sys.Proc, now t
 		return
 	}
 	children := childrenOf(procs)
-	size := func(p *sys.Proc) float64 { return max(m.held(p), tree[p.PID].PeakMB) }
+	size := func(p *sys.Proc) float64 { return max(m.procMB(p), tree[p.PID].PeakMB) }
 	found := 0
 	for _, p := range cands {
 		if cands[p.PPID] != nil {
@@ -535,7 +536,7 @@ func (m *Manager) findEnvLeftovers(procs map[int]*sys.Proc, now time.Time) {
 		if lo := m.st.Leftovers[strconv.Itoa(pid)]; lo != nil && sys.SameProcess(c.p, lo.Start) {
 			continue
 		}
-		mb := m.treeSize(c.p, children, procs, m.held)
+		mb := m.treeSize(c.p, children, procs, m.procMB)
 		if mb < m.cfg.LeftoverMinMB && c.p.CPU < 2 {
 			continue
 		}
@@ -613,11 +614,14 @@ func (m *Manager) withLeftovers(found []*model.Resource, procs map[int]*sys.Proc
 			if r.Cwd == "" {
 				r.Cwd = lo.Cwd
 			}
+			if len(r.RestartArgv) == 0 && len(lo.Argv) > 0 {
+				r.RestartArgv, r.RestartEnv = lo.Argv, lo.Env
+			}
 			r.AskOnly = r.AskOnly || lo.AskOnly
 			continue
 		}
 		r := &model.Resource{ID: "left:" + key, Kind: model.RKLeftover, Source: "procs",
-			Name: filepath.Base(p.Exe), Detail: trunc(p.Args, 90), PID: p.PID, MemMB: m.treeSize(p, children, procs, m.held), CPU: p.CPU,
+			Name: filepath.Base(p.Exe), Detail: trunc(p.Args, 90), PID: p.PID, ProcStart: p.Start, MemMB: m.treeSize(p, children, procs, m.procMB), CPU: p.CPU,
 			Cwd: lo.Cwd, StartedBy: lo.Session, AskOnly: lo.AskOnly, RestartArgv: lo.Argv, RestartEnv: lo.Env,
 			Restart: "agentrm restore left:" + key}
 		if gone != nil {
@@ -636,9 +640,33 @@ func (m *Manager) withLeftovers(found []*model.Resource, procs map[int]*sys.Proc
 		kind := sys.AgentKind(p)
 		found = append(found, &model.Resource{ID: "agent:" + strconv.Itoa(pid), Kind: model.RKStaleAgent, Source: "procs",
 			Name: agentTitle(kind), Detail: fmt.Sprintf("no terminal, not heard from in %dh+: %s", staleAgentHours, trunc(p.Args, 60)),
-			PID: pid, MemMB: m.treeSize(p, children, procs, m.held), CPU: p.CPU, AskOnly: true, Restart: "start the agent again"})
+			PID: pid, ProcStart: p.Start, MemMB: m.treeSize(p, children, procs, m.procMB), CPU: p.CPU, AskOnly: true, Restart: "start the agent again"})
 	}
+	m.keepRestartInfo(found, procs)
 	return found
+}
+
+// keepRestartInfo notes, on each process-backed resource, the start of its process and, for
+// those AgentRM may start again, the command and environment it was started with. They are
+// read now, while the process runs and its PID is still its own, so that a stop decided later
+// carries them on the resource and never has to look a PID up after the process is gone.
+// Must hold mu.
+func (m *Manager) keepRestartInfo(found []*model.Resource, procs map[int]*sys.Proc) {
+	for _, r := range found {
+		p := procs[r.PID]
+		if r.PID <= 0 || p == nil {
+			continue
+		}
+		if r.ProcStart.IsZero() {
+			r.ProcStart = p.Start
+		}
+		if len(r.RestartArgv) > 0 || !discover.Restartable(r) || m.infos == nil || !sys.SameProcess(p, r.ProcStart) {
+			continue
+		}
+		if info := m.infos.get(p); len(info.Argv) > 0 {
+			r.RestartArgv, r.RestartEnv = info.Argv, info.EnvList()
+		}
+	}
 }
 
 // LeftoverCwds lists leftovers whose working directory is not known yet. Must hold mu.

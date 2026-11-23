@@ -22,6 +22,17 @@ const (
 	// RKStaleAgent is an agent process with no terminal or app above it that has not been
 	// heard from in hours. Only ever asked about: it may be someone's tmux session.
 	RKStaleAgent = "stale-agent"
+	// RKDockerVM is Docker Desktop's Linux VM itself. Containers that stop free memory inside
+	// it, and the VM keeps much of it; only restarting Docker gives it all back to macOS. It
+	// comes back by itself (with the engine), so it is never restored, and it is restarted only
+	// when nothing uses Docker.
+	RKDockerVM = "docker-vm"
+	// RKXcodeHelper is one of Xcode's helpers (SourceKitService, the build service,
+	// sourcekit-lsp) grown large and left idle. Xcode starts it again when it needs it.
+	RKXcodeHelper = "xcode-helper"
+	// RKProcess is a plain process AgentRM acts on only because it was flagged as leaking and
+	// you said to stop it. Never discovered as a resource.
+	RKProcess = "process"
 )
 
 // Lease kinds.
@@ -69,14 +80,17 @@ var AllKinds = []string{KCluster, KCompose, KDockerBuild, KCargoBuild, KGradle, 
 	KVM, KModel, KLoadtest, KServer, KBrowser}
 
 type Resource struct {
-	ID          string     `json:"id"`
-	Kind        string     `json:"kind"`
-	Source      string     `json:"source"` // which discovery source found it: docker, simctl, procs
-	Name        string     `json:"name"`
-	Detail      string     `json:"detail"`
-	MemMB       float64    `json:"mem_mb"`
-	Containers  []string   `json:"containers,omitempty"`
-	PID         int        `json:"pid,omitempty"`
+	ID         string   `json:"id"`
+	Kind       string   `json:"kind"`
+	Source     string   `json:"source"` // which discovery source found it: docker, simctl, procs
+	Name       string   `json:"name"`
+	Detail     string   `json:"detail"`
+	MemMB      float64  `json:"mem_mb"`
+	Containers []string `json:"containers,omitempty"`
+	PID        int      `json:"pid,omitempty"`
+	// ProcStart is when the process at PID started. A PID is reused once its process exits:
+	// a signal goes only to a process that still started at this time.
+	ProcStart   time.Time  `json:"proc_start,omitempty"`
 	UDID        string     `json:"udid,omitempty"`
 	Cwd         string     `json:"cwd,omitempty"` // where its process runs, when known
 	FirstSeen   time.Time  `json:"first_seen"`
@@ -90,7 +104,26 @@ type Resource struct {
 	StartedBy   string     `json:"started_by,omitempty"`  // session that started it, when known
 	PausedAt    *time.Time `json:"paused_at,omitempty"`   // frozen since then, not yet stopped
 	Urgent      bool       `json:"urgent,omitempty"`      // a blocked request needs its memory: stop, do not freeze
-	Restart     string     `json:"restart,omitempty"`     // how to bring it back after a stop
+	// PreparedFor is the prediction it was paused ahead of (an ID the daemon keeps), and
+	// PreparedUntil when it is resumed if that does not change. A pause made on a prediction is
+	// never followed by a stop on the same prediction (see manager/prepare.go).
+	PreparedFor   string     `json:"prepared_for,omitempty"`
+	PreparedUntil *time.Time `json:"prepared_until,omitempty"`
+	// NextStep is what AgentRM will do to it if nothing changes ("pause" or "stop"), at NextAt,
+	// after a wait that began at NextFrom; NextDry: in dry run, it only would. Worked out on each
+	// sweep from the same timing the decision uses, so what the app counts down to is what
+	// happens. Empty: nothing is coming (held, pinned, yours, a VM, an app...).
+	NextStep string     `json:"next_step,omitempty"`
+	NextAt   *time.Time `json:"next_at,omitempty"`
+	NextFrom *time.Time `json:"next_from,omitempty"`
+	NextDry  bool       `json:"next_dry,omitempty"`
+	// Unseen is the time its source last failed to answer (Docker hung): what is shown is the
+	// last view, not the current one, and nothing is paused, stopped or counted on from it.
+	Unseen  *time.Time `json:"unseen,omitempty"`
+	Restart string     `json:"restart,omitempty"` // how to bring it back after a stop
+	// RestartBlocked says why you could not restart it now (something runs in it), for what
+	// comes back by itself: the app offers Restart exactly when it is "". Worked out each sweep.
+	RestartBlocked string `json:"restart_blocked,omitempty"`
 	// Owner is the session that started or last held it, once that session is gone, and
 	// OwnerGoneAt when it went: the collector's strongest evidence that nobody needs it.
 	Owner       string     `json:"owner,omitempty"`
@@ -126,11 +159,21 @@ type Lease struct {
 	LastUsed  time.Time  `json:"last_used"`
 	IdleAsked *time.Time `json:"idle_asked,omitempty"`
 	PeakMB    float64    `json:"peak_mb,omitempty"`
+	// UsedMB is what a build lease uses now: the footprint of what its session started since
+	// the grant.
+	UsedMB float64 `json:"used_mb,omitempty"`
+	// InsideMB is the part of UsedMB that is growth of Docker's VM or a Gradle daemon, which
+	// those resources' own figures already include.
+	InsideMB float64 `json:"inside_mb,omitempty"`
 	// BaseFootprintMB is the session's process-tree memory when the lease was granted.
 	BaseFootprintMB float64 `json:"base_footprint_mb,omitempty"`
-	Declared        bool    `json:"declared,omitempty"` // the holder chose MemGB itself
-	HadResources    bool    `json:"had_resources,omitempty"`
-	Overran         bool    `json:"overran,omitempty"`
+	// DaemonBaseMB is what each Gradle and Kotlin daemon held when a gradle lease was granted, or
+	// Docker's VM when a Docker lease was. The work runs inside those, not in a process the
+	// session starts, so their growth is its use.
+	DaemonBaseMB map[string]float64 `json:"daemon_base_mb,omitempty"`
+	Declared     bool               `json:"declared,omitempty"` // the holder chose MemGB itself
+	HadResources bool               `json:"had_resources,omitempty"`
+	Overran      bool               `json:"overran,omitempty"`
 	// Until is an end time the holder declared; past it the lease is released, not renewed.
 	Until *time.Time `json:"until,omitempty"`
 	// Offered is when the lease was granted from the queue, until its session takes it up. A
@@ -157,6 +200,9 @@ type Session struct {
 	Agent    string    `json:"agent"`
 	Cwd      string    `json:"cwd"`
 	LastSeen time.Time `json:"last_seen"`
+	// Grants are when the session was granted leases (the last day's), released ones included:
+	// what it starts after a grant is that lease's, not an earlier build's.
+	Grants []time.Time `json:"grants,omitempty"`
 	// FootprintMB is the resident memory of everything running under the agent's process.
 	FootprintMB float64   `json:"footprint_mb"`
 	AgentPID    int       `json:"agent_pid,omitempty"`
@@ -257,8 +303,18 @@ type Question struct {
 type Stopped struct {
 	Resource  Resource  `json:"resource"`
 	StoppedAt time.Time `json:"stopped_at"`
-	Why       string    `json:"why"`
-	By        string    `json:"by"` // "agentrm" or the session that asked
+	// FreedMB is what the stop was expected to give back: all a process held, part of what
+	// Docker counted for a container (its return ratio when it was stopped).
+	FreedMB float64 `json:"freed_mb"`
+	Why     string  `json:"why"`
+	By      string  `json:"by"` // "agentrm" or the session that asked
+}
+
+// FreedMark is one stop and what it gave back.
+type FreedMark struct {
+	At time.Time `json:"at"`
+	MB float64   `json:"mb"`
+	ID string    `json:"id,omitempty"` // the resource stopped
 }
 
 // Approval is a privileged request from a terminal waiting for a click in the app.
@@ -271,6 +327,43 @@ type Approval struct {
 	Path    string         `json:"path"`
 	From    string         `json:"from"` // the terminal app it came from
 	State   string         `json:"state"`
+	// Vault is set for an agent's request for access to an account: approving it needs the
+	// account's secret, which only the app has, so only the app's vault answer approves it.
+	Vault *VaultAsk `json:"vault,omitempty"`
+	Error string    `json:"error,omitempty"` // why an approved request failed
+}
+
+// Leak is a process whose memory footprint kept climbing for an hour or more with nothing to
+// explain it (see manager/leaks.go). AgentRM only asks about it: what happens to it is yours.
+type Leak struct {
+	ID        string    `json:"id"`
+	PID       int       `json:"pid"`
+	ProcStart time.Time `json:"proc_start"`
+	Name      string    `json:"name"`
+	Cmd       string    `json:"cmd,omitempty"`
+	// Resource is the tracked resource it is part of (a dev server, a leftover), if any: what
+	// accepting acts on.
+	Resource string    `json:"resource,omitempty"`
+	Since    time.Time `json:"since"` // first sample of the climb
+	StartMB  float64   `json:"start_mb"`
+	NowMB    float64   `json:"now_mb"`
+	RateMBh  float64   `json:"rate_mb_per_hour"`
+	Flagged  time.Time `json:"flagged"`
+	// Action is what accepting does: "restart" (it has a known restart) or "stop" (SIGTERM).
+	Action    string `json:"action"`
+	Approval  string `json:"approval,omitempty"`  // the approval waiting for you, if one is
+	Dismissed bool   `json:"dismissed,omitempty"` // you said leave it; not asked about again
+}
+
+// Accuracy is a running comparison of one kind of prediction with its outcome.
+type Accuracy struct {
+	N         int       `json:"n"`
+	Predicted float64   `json:"predicted"` // sums, in MB (or counts for yes/no predictions)
+	Actual    float64   `json:"actual"`
+	AbsErr    float64   `json:"abs_err"`
+	Over      int       `json:"over"`  // predicted more than 1.5x what happened
+	Under     int       `json:"under"` // what happened was more than 1.5x the prediction
+	Since     time.Time `json:"since"`
 }
 
 // StateVersion is the current on-disk state format. Bump it and add a migration in store.
@@ -293,6 +386,9 @@ type State struct {
 	AgentSessions map[string]string `json:"agent_sessions"`
 	// Stopped is what AgentRM stopped, newest last, kept for restoring (bounded).
 	Stopped []*Stopped `json:"stopped"`
+	// Freed is every stop of the last month and what it gave back: the totals (today, the
+	// week's receipt) are not cut short by Stopped's bound.
+	Freed []FreedMark `json:"freed,omitempty"`
 	// Approvals waiting for the user.
 	Approvals map[string]*Approval `json:"approvals"`
 	// Decisions records each would-pause/would-stop decision for review.
@@ -304,6 +400,17 @@ type State struct {
 	Trees map[string]map[int]TreeProc `json:"trees,omitempty"`
 	// Yields are recent answers to "what would giving it up cost you?" (the newest 200).
 	Yields []*Yield `json:"yields,omitempty"`
+	// BypassUntil: you let everything through until then (agentrm bypass): every request is
+	// granted and nothing is paused or stopped automatically.
+	BypassUntil *time.Time `json:"bypass_until,omitempty"`
+	// Accuracy compares each kind of prediction with what really happened (see
+	// manager/accuracy.go).
+	Accuracy map[string]*Accuracy `json:"accuracy,omitempty"`
+	// ReturnRatio is, per discovery source, how much of a stopped resource's counted memory
+	// the Mac really got back, as measured (Docker Desktop's VM keeps much of what its
+	// containers free); ReturnN is how many stops that is from.
+	ReturnRatio map[string]float64 `json:"return_ratio,omitempty"`
+	ReturnN     map[string]int     `json:"return_n,omitempty"`
 	// RestartSeconds is, per resource kind, how long bringing one back took, as measured.
 	RestartSeconds map[string]float64 `json:"restart_seconds,omitempty"`
 	// Predict is what the command stream has taught: which heavy kind follows which, per
@@ -312,8 +419,15 @@ type State struct {
 	// IdleGaps is, per resource kind, how long things sat idle before being used again, in
 	// minutes (-1: never used again). Learned stop timing works from it.
 	IdleGaps map[string][]float64 `json:"idle_gaps,omitempty"`
+	// DockerVMIdleMB is what Docker Desktop's VM holds just after a restart, with nothing
+	// running (learned; see manager/dockervm.go): restarting it gives back what it holds above.
+	DockerVMIdleMB float64 `json:"docker_vm_idle_mb,omitempty"`
 	// LastReceipt is when the weekly receipt was last sent.
 	LastReceipt time.Time `json:"last_receipt,omitempty"`
+	// VaultAccounts are the accounts agents may ask for, by name, without their secrets (the
+	// app keeps those in the Keychain). VaultGrants are the access given, newest last (200).
+	VaultAccounts map[string]*VaultAccount `json:"vault_accounts,omitempty"`
+	VaultGrants   []*VaultGrant            `json:"vault_grants,omitempty"`
 }
 
 // Decision is one pause or stop decision (taken, or that would have been taken in dry run),
@@ -367,6 +481,9 @@ type Waiter struct {
 	// Retry marks a request only its own retry can complete (a restore has to start the thing
 	// as well), so no lease is granted for it from the queue.
 	Retry bool `json:"retry,omitempty"`
+	// HeldGB is set for a request for more than the session already holds of this kind: what
+	// it held then. It waits for the difference while holding that.
+	HeldGB float64 `json:"held_gb,omitempty"`
 	// Pressed is when holders were last pressed to make room for it.
 	Pressed time.Time `json:"-"`
 }

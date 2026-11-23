@@ -7,7 +7,7 @@ This page says what it defends against, what it does not, and why.
 
 | Actor | Runs as | Can AgentRM tell it apart? |
 |---|---|---|
-| You | your user | Yes: a caller under a terminal, an IDE or the AgentRM app, with no agent process above it |
+| You | your user | Yes: a caller under a terminal or an IDE, with no agent process above it; the app by its bundled helper (below) |
 | A hooked agent (Claude Code) | your user | Yes: a caller under the `claude` process; its session id comes from its hooks |
 | An unhooked agent (Codex, Gemini CLI, Aider, OpenCode, Cursor) | your user | Yes, by process ancestry; gated through the PATH shim when installed |
 | A detached process (`nohup`, `setsid`, a daemon an agent started) | your user | It hangs off launchd with no terminal above it, so it gets no identity and no rights |
@@ -22,8 +22,17 @@ daemons; starting heavy work on a machine that has no room. Leases, idle questio
 stop handle this.
 
 **Agents that say what is convenient.** An agent cannot:
-- claim to be another session: identity comes from the socket's peer PID, not from what it says;
-- claim to be you: only a caller with a GUI ancestor and no agent ancestor is a person;
+- claim to be another session: identity comes from the socket's peer PID, not from what it says.
+  A hook's session ID is believed only for the agent process it runs under, and never when that
+  ID already belongs to another live agent process (session IDs are visible in
+  `agentrm status --json`): the hook keeps its own session and a `TAMPER` event is raised once.
+  A session whose agent has exited can be taken up (a resumed session). An agent inside an app
+  (Cursor's) has its session ID kept in a name of its own (`cursor:<app pid>:<id>`), so it
+  cannot name another agent's session;
+- claim to be you: only a caller with a GUI ancestor and no agent ancestor is a person. Apps are
+  recognised by the real executable path the kernel reports, never by argv, and the walk
+  starts at the caller's parent: a process that set its argv[0] to an app's path, or that
+  hangs off launchd, is detached;
 - verify a claim by mentioning a resource: only executed commands count, not `echo`, `grep`,
   quoted strings or heredoc bodies;
 - get a small charge by declaring a small size: declarations cannot go below what the kind has
@@ -55,6 +64,117 @@ not you.
   the fact, not stopped before.
 - **Commands that use a resource without naming it** (a script that reads a port from a file).
   They are caught by activity on the resource, not by the command.
+
+## How the app is recognised
+
+Rights that need a click in the app (`ViaApp`) are given only to a caller that is the app. The
+app talks to the daemon through the `agentrm` helper bundled in it, which it runs as a child,
+so a caller is the app when, as the kernel reports it at the time of the request:
+
+- its executable (`proc_pidpath`, read with the `proc_info` system call: no cgo) is
+  `<bundle>/Contents/Helpers/agentrm`. This is the executable's vnode path: the process cannot
+  choose it, unlike argv[0] or the exec path in `kern.procargs2`, which live in its own memory;
+- its parent's executable is `<bundle>/Contents/MacOS/AgentRM` of the same bundle, so the
+  real helper run detached or from a shell is not the app;
+- the bundle is `/Applications/AgentRM.app` or the bundle the daemon itself runs from;
+- both executables pass `codesign --verify --strict` with a requirement that they are signed
+  by the same team as the daemon. The result is kept while the file stays the same (device,
+  inode, size, mtime, ctime), so `codesign` runs once per install, not per request.
+
+What this does not guarantee:
+
+- **It checks the files, not the running code.** A process that can write into the bundle and
+  win a race between the check and the request could run other code under the right path.
+  Checking the running process (`SecCodeCopyGuestWithAttributes`) needs the Security framework
+  and so cgo; it is not done. An agent that can write into the bundle can also replace the
+  daemon, which runs from it: the bundle is as trusted as the daemon.
+- **An unsigned daemon (a development build) checks paths only**: it has no team to compare.
+- **Driving the real app** (UI scripting with Accessibility permission) still works, as above.
+- **Being "you" is weaker than being the app.** A person is anyone under a terminal or an IDE
+  with no agent above it, and an agent can still get there: by asking Terminal to run a
+  command (AppleScript), or by copying a shell into a bundle of its own
+  (`~/x/Foo.app/Contents/MacOS/sh`) and running commands under it. That is why pinning,
+  settings, priorities and overrides wait for the app (`require_app_approval`).
+- **On Linux there is no app**: no caller is the app. Terminals and editors are recognised by
+  the base name of `/proc/<pid>/exe`, which an agent can copy under any name.
+
+## The vault
+
+The vault ([vault.md](vault.md)) changes what AgentRM holds: secrets. Where they are, and who
+can reach them:
+
+- **At rest, in the login Keychain, in items the AgentRM app created.** The Keychain trusts the
+  app that made an item, so the app reads them without a prompt and anything else, including an
+  agent running `security find-generic-password` or a copy of the `agentrm` binary, makes macOS
+  ask you. This is the one boundary in AgentRM that holds against a process running as you.
+- **On approval, only.** The app reads an account's secret after Touch ID (or your password),
+  for one request it shows you, and passes it to the daemon on the helper's stdin (never argv,
+  which other processes can read). The daemon accepts it only from the app (`ViaApp`, above).
+  The helper sends it only to the daemon: the socket's folder is yours, so anything running as
+  you could move the socket aside and listen in its place; before sending, the helper checks
+  that the process at the other end runs the same executable as itself. Such a listener could
+  still have shown you a different request (the app reads what to show over the same socket)
+  and put the daemon back in time for the answer, so the app sends back the request it showed
+  you, and the daemon gives nothing unless it is, field for field, the request it holds.
+- **With the settings you saved.** The app keeps each account's settings in its Keychain item,
+  beside the secret, and sends them with the secret. The daemon's copy is in `state.json`,
+  which anything running as you can edit while the daemon is stopped (to send a key to another
+  address, or widen what may be asked); if the two differ, nothing is given, and the Vault tab
+  marks the account until you save it again.
+- **In the daemon's memory, while a grant lasts.** It mints the short-lived credential, keeps
+  it, and forgets it when the grant ends. Nothing secret is written to `state.json`, traces,
+  events, the log or `agentrm status`; tests check this. A daemon restart ends every grant.
+- **In the agent's command.** `vault run` hands GitHub and AWS credentials and passwords to the
+  command it runs, so the agent can print them (`vault run x -- env`). That is the point of
+  making them short-lived and narrow: a GitHub token is one hour and some repos at most, an
+  AWS session is one role. Only API keys stay out of reach: the agent gets a proxy token, and
+  the proxy on `127.0.0.1` puts the key on requests. Any local process with a live proxy token
+  can use it until the grant ends.
+
+What approving protects against, and what it does not:
+
+- An agent cannot approve its own request: answering needs the app, and the app needs Touch ID.
+  Editing or adding an account needs Touch ID too, so a driven UI cannot point an API key's
+  account at another server and then ask for it.
+- One session's grant is not another's: a grant is reused only by the agent process it was
+  given to (the session name is the agent's own word, from its hooks), and no hook may name
+  itself "you". Every request's caller is the process that opened the connection, checked by
+  its PID and its start time, so a connection kept open after its process exits does not pass
+  for whatever process gets that PID next (the app's helper, say). Connections accepted just
+  after the daemon was frozen (`kill -STOP`, which lets connections queue while the PID they
+  came from is reused) never count as the app. A grant is tied to its agent's start time too.
+- After a denial the agent cannot ask for that account again, in any form, for a few minutes,
+  and no agent may have more than three requests open: an agent cannot keep asking until you
+  click the wrong button. Both count against the agent process, not only the session name.
+- `/clear` ends the old conversation's grants; the new one asks for its own.
+- A request waiting for you is checked again against the account when you approve, and after
+  the credential is made: narrowing or removing an account fails what was asked under the old
+  limits.
+- Grants to you (a terminal) are never reused: anything that passes for a person would share
+  them, so each request from a terminal asks again.
+- Variables `vault run` and `vault reveal` set are never kept in AgentRM's restart records,
+  whatever their names.
+- Revoking an API key's grant (or its expiry) refuses new requests through the proxy and cuts
+  the ones still under way, a streamed answer included.
+- **Approving is trusting the purpose the agent wrote.** The approval shows what it will get and
+  where the request comes from; it cannot show what the agent will do with it. Keep each
+  account's own limits tight (the GitHub App's permissions, the IAM user's roles): they are the
+  ceiling no approval can raise.
+- **Another of your processes can read a `vault run` command's environment** (`ps -E`), and with
+  it the grant's token, while the command runs. Same-user processes are not isolated from each
+  other on macOS; short grants are the limit.
+- **An agent can start agents.** Each child (`claude -p ...`) is a new process with its own
+  session, so it has its own three open requests and no denial pause: a determined agent can
+  keep asking, more slowly. Every request still needs your approval.
+- **Debug builds can be read with a debugger.** Xcode signs a Debug app so that a debugger may
+  attach (`get-task-allow`); an agent could attach to it and read the vault's Keychain items as
+  the app. Use release builds for real accounts, and never install a Debug build in
+  /Applications.
+- **A terminal driven by an agent passes for you.** An agent can open Terminal with AppleScript
+  and ask from there: the request shows as yours. It gets nothing without your approval, but it
+  can fill your three open requests, or cause a denial pause, for a few minutes.
+- **AWS sessions and seen passwords cannot be taken back.** Revoking ends the grant in AgentRM;
+  an AWS session works until it expires, and a password until you change it.
 
 ## The privileged helper (decision D7, not built)
 

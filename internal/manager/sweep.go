@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -34,12 +35,10 @@ func (m *Manager) Run(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-t.C:
+				m.vaultTick()
 				m.persist()
 				if n++; n%10 == 0 {
-					m.mu.Lock()
-					rec := m.rec
-					m.mu.Unlock()
-					if rec != nil {
+					if rec := m.recorder(); rec != nil {
 						rec.Flush()
 					}
 				}
@@ -77,12 +76,14 @@ func (m *Manager) Run(ctx context.Context) {
 			}
 		case pid := <-exits:
 			// An agent exited: end its sessions now, with a table read after the exit.
+			m.tickMu.Lock()
 			procs := sys.ListProcs()
-			if m.rec != nil {
+			if rec := m.recorder(); rec != nil {
 				now := m.now()
-				m.rec.Write(trace.Frame{T: now, Exit: pid, ExitTab: m.rec.Procs(now, procs, m.traceOwner, m.footprint)})
+				rec.Write(trace.Frame{T: now, Exit: pid, ExitTab: rec.Procs(now, procs, m.traceOwner, m.footprint)})
 			}
 			m.AgentExited(pid, procs)
+			m.tickMu.Unlock()
 		}
 	}
 }
@@ -129,11 +130,19 @@ func (m *Manager) needsFast() bool {
 // FastTick refreshes memory, pressure and process trees, and thaws paused servers someone is
 // trying to reach.
 func (m *Manager) FastTick() {
+	m.tickMu.Lock()
+	defer m.tickMu.Unlock()
+	m.fastTick()
+}
+
+// fastTick is FastTick with tickMu held.
+func (m *Manager) fastTick() {
 	procs := sys.ListProcs()
 	mem := sys.ReadMem()
-	if m.rec != nil {
+	if rec := m.recorder(); rec != nil {
 		now := m.now()
-		m.rec.Write(trace.Frame{T: now, Fast: &trace.Sweep{Procs: m.rec.Procs(now, procs, m.traceOwner, m.footprint), Mem: mem}})
+		m.tickRec = rec
+		m.tickFrame = &trace.Frame{T: now, Fast: &trace.Sweep{Procs: rec.Procs(now, procs, m.traceOwner, m.footprint), Mem: mem}}
 	}
 	m.fastWith(procs, mem)
 }
@@ -142,6 +151,7 @@ func (m *Manager) FastTick() {
 func (m *Manager) fastWith(procs map[int]*sys.Proc, mem sys.MemStats) {
 	m.mu.Lock()
 	now := m.now()
+	m.writeTick(now)
 	m.takeMem(mem, now)
 	if procs != nil {
 		sys.Procs.Set(procs)
@@ -190,16 +200,59 @@ func (m *Manager) fastWith(procs map[int]*sys.Proc, mem sys.MemStats) {
 	}
 }
 
+// swapSample is the cumulative swap-out count (MB) at a moment.
+type swapSample struct {
+	at  time.Time
+	out float64
+}
+
+const (
+	// swapWindow is what the swap rate is measured over. Samples come every few seconds while
+	// someone waits: a rate over one gap turned a 20 MB burst into "600 MB a minute".
+	swapWindow = time.Minute
+	// swapWindowMin is the shortest span a rate is given for, just after a start.
+	swapWindowMin = 20 * time.Second
+)
+
 func (m *Manager) takeMem(mem sys.MemStats, now time.Time) {
-	if !m.lastSwapAt.IsZero() && now.Sub(m.lastSwapAt) > time.Second && mem.Swapouts >= m.lastSwapouts {
-		m.swapRate = (mem.Swapouts - m.lastSwapouts) / now.Sub(m.lastSwapAt).Minutes()
+	if !mem.SwapUnread {
+		m.swapRate = m.measureSwap(mem.Swapouts, now)
 	}
-	m.lastSwapouts, m.lastSwapAt = mem.Swapouts, now
-	m.mem = mem
+	m.mem, m.memAt = mem, now
+	m.measureReturns(now)
+	m.watchGrants(now)
+}
+
+// measureSwap adds a sample and returns the swap-out rate in MB a minute over the last minute
+// or more: against the newest sample at least swapWindow old, or the oldest if it is at least
+// swapWindowMin old. Until then the rate stands as it was.
+func (m *Manager) measureSwap(out float64, now time.Time) float64 {
+	if n := len(m.swapSamples); n > 0 && (out < m.swapSamples[n-1].out || now.Before(m.swapSamples[n-1].at)) {
+		m.swapSamples = nil // the counter or the clock went back: start again
+	}
+	m.swapSamples = append(m.swapSamples, swapSample{now, out})
+	base := -1
+	for i := len(m.swapSamples) - 1; i >= 0; i-- {
+		if now.Sub(m.swapSamples[i].at) >= swapWindow {
+			base = i
+			break
+		}
+	}
+	if base < 0 {
+		if now.Sub(m.swapSamples[0].at) < swapWindowMin {
+			return m.swapRate
+		}
+		base = 0
+	}
+	b := m.swapSamples[base]
+	m.swapSamples = m.swapSamples[base:]
+	return (out - b.out) / now.Sub(b.at).Minutes()
 }
 
 // Sweep is the full pass: discovery, attribution, leases, orphans.
 func (m *Manager) Sweep() {
+	m.tickMu.Lock()
+	defer m.tickMu.Unlock()
 	start := time.Now()
 	procs := sys.ListProcs()
 	if procs != nil {
@@ -231,7 +284,8 @@ func (m *Manager) Sweep() {
 
 // recordSweep writes a sweep's inputs to the trace, if one is being kept.
 func (m *Manager) recordSweep(procs map[int]*sys.Proc, found discover.Result, mem sys.MemStats, est map[string]bool, cwds map[int]string) {
-	if m.rec == nil {
+	rec := m.recorder()
+	if rec == nil {
 		return
 	}
 	m.infos.refresh(procs) // so the trace has each process's owner from its first frame
@@ -240,14 +294,16 @@ func (m *Manager) recordSweep(procs map[int]*sys.Proc, found discover.Result, me
 	for src, err := range found.Failed {
 		failed[src] = err.Error()
 	}
-	m.rec.Write(trace.Frame{T: now, Sweep: &trace.Sweep{Procs: m.rec.Procs(now, procs, m.traceOwner, m.footprint),
-		Found: found.Resources, Failed: failed, Mem: mem, Est: est, Cwds: cwds}})
+	m.tickRec = rec
+	m.tickFrame = &trace.Frame{T: now, Sweep: &trace.Sweep{Procs: rec.Procs(now, procs, m.traceOwner, m.footprint),
+		Found: found.Resources, Failed: failed, Mem: mem, Est: est, Cwds: cwds}} // written by sweepWith (writeTick)
 }
 
 // sweepWith is a full sweep on what was read (live, or from a trace).
 func (m *Manager) sweepWith(procs map[int]*sys.Proc, found discover.Result, mem sys.MemStats, est map[string]bool, cwds map[int]string) {
 	m.mu.Lock()
 	now := m.now()
+	m.writeTick(now)
 	m.takeMem(mem, now)
 	m.lastSweep = now
 	if procs != nil {
@@ -258,11 +314,15 @@ func (m *Manager) sweepWith(procs map[int]*sys.Proc, found discover.Result, mem 
 	}
 	m.merge(found, procs, est, now)
 	m.checkLeases(now)
+	if procs != nil {
+		m.watchLeaks(procs, now) // after merge and the leases: what explains growth is current
+	}
 	m.judgeYields(now)
 	m.markExpected(now)
 	m.weeklyReceipt(now)
 	effects := m.checkOrphans(now)
 	m.grantWaiters(now, true)
+	effects = append(effects, m.tendPrepared(now)...)
 	for id, s := range m.st.Sessions {
 		if now.Sub(s.LastSeen) > 24*time.Hour && s.FootprintMB == 0 {
 			delete(m.st.Sessions, id)
@@ -270,14 +330,19 @@ func (m *Manager) sweepWith(procs map[int]*sys.Proc, found discover.Result, mem 
 			delete(m.recent, id)
 			delete(m.st.Trees, id)
 			delete(m.missing, id)
+			if m.st.Predict != nil {
+				delete(m.st.Predict.Last, id)
+			}
 		}
 	}
+	m.prune(now)
 	for id, o := range m.origins() {
 		if now.Sub(o.at) > time.Hour {
 			delete(m.dockerOrigin, id)
 		}
 	}
 	m.dirty = true
+	effects = m.gateAuto(effects)
 	m.mu.Unlock()
 
 	if len(effects) > 0 {
@@ -292,6 +357,31 @@ func (m *Manager) origins() map[string]origin { return m.dockerOrigin }
 func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[string]bool, now time.Time) {
 	m.failed = found.Failed
 	seen := map[string]bool{}
+	// What the containers hold is inside the VM's footprint, and is counted as theirs. When
+	// Docker did not answer, its containers keep their last view, and so does this figure.
+	containers := 0.0
+	if found.Failed[discover.SrcDocker] != nil {
+		for _, r := range m.st.Resources {
+			if r.Source == discover.SrcDocker && r.Kind != model.RKDockerVM {
+				containers += r.MemMB
+			}
+		}
+	} else {
+		for _, r := range found.Resources {
+			if r.Source == discover.SrcDocker && r.Kind != model.RKDockerVM {
+				containers += r.MemMB
+			}
+		}
+	}
+	m.dockerFullMB, m.dockerContainersMB, m.dockerMeasured = 0, containers, false
+	m.dockerStale = found.Failed[discover.SrcDocker] != nil
+	for _, r := range found.Resources {
+		if r.Kind == model.RKDockerVM {
+			m.dockerFullMB = r.MemMB // its footprint, before it is credited
+			m.dockerMeasured = procs != nil && r.MemMB > 0
+			m.creditDockerVM(r, containers, now)
+		}
+	}
 	for _, r := range found.Resources {
 		seen[r.ID] = true
 		old := m.st.Resources[r.ID]
@@ -305,6 +395,7 @@ func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[
 				r.Owner, r.OwnerGoneAt = old.Owner, old.OwnerGoneAt
 			}
 			r.PausedAt, r.Urgent, r.ReleasedIdle = old.PausedAt, old.Urgent, old.ReleasedIdle && r.LeaseID == ""
+			r.PreparedFor, r.PreparedUntil = old.PreparedFor, old.PreparedUntil
 			if r.Cwd == "" {
 				r.Cwd = old.Cwd
 			}
@@ -317,7 +408,11 @@ func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[
 		}
 		r.Pinned = m.st.Pinned[r.ID]
 		m.st.Resources[r.ID] = r
-		if r.LeaseID == "" {
+		if discover.SelfRestarting(r) {
+			// Nobody holds it: what runs in it (containers) is held instead. It is decided
+			// about on its own path (selfrestart.go).
+			r.LeaseID, r.StartedBy = "", ""
+		} else if r.LeaseID == "" {
 			// Ancestry and Docker events need no history, so they are tried on every sweep (and
 			// after a restart); what recent commands say only counts for something new.
 			m.attribute(r, procs, now, old == nil && m.firstDone)
@@ -332,10 +427,22 @@ func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[
 		}
 	}
 	for id, r := range m.st.Resources {
-		if seen[id] || found.Failed[r.Source] != nil || m.pending[id] != "" {
+		if found.Failed[r.Source] != nil && !seen[id] {
+			// Kept as last seen, and marked so: it may well be gone (D4).
+			if r.Unseen == nil {
+				t := now
+				r.Unseen = &t
+			}
 			continue
 		}
-		m.noteGone(r, now)
+		if seen[id] || m.pending[id] != "" {
+			continue
+		}
+		if !discover.SelfRestarting(r) {
+			// Not for what comes back by itself: Docker's VM is gone while Docker restarts or
+			// is quit, and that says nothing about how long such things sit idle.
+			m.noteGone(r, now)
+		}
 		delete(m.st.Resources, id)
 		delete(m.st.Questions, id)
 		delete(m.st.Touches, id)
@@ -492,22 +599,50 @@ var dockerClients = map[string]bool{"docker": true, "com.docker.cli": true, "doc
 // watchDocker follows `docker events` and, for each container created, finds the client
 // process that asked for it. This attributes containers started by scripts and Makefiles,
 // which command text cannot.
+//
+// Docker being off (or not installed) is not a failure: there is nothing to watch, and the
+// watcher looks again every few seconds so that it is following again soon after Docker starts.
+// Other failures are reported, and retried less and less often.
 func (m *Manager) watchDocker(ctx context.Context) {
 	backoff := 30 * time.Second
 	for ctx.Err() == nil {
-		err := m.followDocker(ctx)
-		m.mu.Lock()
-		if err != nil {
-			m.dockerEventsErr = err.Error()
+		wait := dockerOffPoll
+		var why string
+		if dockerEngineState() != discover.EngineDown {
+			why = dockerEventsProblem(m.followDocker(ctx), dockerEngineState())
+			if why != "" {
+				wait, backoff = backoff, min(backoff*2, 5*time.Minute)
+			} else {
+				backoff = 30 * time.Second
+			}
 		}
+		m.mu.Lock()
+		m.dockerEventsErr = why
 		m.mu.Unlock()
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(backoff):
+		case <-time.After(wait):
 		}
-		backoff = min(backoff*2, 5*time.Minute)
 	}
+}
+
+// dockerOffPoll is how often the watcher looks for Docker while it is off: a stat of its socket.
+const dockerOffPoll = 10 * time.Second
+
+// dockerEngineState is the Docker engine's state; a variable so that tests can set it.
+var dockerEngineState = func() discover.EngineState {
+	s, _ := discover.DockerEngine()
+	return s
+}
+
+// dockerEventsProblem is what to report when `docker events` stopped: nothing when Docker is
+// off or not installed, since then there are no events to miss.
+func dockerEventsProblem(err error, engine discover.EngineState) string {
+	if err == nil || engine == discover.EngineDown || errors.Is(err, exec.ErrNotFound) {
+		return ""
+	}
+	return err.Error()
 }
 
 func (m *Manager) followDocker(ctx context.Context) error {
@@ -539,13 +674,13 @@ func (m *Manager) followDocker(ctx context.Context) error {
 		if s := originFromProcs(procs, names); s != "" {
 			m.mu.Lock()
 			m.dockerOrigin[id] = origin{session: m.resolveOrigin(s), at: m.now()}
-			if m.rec != nil {
+			if rec := m.recorder(); rec != nil {
 				f := trace.Frame{T: m.now()}
 				f.Origin = &struct {
 					ID      string `json:"id"`
 					Session string `json:"session"`
 				}{id, m.dockerOrigin[id].session}
-				m.rec.Write(f)
+				rec.Write(f)
 			}
 			m.mu.Unlock()
 		}

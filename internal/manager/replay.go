@@ -295,6 +295,10 @@ func replayAgentRM(path string, truth *usage, o ReplayOptions) (*ReplayReport, e
 			procs, _ := filter(rd.Table(), nil)
 			lastProcs = procs
 			m.fastWith(procs, f.Fast.Mem)
+		case f.Mem != nil:
+			m.mu.Lock()
+			m.peekWith(*f.Mem, m.now())
+			m.mu.Unlock()
 		case f.Request != nil:
 			r := f.Request
 			req := r.Req
@@ -303,7 +307,7 @@ func replayAgentRM(path string, truth *usage, o ReplayOptions) (*ReplayReport, e
 			if !ok {
 				continue
 			}
-			fx := facts{pid: r.Facts.PID, agentPID: r.Facts.AgentPID, agent: r.Facts.Agent, gui: r.Facts.GUI, app: r.Facts.App, viaApp: r.Facts.ViaApp}
+			fx := facts{pid: r.Facts.PID, agentPID: r.Facts.AgentPID, agent: r.Facts.Agent, gui: r.Facts.GUI, app: r.Facts.App, appPID: r.Facts.AppPID, viaApp: r.Facts.ViaApp, procs: lastProcs}
 			if r.Path == "/approve" || r.Path == "/config" || r.Path == "/priority" || r.Path == "/review" {
 				continue // a person's settings and marks: not part of the policy
 			}

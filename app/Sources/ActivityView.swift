@@ -6,7 +6,7 @@ import SwiftUI
 /// the decisions to review, what was stopped, setup and limits.
 struct ActivityView: View {
     enum Tab: String, CaseIterable {
-        case now = "Now", collected = "Collected", week = "Week", decisions = "Decisions", stopped = "Stopped", setup = "Setup", limits = "Limits"
+        case now = "Now", collected = "Collected", week = "Week", decisions = "Decisions", stopped = "Stopped", vault = "Vault", setup = "Setup", limits = "Limits"
     }
 
     let updater: SPUUpdater
@@ -33,7 +33,8 @@ struct ActivityView: View {
                 Spacer()
                 if let s = store.status {
                     if s.config.dry_run {
-                        LampLabel(lamp: Lamp.waiting.color, text: "Dry run, day \(store.readiness.days + 1) of 7")
+                        let days = store.readiness.days
+                        LampLabel(lamp: Lamp.waiting.color, text: days < 7 ? "Dry run, day \(days + 1) of 7" : "Dry run, \(days) days")
                     } else {
                         LampLabel(lamp: Lamp.inUse.color, text: "Auto-stop on")
                     }
@@ -48,6 +49,7 @@ struct ActivityView: View {
                 case .week: WeekTab()
                 case .decisions: DecisionsTab()
                 case .stopped: StoppedTab()
+                case .vault: VaultTab()
                 case .setup: SetupTab(updater: updater)
                 case .limits: LimitsTab()
                 }
@@ -84,7 +86,7 @@ struct NowTab: View {
                             Readout(label: "Nobody", value: Fmt.gb(r.nobodyMB), unit: "GB",
                                     color: r.nobodyMB > 0 ? Lamp.nobody.color : Ink.text)
                             Readout(label: "Swap", value: "\(Int(s.swap_rate_mb_min ?? 0))", unit: "MB/m",
-                                    color: (s.swap_rate_mb_min ?? 0) > 300 ? Lamp.nobody.color : Ink.text)
+                                    color: (s.swap_rate_mb_min ?? 0) > s.swapLimit ? Lamp.nobody.color : Ink.text)
                             Readout(label: "Freed", value: Fmt.gb(freedThisWeek(s)), unit: "GB")
                         }
                         .frame(width: 280)
@@ -109,9 +111,12 @@ struct NowTab: View {
         .sheet(item: $keeping) { r in KeepSheet(resource: r) { keeping = nil }.environmentObject(store) }
     }
 
+    /// The daemon's total (every stop of the week, at what each gave back); the list of stops
+    /// it sends is only the last 50.
     private func freedThisWeek(_ s: Status) -> Double {
+        if let w = s.freed_week_mb { return w }
         let weekAgo = Date().addingTimeInterval(-7 * 86400)
-        return (s.stopped ?? []).filter { $0.stopped_at > weekAgo }.reduce(0) { $0 + $1.resource.mem_mb }
+        return (s.stopped ?? []).filter { $0.stopped_at > weekAgo }.reduce(0) { $0 + $1.freed }
     }
 
     private var waterfall: some View {
@@ -139,7 +144,8 @@ struct NowTab: View {
             .accessibilityElement()
             .accessibilityLabel("Memory over the last \(cols.count) minutes")
             HStack {
-                Text(cols.count < 60 ? "AGENTRM STARTED \(cols.count) MIN AGO" : "-60 MIN").font(Face.mono(9)).foregroundStyle(Ink.scale)
+                // Columns are the minutes the app has recorded, not wall time (none while asleep).
+                Text(cols.count < 60 ? "\(cols.count) MIN RECORDED" : "-60 MIN").font(Face.mono(9)).foregroundStyle(Ink.scale)
                 Spacer()
                 Text("NOW").font(Face.mono(9)).foregroundStyle(Ink.scale)
             }
@@ -166,7 +172,8 @@ struct CollectedTab: View {
     var body: some View {
         let s = store.status
         let ended = (s?.sessions ?? [:]).values.filter { $0.ended_at != nil }.sorted { $0.ended_at! > $1.ended_at! }
-        let waiting = (s?.resources ?? [:]).values.filter { $0.owner_gone_at != nil && $0.lease_id == nil }
+        // Pinned things are yours to keep, not left running: the same rule as the welcome screen.
+        let waiting = (s?.resources ?? [:]).values.filter { $0.owner_gone_at != nil && $0.lease_id == nil && $0.pinned != true }
         let collected = (s?.stopped ?? []).filter { $0.resource.owner != nil && $0.stopped_at > Date().addingTimeInterval(-86400) }
         ScrollView {
             VStack(alignment: .leading, spacing: 14) {
@@ -174,7 +181,7 @@ struct CollectedTab: View {
                     Readout(label: "Sessions ended", value: "\(ended.count)", unit: "24 h")
                     Readout(label: "Left running", value: Fmt.gb(waiting.reduce(0) { $0 + $1.mem_mb }), unit: "GB",
                             color: waiting.isEmpty ? Ink.text : Lamp.nobody.color)
-                    Readout(label: "Collected", value: Fmt.gb(collected.reduce(0) { $0 + $1.resource.mem_mb }), unit: "GB 24 h",
+                    Readout(label: "Collected", value: Fmt.gb(collected.reduce(0) { $0 + $1.freed }), unit: "GB 24 h",
                             color: Lamp.inUse.color)
                 }
                 Text("When an agent exits, or its process dies without saying so, its leases are released and everything it started or held is collected: asked about, paused within minutes (nothing lost), then stopped. Processes it left running are found even when AgentRM knows nothing else about them. Anything used after the agent left is treated as someone else's and waits the normal time.")
@@ -217,7 +224,7 @@ struct CollectedTab: View {
                         Text("Stopped \(Fmt.rel(st.stopped_at)), \(st.why)").font(Face.body(12)).foregroundStyle(Ink.dim).lineLimit(2)
                     }
                     Spacer()
-                    Text(Fmt.gb(st.resource.mem_mb)).font(Face.mono(13))
+                    Text(Fmt.size(st.resource.mem_mb)).font(Face.mono(13))
                     Button("Restore") { store.restore(st.resource.id) }.buttonStyle(.key)
                 }
                 .padding(.horizontal, 12).padding(.vertical, 9)
@@ -256,7 +263,7 @@ struct DecisionsTab: View {
                                 Text("\(Fmt.when(d.time)), \(d.why)").font(Face.body(12)).foregroundStyle(Ink.dim).lineLimit(2)
                             }
                             Spacer()
-                            Text(Fmt.gb(d.mem_mb)).font(Face.mono(13))
+                            Text(Fmt.size(d.mem_mb)).font(Face.mono(13))
                             if let v = d.verdict {
                                 LampLabel(lamp: v == "right" ? Lamp.inUse.color : Lamp.nobody.color, text: v)
                             } else {
@@ -297,7 +304,7 @@ struct StoppedTab: View {
                                 .font(Face.body(12)).foregroundStyle(Ink.dim).lineLimit(1)
                         }
                         Spacer()
-                        Text(Fmt.gb(item.resource.mem_mb)).font(Face.mono(13))
+                        Text(Fmt.size(item.resource.mem_mb)).font(Face.mono(13))
                         Button("Restore") { store.restore(item.resource.id) }.buttonStyle(.key)
                     }
                     .padding(.horizontal, 12).padding(.vertical, 10)

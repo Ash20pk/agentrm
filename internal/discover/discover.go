@@ -44,6 +44,7 @@ func Discover(cfg model.Config, procs map[int]*sys.Proc) Result {
 	rs, err := Docker()
 	add(SrcDocker, rs, err)
 	rs, err = Simulators(cfg)
+	measureSimulators(rs, procs)
 	add(SrcSimctl, rs, err)
 	if procs == nil {
 		res.Failed[SrcProcs] = fmt.Errorf("could not read the process table")
@@ -79,8 +80,19 @@ func parseSize(s string) float64 { // in MB
 // Docker groups running containers: one resource per kind cluster, per Compose project (and
 // Supabase stack), or per standalone container.
 func Docker() ([]*model.Resource, error) {
-	if off, until := sys.BackedOff("docker"); off {
-		return nil, fmt.Errorf("docker has been timing out; skipped until %s", until.Format("15:04:05"))
+	// Ask the engine's socket first. Down is certain: nothing of Docker's is running. Hung keeps
+	// the last view. Only an engine that answered is worth running the CLI against, and then the
+	// CLI's back-off is not consulted: it is also fed by docker stop and pause timing out, and
+	// skipping discovery because a stop timed out is how a stopped Docker went unnoticed.
+	switch state, sock := DockerEngine(); state {
+	case EngineDown:
+		return nil, nil
+	case EngineHung:
+		return nil, fmt.Errorf("%w (%s)", ErrEngineHung, sock)
+	case EngineUnknown:
+		if off, until := sys.BackedOff("docker"); off {
+			return nil, fmt.Errorf("docker has been timing out; skipped until %s", until.Format("15:04:05"))
+		}
 	}
 	out, err := sys.Run(5*time.Second, "docker", "ps", "--format",
 		`{{.Names}}	{{.Label "io.x-k8s.kind.cluster"}}	{{.Label "com.docker.compose.project"}}	{{.Label "com.supabase.cli.project"}}	{{.Image}}	{{.Ports}}	{{.Label "com.docker.compose.project.working_dir"}}`)
@@ -105,6 +117,10 @@ func Docker() ([]*model.Resource, error) {
 			}
 			stats[f[0]] = stat{parseSize(f[1]), cpu, net * 1048576}
 		}
+	} else if strings.TrimSpace(out) != "" {
+		// Containers are running but their sizes could not be read: a failed source, so their
+		// last view is kept (D4), not a view where every container holds nothing.
+		return nil, fmt.Errorf("docker stats: %w", err)
 	}
 	groups := map[string]*model.Resource{}
 	for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
@@ -183,11 +199,30 @@ func Simulators(cfg model.Config) ([]*model.Resource, error) {
 			}
 			rt := runtime[strings.LastIndex(runtime, ".")+1:]
 			res = append(res, &model.Resource{ID: "sim:" + d.UDID, Kind: model.RKSimulator, Name: d.Name,
-				Detail: rt, UDID: d.UDID, MemMB: cfg.KindMemGB[model.KSimulator] * 1024,
+				Detail: rt + ", size estimated", UDID: d.UDID, MemMB: cfg.KindMemGB[model.KSimulator] * 1024,
 				Restart: "xcrun simctl boot " + d.UDID})
 		}
 	}
 	return res, nil
+}
+
+// measureSimulators sizes each booted simulator by what its processes hold: its launchd_sim
+// (whose arguments name the device) and everything under it. Until that process is found the
+// configured estimate stands, and says it is one.
+func measureSimulators(rs []*model.Resource, procs map[int]*sys.Proc) {
+	if len(rs) == 0 || procs == nil {
+		return
+	}
+	sub := subtreeMB(procs)
+	for _, r := range rs {
+		for _, p := range procs {
+			if filepath.Base(p.Exe) == "launchd_sim" && r.UDID != "" && strings.Contains(p.Args, r.UDID) {
+				r.MemMB = p.RSSMB + sub[p.PID]
+				r.Detail = strings.TrimSuffix(r.Detail, ", size estimated")
+				break
+			}
+		}
+	}
 }
 
 // ---- Processes ----
@@ -197,37 +232,49 @@ var xmxRe = regexp.MustCompile(`-Xmx(\S+)`)
 var limaRe = regexp.MustCompile(`limactl\S*\s+hostagent\b.*\s(\S+)$`)
 var tartRe = regexp.MustCompile(`\btart\s+run\s+(\S+)`)
 
+// shells are interpreters whose command line is a script, not what they are.
+var shells = map[string]bool{"sh": true, "bash": true, "zsh": true, "dash": true, "fish": true, "-zsh": true, "-bash": true}
+
 var databases = map[string]string{ // process name -> brew formula prefix
 	"postgres": "postgresql", "mysqld": "mysql", "redis-server": "redis", "mongod": "mongodb",
 	"mariadbd": "mariadb", "valkey-server": "valkey", "memcached": "memcached",
 }
 
 // Processes finds process-backed resources: Gradle and Kotlin daemons, dev servers, Android
-// emulators, VMs, local model servers, Homebrew databases and headless browsers.
+// emulators, VMs, local model servers, Homebrew databases, headless browsers, Docker
+// Desktop's own VM and Xcode's helpers.
 func Processes(cfg model.Config, procs map[int]*sys.Proc) []*model.Resource {
 	var res []*model.Resource
 	sub := subtreeMB(procs)
+	guests := vzGuests(procs)
 	for _, p := range procs {
 		base := filepath.Base(p.Exe)
 		a := p.Args
+		if shells[base] {
+			// A shell is never one of these, whatever its command line mentions: an agent's
+			// shell running a command that names limactl or GradleDaemon was taken for a VM.
+			continue
+		}
 		switch {
-		case strings.Contains(a, "org.gradle.launcher.daemon") || strings.Contains(a, "GradleDaemon"):
+		// The daemons are JVMs: a command that only mentions one (grep -r GradleDaemon) is not.
+		case base == "java" && (strings.Contains(a, "org.gradle.launcher.daemon") || strings.Contains(a, "GradleDaemon")):
 			res = append(res, procRes(p, "gradle", model.RKGradle, "Gradle daemon", heap(a), p.RSSMB))
-		case strings.Contains(a, "KotlinCompileDaemon"):
+		case base == "java" && strings.Contains(a, "KotlinCompileDaemon"):
 			res = append(res, procRes(p, "gradle", model.RKGradle, "Kotlin daemon", heap(a), p.RSSMB))
 		case strings.HasPrefix(base, "qemu-system") && avdRe.MatchString(a):
 			name := avdRe.FindStringSubmatch(a)[1]
-			res = append(res, procRes(p, "emu", model.RKEmulator, "Android emulator "+name, "AVD "+name, sub[p.PID]))
-		case strings.HasPrefix(base, "qemu-system") && !underApp(procs, p, "Docker.app"):
-			res = append(res, procRes(p, "vm", model.RKVM, "QEMU VM", trunc(a, 90), sub[p.PID]))
-		case limaRe.MatchString(a):
+			// qemu itself holds the guest's memory: it and what it started.
+			res = append(res, procRes(p, "emu", model.RKEmulator, "Android emulator "+name, "AVD "+name, p.RSSMB+sub[p.PID]))
+		case strings.HasPrefix(base, "qemu-system") && !underApp(procs, p, "Docker.app") && !underLima(procs, p):
+			res = append(res, procRes(p, "vm", model.RKVM, "QEMU VM", trunc(a, 90), p.RSSMB+sub[p.PID]))
+		case strings.HasPrefix(base, "limactl") && limaRe.MatchString(a):
 			name := limaRe.FindStringSubmatch(a)[1]
-			r := procRes(p, "vm", model.RKVM, "Lima VM "+name, "limactl", sub[p.PID])
+			r := procRes(p, "vm", model.RKVM, "Lima VM "+name, "limactl", p.RSSMB+sub[p.PID]+guestMB(guests[p.PID]))
 			r.ID, r.Restart = "vm:lima-"+name, "limactl start "+name
 			res = append(res, r)
-		case tartRe.MatchString(a):
+		case base == "tart" && tartRe.MatchString(a):
 			name := tartRe.FindStringSubmatch(a)[1]
-			r := procRes(p, "vm", model.RKVM, "Tart VM "+name, "tart", sub[p.PID])
+			r := procRes(p, "vm", model.RKVM, "Tart VM "+name, "tart", p.RSSMB+sub[p.PID]+guestMB(guests[p.PID]))
 			r.ID, r.Restart = "vm:tart-"+name, "tart run "+name
 			res = append(res, r)
 		case base == "ollama" && strings.Contains(a, " serve"):
@@ -246,7 +293,14 @@ func Processes(cfg model.Config, procs map[int]*sys.Proc) []*model.Resource {
 			res = append(res, r)
 		case isHeadlessBrowser(a) && !isHeadlessBrowserParent(procs, p):
 			res = append(res, procRes(p, "browser", model.RKBrowser, "headless "+browserName(a), "", p.RSSMB+sub[p.PID]))
+		case xcodeHelpers[base] != "":
+			if r := xcodeHelper(procs, p); r != nil {
+				res = append(res, r)
+			}
 		}
+	}
+	if r := dockerVM(procs); r != nil {
+		res = append(res, r)
 	}
 	// Listening dev servers.
 	for pid, ps := range sys.ListeningPorts() {
@@ -258,14 +312,15 @@ func Processes(cfg model.Config, procs map[int]*sys.Proc) []*model.Resource {
 		r.Ports = ps
 		res = append(res, r)
 	}
-	// Where dev servers and model servers run, for per-project estimates.
+	// Where dev servers and model servers run, for per-project estimates, and which project an
+	// Xcode helper serves.
 	var pids []int
 	for _, r := range res {
-		if r.Kind == model.RKServer || r.Kind == model.RKModel {
+		if r.Kind == model.RKServer || r.Kind == model.RKModel || r.Kind == model.RKXcodeHelper {
 			pids = append(pids, r.PID)
 		}
 	}
-	cwds := sys.Cwds(pids)
+	cwds := cwdsOf(pids)
 	for _, r := range res {
 		if c := cwds[r.PID]; c != "" && r.Cwd == "" {
 			r.Cwd = c
@@ -276,7 +331,7 @@ func Processes(cfg model.Config, procs map[int]*sys.Proc) []*model.Resource {
 
 func procRes(p *sys.Proc, prefix, kind, name, detail string, mb float64) *model.Resource {
 	return &model.Resource{ID: fmt.Sprintf("%s:%d", prefix, p.PID), Kind: kind, Name: name, Detail: detail,
-		PID: p.PID, MemMB: mb, CPU: p.CPU, Restart: "re-run the command that started it"}
+		PID: p.PID, ProcStart: p.Start, MemMB: mb, CPU: p.CPU, Restart: "re-run the command that started it"}
 }
 
 // subtreeMB is the memory of each process's descendants (not including itself).
@@ -295,6 +350,17 @@ func subtreeMB(procs map[int]*sys.Proc) map[int]float64 {
 func underApp(procs map[int]*sys.Proc, p *sys.Proc, app string) bool {
 	for i, q := 0, p; q != nil && q.PID > 1 && i < 64; i, q = i+1, procs[q.PPID] {
 		if strings.Contains(q.Exe, "/"+app+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+// underLima reports whether p was started by a Lima host agent: its qemu is counted as the
+// Lima VM's, not as a VM of its own.
+func underLima(procs map[int]*sys.Proc, p *sys.Proc) bool {
+	for i, q := 0, procs[p.PPID]; q != nil && q.PID > 1 && i < 64; i, q = i+1, procs[q.PPID] {
+		if strings.HasPrefix(filepath.Base(q.Exe), "limactl") && limaRe.MatchString(q.Args) {
 			return true
 		}
 	}
@@ -324,9 +390,11 @@ func isHeadlessBrowser(args string) bool {
 		!strings.Contains(args, "--type=") // renderer, GPU and utility helpers are part of the parent
 }
 
+// isHeadlessBrowserParent reports whether p's parent is a headless browser listed in its place.
+// A shell whose command line starts one is not listed (shells), so the browser it started is.
 func isHeadlessBrowserParent(procs map[int]*sys.Proc, p *sys.Proc) bool {
 	par := procs[p.PPID]
-	return par != nil && isHeadlessBrowser(par.Args)
+	return par != nil && !shells[filepath.Base(par.Exe)] && isHeadlessBrowser(par.Args)
 }
 
 func browserName(args string) string {

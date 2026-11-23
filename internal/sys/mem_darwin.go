@@ -16,7 +16,7 @@ var pageSizeRe = regexp.MustCompile(`page size of (\d+)`)
 // ReadMem takes a full snapshot. vm_stat is the one external command left (see D3).
 func ReadMem() MemStats {
 	m := ReadFast()
-	if out, err := Run(5*time.Second, "vm_stat"); err == nil {
+	if out, err := Run(5*time.Second, vmStatPath); err == nil {
 		pageSize := 16384.0
 		lines := strings.Split(out, "\n")
 		if mm := pageSizeRe.FindStringSubmatch(lines[0]); mm != nil {
@@ -30,10 +30,12 @@ func ReadMem() MemStats {
 			}
 		}
 		mb := func(k string) float64 { return pages[k] * pageSize / 1048576 }
-		m.AvailableMB = mb("Pages free") + mb("Pages inactive") + mb("Pages purgeable") + mb("Pages speculative")
+		m.AvailableMB = availableMB(mb)
 		m.CompressedMB = mb("Pages occupied by compressor")
 		m.Swapouts = mb("Swapouts")
 		m.WiredMB = mb("Pages wired down")
+	} else {
+		m.SwapUnread = true
 	}
 	if m.TotalMB > 0 {
 		m.FreePercent = int(100 * m.AvailableMB / m.TotalMB)

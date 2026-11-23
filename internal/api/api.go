@@ -77,6 +77,20 @@ type Req struct {
 
 	ApprovalID string `json:"approval_id,omitempty"`
 	Approve    *bool  `json:"approve,omitempty"`
+
+	// Vault. Account, Scope, Repos and Reveal are what an agent asks for (TTLMinutes is for how
+	// long, Purpose why); GrantID names a grant to revoke. Material is the account's secret: only
+	// the AgentRM app sends it, when you approve, and it is never stored, logged or traced.
+	Account       string               `json:"account,omitempty"`
+	Scope         string               `json:"scope,omitempty"`
+	Repos         []string             `json:"repos,omitempty"`
+	Reveal        bool                 `json:"reveal,omitempty"`
+	GrantID       string               `json:"grant_id,omitempty"`
+	Material      map[string]string    `json:"material,omitempty"`
+	VaultAccounts []model.VaultAccount `json:"vault_accounts,omitempty"`
+	// VaultShown is the request as the app showed it to you when you approved: the daemon
+	// gives nothing unless it is the request it holds.
+	VaultShown *model.VaultAsk `json:"vault_shown,omitempty"`
 }
 
 // Caller is who is really on the other end, as established from the peer PID.
@@ -111,6 +125,11 @@ type ClaimResp struct {
 	Note     string       `json:"note,omitempty"`
 }
 
+// BypassResp says until when everything is let through (zero: it is not).
+type BypassResp struct {
+	Until time.Time `json:"until,omitempty"`
+}
+
 type CountResp struct {
 	N    int    `json:"n"`
 	Note string `json:"note,omitempty"`
@@ -135,6 +154,21 @@ type ApprovalResp struct {
 	Approval *model.Approval `json:"approval"`
 	Result   any             `json:"result,omitempty"`
 	Error    string          `json:"error,omitempty"`
+}
+
+// VaultResp answers a vault request that is granted: Env is what the command gets (and Unset
+// what it must not inherit). It carries the credential, so the CLI hands it to the command and
+// prints it only for a grant you approved for showing.
+type VaultResp struct {
+	Grant *model.VaultGrant `json:"grant"`
+	Env   map[string]string `json:"env,omitempty"`
+	Unset []string          `json:"unset,omitempty"`
+}
+
+// VaultListResp is what agents may ask for, and the grants they hold (all of them, for you).
+type VaultListResp struct {
+	Accounts []*model.VaultAccount `json:"accounts"`
+	Grants   []*model.VaultGrant   `json:"grants"`
 }
 
 type ReviewResp struct {
@@ -163,6 +197,8 @@ type Status struct {
 	Events        []model.Event              `json:"events"`
 	Learned       map[string]float64         `json:"learned_mb"`
 	Stopped       []*model.Stopped           `json:"stopped"`
+	FreedTodayMB  float64                    `json:"freed_today_mb"` // what today's stops gave back
+	FreedWeekMB   float64                    `json:"freed_week_mb"`  // the last seven days
 	Approvals     map[string]*model.Approval `json:"approvals"`
 	Sources       map[string]string          `json:"sources"` // source -> "" (ok) or why it failed
 	Self          sys.SelfUsage              `json:"self"`
@@ -170,6 +206,16 @@ type Status struct {
 	Notes         []string                   `json:"notes,omitempty"`      // problems at startup
 	Prediction    string                     `json:"prediction,omitempty"` // how the command-stream predictor is doing
 	TrustLevels   []TrustLevel               `json:"trust_levels,omitempty"`
+	// Accuracy is each kind of prediction against what really happened.
+	Accuracy map[string]*model.Accuracy `json:"accuracy,omitempty"`
+	// FailOpen is why AgentRM is letting everything through right now, if it is.
+	FailOpen string `json:"fail_open,omitempty"`
+	// Leaks are processes whose memory keeps climbing with nothing to explain it.
+	Leaks []*model.Leak `json:"leaks,omitempty"`
+	// VaultAccounts are the accounts agents may ask for (no secrets); VaultGrants the access
+	// given, newest last.
+	VaultAccounts []*model.VaultAccount `json:"vault_accounts,omitempty"`
+	VaultGrants   []*model.VaultGrant   `json:"vault_grants,omitempty"`
 }
 
 // TrustLevel is one auto-stop level, with the evidence for turning it on.

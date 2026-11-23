@@ -19,20 +19,13 @@ func restartLeftover(r *model.Resource) error {
 	if len(r.RestartArgv) == 0 {
 		return fmt.Errorf("AgentRM did not see how %s was started; re-run the command that started it", r.ID)
 	}
-	cmd := exec.Command(r.RestartArgv[0], r.RestartArgv[1:]...)
-	if !strings.Contains(r.RestartArgv[0], "/") {
-		// argv[0] as typed: look it up on the PATH it had.
-		for _, kv := range r.RestartEnv {
-			if p, ok := strings.CutPrefix(kv, "PATH="); ok {
-				for _, dir := range filepath.SplitList(p) {
-					if fi, err := os.Stat(filepath.Join(dir, r.RestartArgv[0])); err == nil && !fi.IsDir() {
-						cmd.Path = filepath.Join(dir, r.RestartArgv[0])
-						break
-					}
-				}
-			}
-		}
+	path, err := resolveExec(r.RestartArgv[0], r.RestartEnv, r.Cwd)
+	if err != nil {
+		return err
 	}
+	// Built by hand, not with exec.Command: that looks argv[0] up on AgentRM's own PATH, and
+	// keeps the failure (or runs a different binary of the same name) even once Path is set.
+	cmd := &exec.Cmd{Path: path, Args: r.RestartArgv}
 	cmd.Env, cmd.Dir = r.RestartEnv, r.Cwd
 	if cmd.Dir != "" {
 		if _, err := os.Stat(cmd.Dir); err != nil {
@@ -54,4 +47,56 @@ func restartLeftover(r *model.Resource) error {
 	}
 	go func() { _ = cmd.Wait() }()
 	return nil
+}
+
+// resolveExec finds the program a process was started as, the way its shell did: a name with a
+// slash is a path (relative to where it ran), a bare name is looked up on the PATH it was
+// started with, and only that PATH. A process that rewrote its arguments ("postgres: writer")
+// names no program, and is not started again.
+func resolveExec(argv0 string, env []string, cwd string) (string, error) {
+	if argv0 == "" {
+		return "", fmt.Errorf("its command line was empty or rewritten by the process; re-run the command that started it")
+	}
+	if strings.Contains(argv0, "/") {
+		p := argv0
+		if !filepath.IsAbs(p) {
+			if cwd == "" {
+				return "", fmt.Errorf("it was started as %q, and the directory it ran in is not known", argv0)
+			}
+			p = filepath.Join(cwd, p)
+		}
+		if !isExecutable(p) {
+			return "", fmt.Errorf("%q is not an executable (the process may have rewritten its command line); re-run the command that started it", p)
+		}
+		return p, nil
+	}
+	path, ok := "", false
+	for _, kv := range env {
+		if v, found := strings.CutPrefix(kv, "PATH="); found {
+			path, ok = v, true
+		}
+	}
+	if !ok {
+		return "", fmt.Errorf("it was started as %q, and the PATH it had is not known; re-run the command that started it", argv0)
+	}
+	for _, dir := range filepath.SplitList(path) {
+		if dir == "" {
+			dir = "."
+		}
+		if !filepath.IsAbs(dir) {
+			if cwd == "" {
+				continue
+			}
+			dir = filepath.Join(cwd, dir)
+		}
+		if p := filepath.Join(dir, argv0); isExecutable(p) {
+			return p, nil
+		}
+	}
+	return "", fmt.Errorf("%q is not on the PATH it was started with (or the process rewrote its command line); re-run the command that started it", argv0)
+}
+
+func isExecutable(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.Mode().IsRegular() && fi.Mode()&0o111 != 0
 }

@@ -20,13 +20,14 @@ func recordScenario(t *testing.T, usedAt time.Duration) string {
 	dir := t.TempDir()
 	m, c := newTest(t, 8)
 	fakeEffects(t, nil)
-	m.rec = trace.NewWriter(dir, 3)
+	// Kept for good: the writer prunes by the wall clock, and this clock is fixed in the past.
+	m.recP.Store(trace.NewWriter(dir, 36500))
 	t0 := c.Now()
 	fakeInfos(m, map[int]sys.ProcInfo{700: {Agent: "claude", Session: "s", AgentPID: 500, Argv: []string{"node", "server.js"}}})
 	agentUp := func() map[int]*sys.Proc {
 		return map[int]*sys.Proc{
 			1:   {PID: 1, Exe: "/sbin/launchd"},
-			400: {PID: 400, PPID: 1, Exe: "/Applications/Warp.app/Contents/MacOS/stable"},
+			400: {PID: 400, PPID: 1, Exe: "/Applications/Warp.app/Contents/MacOS/stable", Path: "/Applications/Warp.app/Contents/MacOS/stable"},
 			500: {PID: 500, PPID: 400, Exe: "/usr/local/bin/claude", Args: "claude", Start: t0.Add(-time.Hour), RSSMB: 300},
 			700: {PID: 700, PPID: 1, Exe: "node", Args: "node server.js", Start: t0, RSSMB: 500},
 		}
@@ -52,7 +53,7 @@ func recordScenario(t *testing.T, usedAt time.Duration) string {
 		if c.Now().Sub(t0) >= 5*time.Minute {
 			delete(procs, 500)
 			if c.Now().Sub(t0) == 5*time.Minute {
-				m.rec.Write(trace.Frame{T: c.Now(), Exit: 500, ExitTab: m.rec.Procs(c.Now(), procs, m.traceOwner, nil)})
+				m.recorder().Write(trace.Frame{T: c.Now(), Exit: 500, ExitTab: m.recorder().Procs(c.Now(), procs, m.traceOwner, nil)})
 				m.AgentExited(500, procs)
 			}
 		}
@@ -62,7 +63,7 @@ func recordScenario(t *testing.T, usedAt time.Duration) string {
 		}
 		step(procs, est)
 	}
-	m.rec.Close()
+	m.recorder().Close()
 	if len(m.st.Decisions) == 0 {
 		t.Fatal("the live run (dry run) decided nothing: the scenario is wrong")
 	}

@@ -34,6 +34,7 @@ type Facts struct {
 	Agent    string `json:"agent,omitempty"`
 	GUI      bool   `json:"gui,omitempty"`
 	App      string `json:"app,omitempty"`
+	AppPID   int    `json:"app_pid,omitempty"`
 	ViaApp   bool   `json:"via_app,omitempty"`
 }
 
@@ -72,11 +73,13 @@ type Request struct {
 }
 
 type Frame struct {
-	T       time.Time `json:"t"`
-	Sweep   *Sweep    `json:"sweep,omitempty"`
-	Fast    *Sweep    `json:"fast,omitempty"` // a fast tick: memory and processes only
-	Request *Request  `json:"req,omitempty"`
-	Exit    int       `json:"exit,omitempty"` // an agent PID the kernel said exited
+	T     time.Time `json:"t"`
+	Sweep *Sweep    `json:"sweep,omitempty"`
+	Fast  *Sweep    `json:"fast,omitempty"` // a fast tick: memory and processes only
+	// Mem: memory read again for a request while a tick was under way (peekMem).
+	Mem     *sys.MemStats `json:"mem,omitempty"`
+	Request *Request      `json:"req,omitempty"`
+	Exit    int           `json:"exit,omitempty"` // an agent PID the kernel said exited
 	// Decision: the live daemon decided to pause, stop or reclaim (replay checks it agrees).
 	Decision *model.Decision `json:"decision,omitempty"`
 	ExitTab  *Procs          `json:"exit_procs,omitempty"`
@@ -173,7 +176,7 @@ func cpuBand(c float64) float64 {
 // same says whether two samples of a process differ in nothing a decision depends on: memory
 // within 5% (or 20 MB), CPU in the same band.
 func same(a, b *sys.Proc) bool {
-	if a.PID != b.PID || a.PPID != b.PPID || !a.Start.Equal(b.Start) || a.Exe != b.Exe || a.Args != b.Args || a.CPU != b.CPU {
+	if a.PID != b.PID || a.PPID != b.PPID || !a.Start.Equal(b.Start) || a.Exe != b.Exe || a.Path != b.Path || a.Args != b.Args || a.CPU != b.CPU {
 		return false
 	}
 	d := math.Abs(a.RSSMB - b.RSSMB)

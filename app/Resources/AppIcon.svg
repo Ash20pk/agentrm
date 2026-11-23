@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <!-- AgentRM's icon: the panel's LED meter on a graphite faceplate. Three bars in use (green),
+       one waiting (amber), the rest unlit. Rendered into the app's icon set by
+       scripts/make-icon.sh. Colours are the app's lamps (Theme.swift). -->
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3A3F46"/><stop offset="0.5" stop-color="#26292E"/><stop offset="1" stop-color="#17191C"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#5A6069"/><stop offset="1" stop-color="#121315"/>
+    </linearGradient>
+    <linearGradient id="sheen" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.10"/><stop offset="0.45" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="well" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#0E0F11"/><stop offset="1" stop-color="#1A1C20"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9AF5BC"/><stop offset="0.25" stop-color="#4ADE80"/><stop offset="1" stop-color="#2FBF66"/>
+    </linearGradient>
+    <linearGradient id="amber" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FDE68A"/><stop offset="0.25" stop-color="#FBBF24"/><stop offset="1" stop-color="#E0A30E"/>
+    </linearGradient>
+    <linearGradient id="unlit" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#363B42"/><stop offset="1" stop-color="#24272C"/>
+    </linearGradient>
+    <filter id="glow" x="-60%" y="-60%" width="220%" height="220%">
+      <feGaussianBlur stdDeviation="11" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <filter id="drop" x="-10%" y="-10%" width="120%" height="130%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#000000" flood-opacity="0.35"/>
+    </filter>
+  </defs>
+
+  <!-- Faceplate -->
+  <rect x="100" y="100" width="824" height="824" rx="185" fill="url(#rim)" filter="url(#drop)"/>
+  <rect x="106" y="106" width="812" height="812" rx="180" fill="url(#body)"/>
+  <rect x="106" y="106" width="812" height="812" rx="180" fill="url(#sheen)"/>
+
+  <g transform="translate(0,14)">
+    <!-- The meter's window, lit from below -->
+    <rect x="214" y="318" width="596" height="420" rx="52" fill="#4A5058" opacity="0.55"/>
+    <rect x="214" y="314" width="596" height="420" rx="52" fill="url(#well)"/>
+
+    <!-- Scale printed above it -->
+    <g fill="#8A919B" opacity="0.8">
+      <rect x="259" y="258" width="8" height="30" rx="3"/>
+      <rect x="339" y="272" width="8" height="16" rx="3"/>
+      <rect x="419" y="272" width="8" height="16" rx="3"/>
+      <rect x="499" y="258" width="8" height="30" rx="3"/>
+      <rect x="579" y="272" width="8" height="16" rx="3"/>
+      <rect x="659" y="272" width="8" height="16" rx="3"/>
+      <rect x="739" y="258" width="8" height="30" rx="3"/>
+    </g>
+
+    <!-- The bars -->
+    <g filter="url(#glow)">
+      <rect x="234" y="366" width="58" height="324" rx="14" fill="url(#green)"/>
+      <rect x="314" y="366" width="58" height="324" rx="14" fill="url(#green)"/>
+      <rect x="394" y="366" width="58" height="324" rx="14" fill="url(#green)"/>
+      <rect x="474" y="366" width="58" height="324" rx="14" fill="url(#amber)"/>
+    </g>
+    <rect x="554" y="366" width="58" height="324" rx="14" fill="url(#unlit)"/>
+    <rect x="634" y="366" width="58" height="324" rx="14" fill="url(#unlit)"/>
+    <rect x="714" y="366" width="58" height="324" rx="14" fill="url(#unlit)"/>
+    <g fill="#FFFFFF" opacity="0.06">
+      <rect x="560" y="372" width="46" height="6" rx="3"/>
+      <rect x="640" y="372" width="46" height="6" rx="3"/>
+      <rect x="720" y="372" width="46" height="6" rx="3"/>
+    </g>
+  </g>
+</svg>

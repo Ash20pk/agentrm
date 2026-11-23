@@ -6,6 +6,7 @@ package mcp
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"agentrm/internal/api"
+	"agentrm/internal/model"
 )
 
 type rpcReq struct {
@@ -73,6 +75,22 @@ var tools = []tool{
 		obj(map[string]any{"resource_id": str("the resource")}, "resource_id")},
 	{"agentrm_inbox", "Questions AgentRM has for you. Answer each with agentrm_claim or agentrm_disown.", obj(map[string]any{})},
 	{"agentrm_status", "Memory, what is running, and who holds what.", obj(map[string]any{})},
+	{"agentrm_vault_list", "Accounts in AgentRM's vault you may ask for (GitHub, API keys, AWS, logins), and your grants.", obj(map[string]any{})},
+	{"agentrm_vault_request", "Ask for short-lived access to a vault account. The person approves it with Touch ID (this waits for up to " +
+		"about 100 seconds; if it is still waiting, call again with the same arguments). For an API key you get a base URL " +
+		"and a token for AgentRM's local proxy, never the key itself: send the token where the key would go. Other accounts " +
+		"are given only in a shell (agentrm vault run ACCOUNT --purpose ... -- COMMAND), unless reveal is true, which is " +
+		"a separate approval because what you are given goes into your transcript.",
+		obj(map[string]any{
+			"account": str("the account's name, from agentrm_vault_list"),
+			"purpose": str("why you need it: the person approves what you write here"),
+			"scope":   str("GitHub permissions (contents:read,pull_requests:write); for an API key full or read; for AWS a role"),
+			"repos":   str("GitHub: comma-separated repository names"),
+			"minutes": num("how long you need it (default 30)"),
+			"reveal":  map[string]any{"type": "boolean", "description": "return the credentials themselves (approved separately)"},
+		}, "account", "purpose")},
+	{"agentrm_vault_revoke", "End a vault grant before its time (or all of yours if no grant_id).",
+		obj(map[string]any{"grant_id": str("the grant")})},
 }
 
 // Serve runs the MCP protocol on in/out until in is closed.
@@ -195,6 +213,22 @@ func call(name string, a map[string]any) (string, bool) {
 			return "No questions.", false
 		}
 		return strings.Join(r.Questions, "\n"), false
+	case "agentrm_vault_list":
+		var r api.VaultListResp
+		if err := api.Call("/vault/list", req, &r); err != nil {
+			return err.Error(), true
+		}
+		return vaultSummary(&r, time.Now()), false
+	case "agentrm_vault_request":
+		return vaultRequest(a, vaultWait)
+	case "agentrm_vault_revoke":
+		req.GrantID = s(a, "grant_id")
+		req.All = req.GrantID == ""
+		var r api.CountResp
+		if err := api.Call("/vault/revoke", req, &r); err != nil {
+			return err.Error(), true
+		}
+		return fmt.Sprintf("Revoked %d grant(s).", r.N), false
 	case "agentrm_status":
 		var st api.Status
 		if err := api.Call("/status", req, &st); err != nil {
@@ -227,4 +261,111 @@ func Summary(st *api.Status) string {
 		fmt.Fprintf(&b, " Unclaimed: %s.", strings.Join(un, ", "))
 	}
 	return b.String()
+}
+
+// vaultWait is how long a vault request waits for the person, inside one tool call.
+var vaultWait = 100 * time.Second
+
+func vaultRequest(a map[string]any, wait time.Duration) (string, bool) {
+	req := api.Req{Via: "mcp", Account: s(a, "account"), Purpose: s(a, "purpose"), Scope: s(a, "scope"),
+		TTLMinutes: int(n(a, "minutes"))}
+	req.Reveal, _ = a["reveal"].(bool)
+	for _, r := range strings.Split(s(a, "repos"), ",") {
+		if r = strings.TrimSpace(r); r != "" {
+			req.Repos = append(req.Repos, r)
+		}
+	}
+	// Only an API key's access can be handed over here without putting a secret in the
+	// transcript; say so before a grant is made that could not be used.
+	var list api.VaultListResp
+	if err := api.Call("/vault/list", api.Req{Via: "mcp"}, &list); err != nil {
+		return err.Error(), true
+	}
+	kind := ""
+	for _, acct := range list.Accounts {
+		if acct.Name == req.Account {
+			kind = acct.Kind
+		}
+	}
+	if kind != "" && kind != model.VaultAPIKey && !req.Reveal {
+		return fmt.Sprintf("%s is a %s account: its access is given only to a command, in a shell: "+
+			"agentrm vault run %s --purpose %q -- COMMAND. Without a shell, call again with reveal: true "+
+			"(a separate approval: the credentials would go into your transcript).", req.Account, kind, req.Account, req.Purpose), true
+	}
+	var g api.VaultResp
+	err := api.Call("/vault/request", req, &g)
+	var na *api.NeedsApproval
+	if errors.As(err, &na) {
+		deadline := time.Now().Add(wait)
+		for err != nil && time.Now().Before(deadline) {
+			time.Sleep(2 * time.Second)
+			var r api.ApprovalResp
+			if e := api.Call("/approval", api.Req{ApprovalID: na.ID}, &r); e != nil {
+				return e.Error(), true
+			}
+			switch r.Approval.State {
+			case "approved":
+				err = api.Call("/vault/request", req, &g)
+			case "failed":
+				return "Approved, but the access could not be made: " + r.Error, true
+			case "denied":
+				return "The person denied access to " + req.Account + ". Ask them in the chat what to do instead.", true
+			case "expired":
+				return "Nobody answered in AgentRM. Ask the person in the chat to approve it, then call again.", true
+			}
+		}
+		if err != nil {
+			return "Still waiting for the person to approve request " + na.ID + " in AgentRM. Call again with the same arguments to keep waiting (it stays open 5 minutes).", true
+		}
+	}
+	if err != nil {
+		return err.Error(), true
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Granted %s (%s) until %s, grant %s.\n", g.Grant.Account, g.Grant.Scope, g.Grant.Expires.Local().Format("15:04"), g.Grant.ID)
+	keys := make([]string, 0, len(g.Env))
+	for k := range g.Env {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(&b, "%s=%s\n", k, g.Env[k])
+	}
+	if len(g.Unset) > 0 {
+		fmt.Fprintf(&b, "Unset: %s\n", strings.Join(g.Unset, ", "))
+	}
+	if kind == model.VaultAPIKey && !req.Reveal {
+		b.WriteString("The key above is a token for AgentRM's proxy on this Mac, not the real key: it works only through the base URL above, and only while the grant lasts.")
+	}
+	return b.String(), false
+}
+
+func vaultSummary(r *api.VaultListResp, now time.Time) string {
+	if len(r.Accounts) == 0 {
+		return "The vault has no accounts. The person adds them in the AgentRM app, under Vault."
+	}
+	var b strings.Builder
+	for _, a := range r.Accounts {
+		fmt.Fprintf(&b, "%s (%s)", a.Name, a.Kind)
+		switch a.Kind {
+		case model.VaultAPIKey:
+			fmt.Fprintf(&b, ": %s, scopes %s", a.APIURL, strings.Join(a.Scopes, "/"))
+		case model.VaultAWS:
+			fmt.Fprintf(&b, ": roles %s", strings.Join(a.Scopes, ", "))
+		case model.VaultGitHub:
+			if len(a.Repos) > 0 {
+				fmt.Fprintf(&b, ": repos %s", strings.Join(a.Repos, ", "))
+			}
+		}
+		if a.Note != "" {
+			b.WriteString(" — " + a.Note)
+		}
+		b.WriteString("\n")
+	}
+	for _, g := range r.Grants {
+		if g.Live(now) {
+			fmt.Fprintf(&b, "Your grant %s: %s %s until %s\n", g.ID, g.Account, g.Scope, g.Expires.Local().Format("15:04"))
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
 }

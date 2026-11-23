@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -188,6 +189,7 @@ func TestFairShare(t *testing.T) {
 func TestReclaimPressesTheLeastUsed(t *testing.T) {
 	m, c := newTest(t, 1.5)
 	m.cfg.DryRun = false
+	learnFullReturn(m) // the order holders are pressed in, not how much a container gives back
 	now := c.Now()
 	since := now.Add(-time.Minute)
 	orphan := addRes(m, "compose:old", model.RKContainers, 800, "")
@@ -350,7 +352,7 @@ func TestAttribution(t *testing.T) {
 		100: {PID: 100, PPID: 1, Exe: "claude", Args: "claude"},
 		101: {PID: 101, PPID: 100, Exe: "/bin/zsh", Args: "zsh"},
 		102: {PID: 102, PPID: 101, Exe: "node", Args: "node server.js"},
-		10:  {PID: 10, PPID: 1, Exe: "/Applications/Warp.app/Contents/MacOS/stable", Args: "stable"},
+		10:  {PID: 10, PPID: 1, Exe: "/Applications/Warp.app/Contents/MacOS/stable", Path: "/Applications/Warp.app/Contents/MacOS/stable", Args: "stable"},
 		11:  {PID: 11, PPID: 10, Exe: "-zsh", Args: "-zsh"},
 		12:  {PID: 12, PPID: 11, Exe: "node", Args: "node dev.js"},
 	}
@@ -422,15 +424,17 @@ func TestEstimatesLearnPerProjectFromRealRuns(t *testing.T) {
 	}
 }
 
-func TestUnderDeclaringDoesNotPay(t *testing.T) {
+// What an agent declares is what it is charged, even below what AgentRM learned; only a
+// session caught overrunning loses that for an hour.
+func TestDeclaredFigureIsChargedUntilOverrun(t *testing.T) {
 	m, c := newTest(t, 8)
 	m.touchSession("s", "claude", "")
 	if got := m.effectiveGB("cargo-build", "", 0.5, "s", c.Now()); got != 0.5 {
 		t.Fatalf("no history: %.2f", got)
 	}
 	m.st.Learned["cargo-build"] = 2048
-	if got := m.effectiveGB("cargo-build", "", 0.5, "s", c.Now()); got != 2 {
-		t.Fatalf("declared below the learned mean: %.2f", got)
+	if got := m.effectiveGB("cargo-build", "", 0.5, "s", c.Now()); got != 0.5 {
+		t.Fatalf("declared below the learned mean was not charged as declared: %.2f", got)
 	}
 	delete(m.st.Learned, "cargo-build")
 	l := &model.Lease{ID: "L", Session: "s", Kind: "cargo-build", MemGB: 0.5, Declared: true, PeakMB: 2500}
@@ -661,6 +665,55 @@ func TestFailedSourceKeepsItsResources(t *testing.T) {
 	}
 }
 
+// 2026-11-17: Docker hung for five hours. Every sweep kept its containers as last seen, reclaim
+// counted on stopping them for a blocked request, each stop timed out, and the request waited
+// on memory that never came. What a source cannot see is now neither acted on nor counted on.
+func TestUnseenResourcesAreNotCountedOnOrActedOn(t *testing.T) {
+	m, c := newTest(t, 1.0)
+	got := fakeEffects(t, nil)
+	m.cfg.DryRun = false
+	now := c.Now()
+	since := now.Add(-time.Hour)
+	ghost := addRes(m, "compose:openbox-local", model.RKContainers, 1100, "")
+	ghost.OrphanSince = &since
+	m.st.Leases["idle"] = &model.Lease{ID: "idle", Session: "s2", Kind: "cluster", MemGB: 2, TTL: 120,
+		Verified: true, LastUsed: now.Add(-30 * time.Minute), Expires: now.Add(time.Hour)}
+	addRes(m, "kind:idle", model.RKCluster, 2048, "idle")
+	live := &model.Resource{ID: "kind:idle", Kind: model.RKCluster, Name: "idle", MemMB: 2048, Source: "procs"}
+
+	m.merge(discover.Result{Resources: []*model.Resource{live}, Failed: map[string]error{"docker": discover.ErrEngineHung}}, nil, nil, now)
+	if ghost = m.st.Resources["compose:openbox-local"]; ghost == nil || ghost.Unseen == nil {
+		t.Fatal("a resource on a hung source should be kept and marked unseen")
+	}
+
+	acquire(t, m, agent("waiting"), "heavy", 2)
+	if ghost.Urgent {
+		t.Error("reclaim counted on stopping something on a hung engine")
+	}
+	if m.st.Leases["idle"].IdleAsked == nil {
+		t.Error("with nothing stoppable, the idle lease should have been pressed instead")
+	}
+	c.Add(time.Hour)
+	m.applyEffects(RunEffects(m.checkOrphans(c.Now())))
+	for _, e := range *got {
+		if e.Res.ID == ghost.ID {
+			t.Fatalf("acted on an unseen resource: %s", e.Op)
+		}
+	}
+
+	// The engine answers again and the stack is still there: live once more.
+	fresh := &model.Resource{ID: "compose:openbox-local", Kind: model.RKContainers, Name: "x", MemMB: 1100, Source: "docker"}
+	m.merge(discover.Result{Resources: []*model.Resource{fresh}, Failed: map[string]error{}}, nil, nil, c.Now())
+	if r := m.st.Resources["compose:openbox-local"]; r == nil || r.Unseen != nil {
+		t.Fatal("a resource seen again should no longer be marked unseen")
+	}
+	// The engine is down: gone, at once.
+	m.merge(discover.Result{Failed: map[string]error{}}, nil, nil, c.Now())
+	if m.st.Resources["compose:openbox-local"] != nil {
+		t.Fatal("a stack on a stopped engine was kept")
+	}
+}
+
 func TestEffectsRunOutsideTheLock(t *testing.T) {
 	m, c := newTest(t, 8)
 	old := Executor
@@ -709,6 +762,68 @@ func TestResolveIdentity(t *testing.T) {
 	}
 }
 
+// T201: nohup bash -c 'sleep 2; exec -a /tmp/AgentRM.app/Contents/x agentrm config ...' &
+// leaves a process hanging off launchd that names itself the app. It is detached: not you,
+// and not the app.
+func TestSpoofedAppCallerIsDetached(t *testing.T) {
+	m, _ := newTest(t, 8)
+	t.Cleanup(func() { sys.Procs.Set(nil) })
+	const term = "/System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal"
+	sys.Procs.Set(map[int]*sys.Proc{
+		1:     {PID: 1, Path: "/sbin/launchd"},
+		99901: {PID: 99901, PPID: 1, Exe: "/tmp/AgentRM.app/Contents/x", Args: "/tmp/AgentRM.app/Contents/x config --dry-run=false", Path: "/usr/local/bin/agentrm"},
+		99902: {PID: 99902, PPID: 1, Exe: "/Applications/AgentRM.app/Contents/Helpers/agentrm", Path: "/tmp/AgentRM.app/Contents/Helpers/agentrm"},
+		99903: {PID: 99903, PPID: 1, Exe: term, Path: term},
+	})
+	for _, pid := range []int{99901, 99902, 99903} {
+		f := gatherFacts(pid)
+		m.mu.Lock()
+		c := m.resolve(f, &api.Req{Session: "you"})
+		m.mu.Unlock()
+		if f.gui || f.viaApp || c.Human || c.ViaApp || c.Session != "detached" {
+			t.Errorf("pid %d: facts %+v, caller %+v", pid, f, c)
+		}
+	}
+}
+
+// T201: a hooked agent that names another live agent's session (they are in agentrm status)
+// keeps its own; once that agent has exited, the session may be resumed.
+func TestHookCannotTakeOverALiveSession(t *testing.T) {
+	m, c := newTest(t, 8)
+	start := c.Now().Add(-time.Hour)
+	victim := liveSession(m, "victim", start) // agent pid 500
+	m.agentSessions[500] = "victim"
+	procs := map[int]*sys.Proc{
+		1:   {PID: 1},
+		500: {PID: 500, PPID: 1, Exe: "claude", Args: "claude", Start: start},
+		600: {PID: 600, PPID: 1, Exe: "claude", Args: "claude", Start: start},
+	}
+	hook := func(procs map[int]*sys.Proc) api.Caller {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return m.resolve(facts{pid: 601, agentPID: 600, agent: "claude", procs: procs}, &api.Req{Via: "hook", Session: "victim"})
+	}
+	for _, table := range []map[int]*sys.Proc{procs, nil} {
+		if got := hook(table); got.Session != "claude-600" || m.agentSessions[600] != "" || m.agentSessions[500] != "victim" || victim.EndedAt != nil {
+			t.Fatalf("another agent's session was taken over: %+v, bindings %v", got, m.agentSessions)
+		}
+	}
+	tamper := 0
+	for _, e := range m.events {
+		if e.Kind == "TAMPER" && strings.Contains(e.Text, "victim") {
+			tamper++
+		}
+	}
+	if tamper != 1 {
+		t.Fatalf("the attempt was reported %d times, want once", tamper)
+	}
+	// A PID reused by another process is not the session's agent.
+	reused := map[int]*sys.Proc{1: procs[1], 600: procs[600], 500: {PID: 500, PPID: 1, Exe: "claude", Args: "claude", Start: start.Add(time.Minute)}}
+	if got := hook(reused); got.Session != "victim" || m.agentSessions[600] != "victim" {
+		t.Fatalf("a session whose agent is gone was not resumed: %+v", got)
+	}
+}
+
 func TestStatusEncodes(t *testing.T) {
 	m, _ := newTest(t, 8)
 	acquire(t, m, agent("a"), "cluster", 1)
@@ -719,25 +834,92 @@ func TestStatusEncodes(t *testing.T) {
 	}
 }
 
-// One test against a real process, to check the effects do what they say.
+// The app polls /status every few seconds while sweeps change the state. The response used to
+// point into the live maps and was encoded after the lock was released: "concurrent map
+// iteration and map write", a fatal error that killed the daemon. Run with -race.
+func TestStatusIsEncodedFromACopy(t *testing.T) {
+	m, _ := newTest(t, 8)
+	acquire(t, m, agent("a"), "cluster", 1)
+	h := m.routes()["/status"]
+	f := facts{pid: 1, gui: true, app: "AgentRM.app", viaApp: true}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 300; i++ {
+			m.mu.Lock()
+			id := fmt.Sprintf("srv:%d", i)
+			m.st.Resources[id] = &model.Resource{ID: id, Kind: model.RKServer, Source: "procs"}
+			delete(m.st.Resources, fmt.Sprintf("srv:%d", i-1))
+			m.mu.Unlock()
+		}
+	}()
+	for i := 0; i < 100; i++ {
+		out, err := m.handleFacts(context.Background(), "/status", h, f, api.Req{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := json.Marshal(out); err != nil {
+			t.Fatal(err)
+		}
+	}
+	<-done
+}
+
+// One test against a real process tree, to check the effects do what they say: `sh -c` with a
+// child, like `npm run dev` with vite under it. The child is paused and stopped with its parent.
 func TestPauseAndStopARealProcess(t *testing.T) {
-	cmd := exec.Command("sleep", "120")
+	cmd := exec.Command("/bin/sh", "-c", "sleep 60; :") // the `; :` keeps sh from exec'ing sleep
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
 	exited := make(chan struct{})
 	go func() { _ = cmd.Wait(); close(exited) }()
 	defer cmd.Process.Kill()
-	r := model.Resource{ID: "srv:test", Kind: model.RKServer, PID: cmd.Process.Pid}
-	state := func() string {
-		out, _ := exec.Command("ps", "-o", "state=", "-p", fmt.Sprint(cmd.Process.Pid)).Output()
+	pid := cmd.Process.Pid
+	child := 0
+	for i := 0; i < 100 && child == 0; i++ {
+		for _, p := range sys.ListProcs() {
+			if p.PPID == pid {
+				child = p.PID
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if child == 0 {
+		t.Fatal("sh started no child")
+	}
+	defer syscall.Kill(child, syscall.SIGKILL)
+	state := func(pid int) string {
+		out, _ := exec.Command("/bin/ps", "-o", "state=", "-p", fmt.Sprint(pid)).Output()
 		return strings.TrimSpace(string(out))
 	}
-	if err := Executor(Effect{Op: "pause", Res: r}); err != nil || !strings.HasPrefix(state(), "T") {
-		t.Fatalf("not frozen: %v %q", err, state())
+	frozen := func(pid int) bool { return strings.HasPrefix(state(pid), "T") }
+	p := sys.QuickProc(pid)
+	if p == nil || p.Start.IsZero() {
+		t.Fatalf("no start time for a live process: %+v", p)
 	}
-	if err := Executor(Effect{Op: "resume", Res: r}); err != nil || strings.HasPrefix(state(), "T") {
-		t.Fatalf("not thawed: %v %q", err, state())
+	r := model.Resource{ID: "srv:test", Kind: model.RKServer, PID: pid, ProcStart: p.Start}
+
+	// The PID is now someone else's (a start that does not match): nothing is signalled.
+	other := r
+	other.ProcStart = p.Start.Add(-time.Hour)
+	if err := Executor(Effect{Op: "pause", Res: other}); err == nil || frozen(pid) {
+		t.Fatalf("paused a process whose start does not match: %v %q", err, state(pid))
+	}
+	if err := Executor(Effect{Op: "stop", Res: other}); err == nil || state(pid) == "" {
+		t.Fatalf("stopped a process whose start does not match: %v", err)
+	}
+	unknown := r
+	unknown.ProcStart = time.Time{}
+	if err := Executor(Effect{Op: "stop", Res: unknown}); err == nil {
+		t.Fatal("signalled a PID with no recorded start")
+	}
+
+	if err := Executor(Effect{Op: "pause", Res: r}); err != nil || !frozen(pid) || !frozen(child) {
+		t.Fatalf("not frozen: %v parent %q child %q", err, state(pid), state(child))
+	}
+	if err := Executor(Effect{Op: "resume", Res: r}); err != nil || frozen(pid) || frozen(child) {
+		t.Fatalf("not thawed: %v parent %q child %q", err, state(pid), state(child))
 	}
 	_ = Executor(Effect{Op: "pause", Res: r})
 	now := time.Now()
@@ -749,6 +931,92 @@ func TestPauseAndStopARealProcess(t *testing.T) {
 	case <-exited:
 	case <-time.After(3 * time.Second):
 		t.Fatal("a frozen process was not stopped (TERM must be followed by CONT)")
+	}
+	for i := 0; i < 150 && syscall.Kill(child, 0) == nil; i++ {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if syscall.Kill(child, 0) == nil {
+		t.Fatalf("the child outlived its stopped parent: %q", state(child))
+	}
+	// Resuming what is gone is not an error: there is nothing left frozen.
+	if err := Executor(Effect{Op: "resume", Res: r}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A restore that fails keeps its record, so it can be tried again, and gives its lease back.
+func TestFailedRestoreKeepsItsRecord(t *testing.T) {
+	m, c := newTest(t, 8)
+	fakeEffects(t, map[string]bool{"restore": true})
+	st := &model.Stopped{Resource: model.Resource{ID: "left:9-1", Kind: model.RKLeftover, MemMB: 200}, StoppedAt: c.Now()}
+	m.st.Stopped = []*model.Stopped{st}
+	out, effs, err := m.restore(agent("s"), api.Req{ResourceID: "left:9-1"})
+	if err != nil || !out.(*api.AcquireResp).Granted || len(m.st.Stopped) != 0 {
+		t.Fatalf("restore was not started: %v %+v", err, out)
+	}
+	m.applyEffects(RunEffects(effs))
+	if len(m.st.Stopped) != 1 || m.st.Stopped[0].Resource.ID != "left:9-1" {
+		t.Fatalf("a failed restore lost the record of what was stopped: %+v", m.st.Stopped)
+	}
+	if len(m.st.Leases) != 0 {
+		t.Fatalf("a failed restore kept its lease: %+v", m.st.Leases)
+	}
+}
+
+// What a stop records for a restore comes with the resource, read while its process ran, and
+// only for what may be started again.
+func TestStopKeepsHowItWasStartedOnlyForRestartable(t *testing.T) {
+	m, c := newTest(t, 8)
+	start := c.Now().Add(-time.Hour)
+	m.infos = newInfoCache(func(pid int) (sys.ProcInfo, bool) {
+		return sys.ProcInfo{Argv: []string{"node", "server.js"}, Env: map[string]string{"PATH": "/x"}}, true
+	})
+	procs := map[int]*sys.Proc{
+		1:   {PID: 1, Exe: "/sbin/launchd"},
+		700: {PID: 700, PPID: 1, Exe: "/u/node", Args: "node server.js", Start: start},
+		701: {PID: 701, PPID: 1, Exe: "/u/claude", Args: "claude -p fix", Start: start},
+	}
+	m.infos.refresh(procs)
+	found := []*model.Resource{
+		{ID: "srv:700", Kind: model.RKServer, PID: 700},
+		{ID: "browser:701", Kind: model.RKBrowser, PID: 701},
+	}
+	m.keepRestartInfo(found, procs)
+	if !found[0].ProcStart.Equal(start) || len(found[0].RestartArgv) != 2 || found[0].RestartEnv[0] != "PATH=/x" {
+		t.Fatalf("a dev server did not keep how it was started: %+v", found[0])
+	}
+	if len(found[1].RestartArgv) != 0 || !found[1].ProcStart.Equal(start) {
+		t.Fatalf("a headless browser kept a command to re-run: %+v", found[1])
+	}
+	// The process is gone and its PID reused by the time the stop is recorded: what the stop
+	// recorded is what the resource carried, not what the new process at that PID runs.
+	m.infos = newInfoCache(func(int) (sys.ProcInfo, bool) {
+		return sys.ProcInfo{Argv: []string{"rm", "-rf", "x"}}, true
+	})
+	m.infos.refresh(map[int]*sys.Proc{700: {PID: 700, PPID: 1, Exe: "/bin/rm", Start: c.Now()}})
+	m.recordStopped(*found[0], "test", "", c.Now())
+	got := m.st.Stopped[0].Resource
+	if strings.Join(got.RestartArgv, " ") != "node server.js" || got.Restart != "agentrm restore srv:700" {
+		t.Fatalf("recorded %+v", got)
+	}
+	bare := model.Resource{ID: "srv:700", Kind: model.RKServer, PID: 700, ProcStart: start}
+	m.recordStopped(bare, "test", "", c.Now())
+	if got := m.st.Stopped[1].Resource; len(got.RestartArgv) != 0 {
+		t.Fatalf("took the command of whatever has the PID now: %+v", got.RestartArgv)
+	}
+}
+
+// On a clean shutdown nothing is left frozen: a daemon that is then disabled would never thaw it.
+func TestCloseResumesWhatWasPaused(t *testing.T) {
+	m, c := newTest(t, 8)
+	got := fakeEffects(t, nil)
+	r := addRes(m, "srv:5", model.RKServer, 300, "")
+	t0 := c.Now()
+	r.PausedAt = &t0
+	addRes(m, "srv:6", model.RKServer, 300, "")
+	m.Close()
+	if len(*got) != 1 || (*got)[0].Op != "resume" || (*got)[0].Res.ID != "srv:5" || r.PausedAt != nil {
+		t.Fatalf("shutdown left a paused process frozen: %+v", *got)
 	}
 }
 

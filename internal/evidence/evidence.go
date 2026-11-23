@@ -143,14 +143,15 @@ func NewActivity() *Activity {
 }
 
 // Active reports whether r showed use since the last sweep: an established connection on one
-// of its ports, network traffic well above its own background, or CPU for a Gradle daemon.
+// of its ports, network traffic well above its own background, or CPU for a Gradle daemon or
+// an Xcode helper.
 func (a *Activity) Active(r *model.Resource, established map[string]bool) bool {
 	for _, p := range r.Ports {
 		if established[p] {
 			return true
 		}
 	}
-	if r.Kind == model.RKGradle && r.CPU > 5 {
+	if (r.Kind == model.RKGradle || r.Kind == model.RKXcodeHelper) && r.CPU > 5 {
 		return true
 	}
 	if r.NetBytes > 0 {

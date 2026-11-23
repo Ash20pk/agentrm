@@ -33,9 +33,20 @@ func SockPath() string {
 }
 
 // WriteAtomic writes b to path so that a crash never leaves a partial file.
+//
+// When path is a symlink (dotfiles kept in a repository and linked into ~), the file it points
+// to is written and the link is left in place; an existing file keeps its permissions, and perm
+// applies only to a new one.
 func WriteAtomic(path string, b []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	f, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	target, err := resolveLink(path)
+	if err != nil {
+		return err
+	}
+	if fi, err := os.Stat(target); err == nil {
+		perm = fi.Mode().Perm()
+	}
+	dir := filepath.Dir(target)
+	f, err := os.CreateTemp(dir, "."+filepath.Base(target)+".tmp-*")
 	if err != nil {
 		return err
 	}
@@ -55,7 +66,7 @@ func WriteAtomic(path string, b []byte, perm os.FileMode) error {
 	if err := os.Chmod(tmp, perm); err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
+	if err := os.Rename(tmp, target); err != nil {
 		return err
 	}
 	if d, err := os.Open(dir); err == nil {
@@ -63,6 +74,26 @@ func WriteAtomic(path string, b []byte, perm os.FileMode) error {
 		d.Close()
 	}
 	return nil
+}
+
+// resolveLink follows path through any symlinks to the file they name, which need not exist
+// yet (a link to a file not created yet is written through, not replaced).
+func resolveLink(path string) (string, error) {
+	for i := 0; i < 40; i++ {
+		fi, err := os.Lstat(path)
+		if err != nil || fi.Mode()&os.ModeSymlink == 0 {
+			return path, nil
+		}
+		dest, err := os.Readlink(path)
+		if err != nil {
+			return "", err
+		}
+		if !filepath.IsAbs(dest) {
+			dest = filepath.Join(filepath.Dir(path), dest)
+		}
+		path = dest
+	}
+	return "", fmt.Errorf("%s: too many levels of symbolic links", path)
 }
 
 // ---- config ----

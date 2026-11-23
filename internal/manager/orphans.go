@@ -9,7 +9,9 @@ package manager
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
+	"strings"
 	"time"
 
 	"agentrm/internal/api"
@@ -24,7 +26,26 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 	blocked := len(m.liveWaiters(now)) > 0
 	var effects []Effect
 	for _, r := range m.st.Resources {
-		if m.pending[r.ID] != "" {
+		r.NextStep, r.NextAt, r.NextFrom, r.NextDry = "", nil, nil, false
+		if op := m.pending[r.ID]; op != "" {
+			t := now // under way
+			r.NextStep, r.NextAt, r.NextFrom = op, &t, &t
+			r.RestartBlocked = "a " + op + " is under way"
+			continue
+		}
+		if !blocked && r.Urgent {
+			// Marked for a direct stop because a request was waiting; nobody waits now.
+			r.Urgent = false
+		}
+		if r.Unseen != nil {
+			// Its source is not answering (Docker hung): it may be gone, and a pause or stop
+			// would only time out against the same engine. Nothing is decided until it is seen.
+			continue
+		}
+		if discover.SelfRestarting(r) {
+			if e := m.checkSelfRestarting(r, now); e != nil {
+				effects = append(effects, *e)
+			}
 			continue
 		}
 		if r.LeaseID != "" || r.Pinned || m.neverStop(r) {
@@ -36,6 +57,7 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 			continue
 		}
 		grace, hold, reason, ownerGone := m.collectTiming(r, now, blocked)
+		m.planNext(r, grace, hold, blocked, now)
 		if r.OrphanSince == nil {
 			t := now
 			r.OrphanSince = &t
@@ -84,6 +106,12 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 		if r.Urgent || blocked {
 			why += ", and a request was waiting for memory"
 		}
+		if r.PreparedUntil != nil && !direct {
+			// Paused ahead of a predicted request: that pause is not the start of its pause period,
+			// and it is resumed when the prediction is settled (prepare.go). Only a request really
+			// waiting takes it further, as it would anything unclaimed this long.
+			continue
+		}
 		switch {
 		case r.PausedAt == nil && !direct:
 			if m.dryFor(r) {
@@ -122,11 +150,62 @@ func (m *Manager) checkOrphans(now time.Time) []Effect {
 	return effects
 }
 
+// planNext records what the steps below will do to an unclaimed r, and when, for the app's
+// countdown: the same rules, read ahead. Must hold mu.
+func (m *Manager) planNext(r *model.Resource, grace, hold time.Duration, blocked bool, now time.Time) {
+	if r.StartedBy == "you" {
+		return // asked about, never paused or stopped
+	}
+	since := now
+	if r.OrphanSince != nil {
+		since = *r.OrphanSince
+	}
+	direct := r.Urgent || blocked || m.cfg.PauseMinutes <= 0 || !discover.CanPause(r)
+	if r.PreparedUntil != nil && !direct {
+		return // resumed when its prediction is settled (prepare.go)
+	}
+	step, from, at := "", since, since.Add(grace)
+	switch {
+	case r.PausedAt == nil && !direct:
+		step = "pause"
+	case r.PausedAt != nil && !direct:
+		if discover.CanAutoStop(r) {
+			step, from, at = "stop", *r.PausedAt, r.PausedAt.Add(hold)
+		}
+	case !discover.CanAutoStop(r):
+		// Paused at once if it can be, unless in dry run, where it is only asked about.
+		if r.PausedAt == nil && discover.CanPause(r) && !m.dryFor(r) {
+			step = "pause"
+		}
+	default:
+		step = "stop"
+		if r.PausedAt != nil {
+			from = *r.PausedAt
+		}
+	}
+	if step == "" {
+		return
+	}
+	if from.After(at) {
+		from = at // a paused thing turned direct: its step is due
+	}
+	// In dry run, or while everything is let through (bypass, a stale sweep), it only would.
+	r.NextStep, r.NextFrom, r.NextAt, r.NextDry = step, &from, &at, m.dryFor(r) || m.failOpen(now) != ""
+}
+
 // decide logs a pause, stop or reclaim decision for review.
 func (m *Manager) decide(action string, r *model.Resource, why string) {
+	m.decideAs(action, r, why, false)
+}
+
+// decideAs logs a decision; byHand is one a person took, which dry run does not hold back.
+func (m *Manager) decideAs(action string, r *model.Resource, why string, byHand bool) {
 	d := &model.Decision{ID: newID(), Time: m.now(), Action: action, Why: why, DryRun: m.cfg.DryRun}
 	if r != nil {
 		d.Category, d.DryRun = m.categoryOf(r), m.dryFor(r)
+	}
+	if byHand {
+		d.DryRun = false
 	}
 	if r != nil {
 		d.Resource, d.Name, d.MemMB = r.ID, r.Name, r.MemMB
@@ -135,8 +214,8 @@ func (m *Manager) decide(action string, r *model.Resource, why string) {
 	if m.onDecide != nil {
 		m.onDecide(d)
 	}
-	if m.rec != nil {
-		m.rec.Write(trace.Frame{T: d.Time, Decision: d})
+	if rec := m.recorder(); rec != nil {
+		rec.Write(trace.Frame{T: d.Time, Decision: d})
 	}
 	if len(m.st.Decisions) > 500 {
 		m.st.Decisions = m.st.Decisions[len(m.st.Decisions)-500:]
@@ -198,7 +277,7 @@ func (m *Manager) review(c api.Caller, r api.Req) (any, []Effect, error) {
 func (m *Manager) reviewSummary(all bool) *api.ReviewResp {
 	out := &api.ReviewResp{FalseRate: -1}
 	for _, d := range m.st.Decisions {
-		if d.Verdict != "" && d.Action != "reclaim" {
+		if d.Verdict != "" && collecting(d) {
 			out.Reviewed++
 			if d.Verdict == "wrong" {
 				out.Wrong++
@@ -213,4 +292,47 @@ func (m *Manager) reviewSummary(all bool) *api.ReviewResp {
 		out.FalseRate = float64(out.Wrong) / float64(out.Reviewed)
 	}
 	return out
+}
+
+var episodeTime = regexp.MustCompile(`:\d{4}-\d{2}-\d{2}T`)
+
+// prune drops what would otherwise grow for as long as the daemon runs: approvals a day past
+// their expiry, and once-per-episode markers for resources that are gone. Must hold mu.
+func (m *Manager) prune(now time.Time) {
+	for id, a := range m.st.Approvals {
+		if now.Sub(a.Expires) > 24*time.Hour {
+			delete(m.st.Approvals, id)
+			continue
+		}
+		// A question about a leak that is no longer flagged (it exited, or the daemon restarted
+		// and has not seen it climb since) has nothing left to act on.
+		if a.Path == "/leak" && a.State == "pending" {
+			if id, _ := a.Request["resource_id"].(string); m.findLeak(id) == nil {
+				a.State = "expired"
+			}
+		}
+	}
+	// Receipts and overrun notes are told once; a session that never came back to read one
+	// does not need it a day later (the receipts file keeps the figure).
+	for id, q := range m.st.Questions {
+		if (strings.HasPrefix(id, "receipt:") || strings.HasPrefix(id, "overran:")) && now.Sub(q.Created) > 24*time.Hour {
+			delete(m.st.Questions, id)
+		}
+	}
+	for key := range m.wouldDecided {
+		parts := strings.SplitN(key, ":", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		id := parts[1]
+		if parts[0] != "ask" {
+			// action:<id>:<orphan since>; resource IDs contain colons, the time is RFC 3339.
+			if loc := episodeTime.FindStringIndex(id); loc != nil {
+				id = id[:loc[0]]
+			}
+		}
+		if m.st.Resources[id] == nil {
+			delete(m.wouldDecided, key)
+		}
+	}
 }

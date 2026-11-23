@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"agentrm/internal/api"
+	"agentrm/internal/discover"
 	"agentrm/internal/model"
 )
 
@@ -66,6 +67,9 @@ func (m *Manager) approve(c api.Caller, r api.Req) (any, []Effect, error) {
 		m.event("DENIED %s: %s", a.ID, a.What)
 		return &api.ApprovalResp{Approval: a}, nil, nil
 	}
+	if a.Vault != nil {
+		return nil, nil, fmt.Errorf("a vault request is approved with Touch ID in the AgentRM app (it needs the account's secret)")
+	}
 	var req api.Req
 	b, _ := json.Marshal(a.Request)
 	_ = json.Unmarshal(b, &req)
@@ -90,7 +94,7 @@ func (m *Manager) approvalStatus(c api.Caller, r api.Req) (any, []Effect, error)
 	if a.State == "pending" && m.now().After(a.Expires) {
 		a.State = "expired"
 	}
-	return &api.ApprovalResp{Approval: a}, nil, nil
+	return &api.ApprovalResp{Approval: a, Error: a.Error}, nil, nil
 }
 
 func (m *Manager) pin(c api.Caller, r api.Req) (any, []Effect, error) {
@@ -227,6 +231,35 @@ func (m *Manager) stopNow(c api.Caller, r api.Req) (any, []Effect, error) {
 	if c.Session == "detached" {
 		return nil, nil, fmt.Errorf("a detached process cannot stop anything")
 	}
+	if discover.SelfRestarting(res) {
+		if !c.Human {
+			return nil, nil, fmt.Errorf("%s is restarted only by you; an agent cannot", res.ID)
+		}
+		if busy := m.restartBlocker(res, m.now()); busy != "" {
+			return nil, nil, fmt.Errorf("not restarting %s: %s", res.ID, busy)
+		}
+		if err := m.privileged(c, "restart "+res.Name+" (gives back ~"+gb(res.MemMB)+")"); err != nil {
+			return nil, nil, err
+		}
+		m.pending[res.ID] = "stop"
+		why := "restarted by " + c.Session
+		m.decideAs("stop", res, why+" (by hand)", true)
+		return &api.StopResp{Restart: res.Restart}, []Effect{{Op: "stop", Res: *res, Why: why, By: c.Session}}, nil
+	}
+	if !c.Human && l == nil && res.StartedBy != c.Session {
+		// Nobody holds it, and this agent did not start it. An agent may stop only what AgentRM
+		// itself would stop: not something you started, not an app, a VM or another agent.
+		switch {
+		case res.StartedBy == "you":
+			return nil, nil, fmt.Errorf("%s was started by you; an agent cannot stop it", res.ID)
+		case res.Kind == model.RKStaleAgent || res.AskOnly || !discover.CanAutoStop(res) || m.neverStop(res):
+			why := discover.NoAutoStopWhy(res)
+			if why == "" {
+				why = "it is exempt in your settings"
+			}
+			return nil, nil, fmt.Errorf("%s is never stopped automatically (%s); an agent cannot stop it either", res.ID, why)
+		}
+	}
 	m.pending[res.ID] = "stop"
 	why := "stopped by " + c.Session
 	m.decide("stop", res, why+" (by hand)")
@@ -276,5 +309,7 @@ func (m *Manager) restore(c api.Caller, r api.Req) (any, []Effect, error) {
 		}
 	}
 	m.st.Stopped = out
-	return &api.AcquireResp{Granted: true, Lease: l}, []Effect{{Op: "restore", Res: res, Why: "restore", By: c.Session}}, nil
+	e := Effect{Op: "restore", Res: res, Why: "restore", By: c.Session, Stopped: st}
+	e.Res.LeaseID = l.ID // released again if the restore fails
+	return &api.AcquireResp{Granted: true, Lease: l}, []Effect{e}, nil
 }

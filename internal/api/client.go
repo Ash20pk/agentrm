@@ -8,10 +8,14 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"time"
 
 	"agentrm/internal/store"
+	"agentrm/internal/sys"
 )
 
 // ErrDaemonDown means nothing answered on the socket.
@@ -28,19 +32,70 @@ type NeedsApproval struct {
 
 func (e *NeedsApproval) Error() string { return e.Message }
 
-func client(timeout time.Duration) *http.Client {
+func client(timeout time.Duration, verify bool) *http.Client {
 	return &http.Client{
 		Timeout: timeout,
 		Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{Timeout: time.Second}).DialContext(ctx, "unix", store.SockPath())
+			c, err := (&net.Dialer{Timeout: time.Second}).DialContext(ctx, "unix", store.SockPath())
+			if err != nil || !verify {
+				return c, err
+			}
+			if err := verifyDaemon(c); err != nil {
+				c.Close()
+				return nil, err
+			}
+			return c, nil
 		}},
 	}
+}
+
+// ErrNotDaemon: the socket is served by something other than AgentRM's daemon.
+var ErrNotDaemon = errors.New("not AgentRM's daemon")
+
+// verifyDaemon checks that the process serving the socket runs this very executable: the
+// daemon is the same signed binary as the helper the app runs. The socket's folder belongs to
+// the user, so anything running as the user could move the socket aside and listen in its
+// place, to read what the app sends.
+func verifyDaemon(c net.Conn) error {
+	self, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	if r, err := filepath.EvalSymlinks(self); err == nil {
+		self = r
+	}
+	pid := sys.PeerPID(c)
+	peer := sys.ExePath(pid)
+	if r, err := filepath.EvalSymlinks(peer); err == nil {
+		peer = r
+	}
+	if pid <= 0 || peer == "" || peer != self {
+		return fmt.Errorf("%w: the AgentRM socket is served by pid %d (%s), not by %s; nothing was sent. Something may be listening in AgentRM's place: restart AgentRM", ErrNotDaemon, pid, or(peer, "unknown"), self)
+	}
+	return nil
+}
+
+func or(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
 }
 
 // Call sends req to path and decodes the answer into out (if not nil).
 func Call(path string, req any, out any) error { return CallTimeout(5*time.Second, path, req, out) }
 
 func CallTimeout(timeout time.Duration, path string, req any, out any) error {
+	return call(client(timeout, false), timeout, path, req, out)
+}
+
+// CallDaemon is CallTimeout for a request that carries a secret or changes the vault: it is
+// sent only to AgentRM's own daemon (see verifyDaemon).
+func CallDaemon(timeout time.Duration, path string, req any, out any) error {
+	return call(client(timeout, true), timeout, path, req, out)
+}
+
+func call(cl *http.Client, timeout time.Duration, path string, req any, out any) error {
 	b, err := json.Marshal(req)
 	if err != nil {
 		return err
@@ -48,8 +103,15 @@ func CallTimeout(timeout time.Duration, path string, req any, out any) error {
 	hr, _ := http.NewRequest(http.MethodPost, "http://agentrm"+path, bytes.NewReader(b))
 	hr.Header.Set("Content-Type", "application/json")
 	hr.Header.Set(VersionHeader, strconv.Itoa(Version))
-	resp, err := client(timeout).Do(hr)
+	resp, err := cl.Do(hr)
 	if err != nil {
+		if errors.Is(err, ErrNotDaemon) {
+			var ue *url.Error
+			if errors.As(err, &ue) {
+				return ue.Err
+			}
+			return err
+		}
 		var ne net.Error
 		if errors.As(err, &ne) && ne.Timeout() {
 			return fmt.Errorf("the AgentRM daemon did not answer in %s", timeout)
