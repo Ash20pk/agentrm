@@ -182,6 +182,12 @@ func New(o Options) *Manager {
 	cfg, notes := store.LoadConfig(o.Dir, m.mem.TotalMB)
 	st, snotes := store.LoadState(o.Dir, now())
 	m.cfg, m.st = cfg, st
+	// The queue as it was. A restore's place is not kept: only its own retry completes it.
+	for _, w := range st.Waiters {
+		if w != nil && !w.Retry {
+			m.waiters = append(m.waiters, w)
+		}
+	}
 	m.seedFreed()
 	m.notes = append(notes, snotes...)
 	m.applyLogLevel()
@@ -264,6 +270,7 @@ func (m *Manager) persist() {
 		m.mu.Unlock()
 		return
 	}
+	m.st.Waiters = m.waiters
 	b, err := json.MarshalIndent(m.st, "", "  ")
 	m.dirty = false
 	m.mu.Unlock()

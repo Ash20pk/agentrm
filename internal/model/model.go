@@ -159,6 +159,12 @@ type Lease struct {
 	LastUsed  time.Time  `json:"last_used"`
 	IdleAsked *time.Time `json:"idle_asked,omitempty"`
 	PeakMB    float64    `json:"peak_mb,omitempty"`
+	// TogetherMB is the peak of all the session's leases of this kind together, when a build
+	// ran under more than one (a top-up): what is learned from, since each holds only a part.
+	TogetherMB float64 `json:"together_mb,omitempty"`
+	// Background marks a build the agent runs in the background: another command of its kind
+	// returning does not end it.
+	Background bool `json:"background,omitempty"`
 	// UsedMB is what a build lease uses now: the footprint of what its session started since
 	// the grant.
 	UsedMB float64 `json:"used_mb,omitempty"`
@@ -381,6 +387,9 @@ type State struct {
 	Resources map[string]*Resource `json:"resources"`
 	Questions map[string]*Question `json:"questions"`
 	Pinned    map[string]bool      `json:"pinned"`
+	// Waiters is the queue, kept so a restart does not drop requests their sessions were told
+	// would be granted.
+	Waiters []*Waiter `json:"waiters,omitempty"`
 	// Touches records, per resource, when each session last ran a command that used it.
 	Touches map[string]map[string]time.Time `json:"touches"`
 	// Learned is the observed peak memory per estimate key (kind, or kind@project), in MB.
@@ -483,6 +492,8 @@ type Waiter struct {
 	TTLMinutes   int    `json:"ttl_minutes,omitempty"`
 	UntilMinutes int    `json:"until_minutes,omitempty"`
 	Declared     bool   `json:"declared,omitempty"`
+	// Background marks a command the agent runs in the background: no call says when it ends.
+	Background bool `json:"background,omitempty"`
 	// Retry marks a request only its own retry can complete (a restore has to start the thing
 	// as well), so no lease is granted for it from the queue.
 	Retry bool `json:"retry,omitempty"`

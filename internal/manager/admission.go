@@ -83,6 +83,9 @@ func (m *Manager) liveWaiters(now time.Time) []*model.Waiter {
 	}
 	sort.SliceStable(out, func(i, j int) bool { return ahead(out[i], out[j]) })
 	m.waiters = out
+	if len(gone) > 0 {
+		m.dirty = true
+	}
 	for _, w := range gone {
 		m.wake(w, nil)
 	}
@@ -111,6 +114,9 @@ func (m *Manager) dropWaiter(session, kind string) {
 		m.waiters[i] = nil
 	}
 	m.waiters = out
+	if len(dropped) > 0 {
+		m.dirty = true
+	}
 	for _, w := range dropped {
 		m.wake(w, nil)
 	}
@@ -166,7 +172,7 @@ func (m *Manager) fits(session, kind, cwd string, needMB float64, me *model.Wait
 	// Do not take memory a request ahead of this one is still waiting for.
 	aheadMB := 0.0
 	for _, w := range waiters {
-		if w.Session != session && (me == nil || ahead(w, me)) && !(prio > w.Priority) {
+		if w.Session != session && (me == nil || ahead(w, me)) && !(prio > w.Priority) && !m.heldUp(w) {
 			aheadMB += w.NeedMB
 		}
 	}
@@ -182,6 +188,19 @@ func (m *Manager) fits(session, kind, cwd string, needMB float64, me *model.Wait
 	return true, "", false
 }
 
+// heldUp says whether a queued request cannot be granted now for a reason more memory would not
+// change: only its own retry completes it, its kind is refused (disk, CPU, heat), or it would
+// take its session past its share. Such a request reserves nothing against those behind it;
+// otherwise the two block each other with memory free (one over its share because the other
+// waits, the other behind memory kept for the first).
+func (m *Manager) heldUp(w *model.Waiter) bool {
+	if w.Retry || m.busy(w.Kind) != "" {
+		return true
+	}
+	return m.cfg.MaxSessionShare > 0 && m.priority(w.Session) == 0 &&
+		m.heldMB(w.Session)+w.NeedMB > m.cfg.MaxSessionShare*m.usableMB()
+}
+
 // admit decides whether what want asks for can be granted now. On refusal it queues the
 // request, remembering what was asked so the lease can be granted when it fits (grantWaiters),
 // and starts reclaiming; the reason says what was done and how the session hears about it.
@@ -193,7 +212,9 @@ func (m *Manager) admit(want model.Waiter, now time.Time) (bool, string, int) {
 	waiters := m.liveWaiters(now)
 	var me *model.Waiter
 	for _, w := range waiters {
-		if w.Session == want.Session && w.Kind == want.Kind {
+		// A restore's place is its own: it must not replace the session's queued request for
+		// the same kind, which would then never be granted from the queue.
+		if w.Session == want.Session && w.Kind == want.Kind && w.Retry == want.Retry {
 			me = w
 		}
 	}
@@ -209,6 +230,7 @@ func (m *Manager) admit(want model.Waiter, now time.Time) (bool, string, int) {
 	if me == nil {
 		me = &model.Waiter{Since: now}
 		m.waiters = append(m.waiters, me)
+		m.dirty = true
 	}
 	since := me.Since
 	*me = want
@@ -244,6 +266,7 @@ func (m *Manager) howToWait(w *model.Waiter) string {
 // news for its next tool call. With press, holders are pressed again for those still waiting.
 // Must hold mu.
 func (m *Manager) grantWaiters(now time.Time, press bool) {
+	overdue := false
 	for _, w := range append([]*model.Waiter(nil), m.liveWaiters(now)...) {
 		// It got one some other way. A request for more than the session held waits while the
 		// session holds what it held then; only more than that answers it.
@@ -270,7 +293,10 @@ func (m *Manager) grantWaiters(now time.Time, press bool) {
 		case ok:
 		case why != "":
 			ok, note = true, " (from the queue: "+why+")"
-		case m.waitedEnough(w, now):
+		case !overdue && m.waitedEnough(w, now):
+			// One a pass: the next is looked at again a few seconds later, when what this one
+			// did to the Mac shows. Several let through at once could push it into swap.
+			overdue = true
 			// Estimates said no for long enough; the Mac itself is not short. Let it run.
 			ok, note = true, fmt.Sprintf(" (waited %s, the most a request waits while the Mac is not swapping)",
 				now.Sub(w.Since).Round(time.Minute))
@@ -313,6 +339,7 @@ func (m *Manager) removeWaiter(w *model.Waiter) {
 		m.waiters[i] = nil
 	}
 	m.waiters = out
+	m.dirty = true
 }
 
 // takeUp records that a lease granted from the queue reached its session.
@@ -597,8 +624,9 @@ func (m *Manager) learn(l *model.Lease) {
 	}
 	m.scoreCharge(l, kind)
 	m.writeReceipt(l, kind, m.now())
+	peak := max(l.PeakMB, l.TogetherMB)
 	// Only leases that really ran something teach anything.
-	if kind == "" || l.PeakMB < minLearnMB || (model.LeaseToResource[kind] != "" && !l.HadResources) || inVM(l) {
+	if kind == "" || peak < minLearnMB || (model.LeaseToResource[kind] != "" && !l.HadResources) || inVM(l) {
 		return
 	}
 	keys := []string{kind}
@@ -607,14 +635,14 @@ func (m *Manager) learn(l *model.Lease) {
 	}
 	for _, key := range keys {
 		if old := m.st.Learned[key]; old > 0 {
-			dev := l.PeakMB - old
+			dev := peak - old
 			if dev < 0 {
 				dev = -dev
 			}
 			m.st.LearnedDev[key] = 0.7*m.st.LearnedDev[key] + 0.3*dev
-			m.st.Learned[key] = 0.7*old + 0.3*l.PeakMB
+			m.st.Learned[key] = 0.7*old + 0.3*peak
 		} else {
-			m.st.Learned[key] = l.PeakMB
+			m.st.Learned[key] = peak
 		}
 	}
 }

@@ -65,6 +65,27 @@ type Config struct {
 	TraceDays   int  `json:"trace_days"`   // daily trace files kept
 }
 
+// Sanitize puts back the default for a value no setting of it can mean (a hand-edited
+// config.json): a lease that expires as it is granted, a reserve below nothing or above what
+// the Mac has (every request would be refused as never fitting), a share outside 0 to 1. It
+// says what it changed.
+func (c *Config) Sanitize(totalMB float64) []string {
+	def := DefaultConfig()
+	ScaleToMachine(&def, totalMB)
+	var notes []string
+	fix := func(name string, bad bool, set func()) {
+		if bad {
+			set()
+			notes = append(notes, "config.json: "+name+" was out of range; using the default")
+		}
+	}
+	fix("default_ttl_minutes", c.DefaultTTLMinutes < 1, func() { c.DefaultTTLMinutes = def.DefaultTTLMinutes })
+	fix("build_ttl_minutes", c.BuildTTLMinutes < 1, func() { c.BuildTTLMinutes = def.BuildTTLMinutes })
+	fix("headroom_gb", c.HeadroomGB < 0 || (totalMB > 0 && c.HeadroomGB*1024 > totalMB/2), func() { c.HeadroomGB = def.HeadroomGB })
+	fix("max_session_share", c.MaxSessionShare < 0 || c.MaxSessionShare > 1, func() { c.MaxSessionShare = def.MaxSessionShare })
+	return notes
+}
+
 // DefaultConfig is sized for a 16 GB Mac; ScaleToMachine adjusts it to the real one.
 func DefaultConfig() Config {
 	return Config{
