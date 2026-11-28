@@ -187,6 +187,7 @@ type Status struct {
 	HeadroomMB    float64                    `json:"headroom_mb"`
 	PendingMB     float64                    `json:"pending_mb"`
 	SwapRate      float64                    `json:"swap_rate_mb_min"`
+	HotSince      *time.Time                 `json:"hot_since,omitempty"` // running hot (thermal_level reached) since; nil while cool
 	Waiters       []*model.Waiter            `json:"waiters"`
 	Config        model.Config               `json:"config"`
 	Leases        map[string]*model.Lease    `json:"leases"`

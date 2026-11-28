@@ -157,6 +157,7 @@ func (m *Manager) fastWith(procs map[int]*sys.Proc, mem sys.MemStats) {
 		sys.Procs.Set(procs)
 		m.updateFootprints(procs, now)
 	}
+	m.watchHeat(now)
 	m.grantWaiters(now, false) // memory may have just come free
 	var watch []string
 	paused := map[string]*model.Resource{}
@@ -312,6 +313,7 @@ func (m *Manager) sweepWith(procs map[int]*sys.Proc, found discover.Result, mem 
 		m.setLeftoverCwds(cwds)
 		found.Resources = m.withLeftovers(found.Resources, procs)
 	}
+	m.watchHeat(now)
 	m.merge(found, procs, est, now)
 	m.checkLeases(now)
 	if procs != nil {

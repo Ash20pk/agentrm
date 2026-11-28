@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -89,7 +90,15 @@ func runDaemon() error {
 	defer replaced()
 	if exe, err := os.Executable(); err == nil {
 		go watchExecutable(ctx, exe, 15*time.Second, func(why string) {
-			fmt.Fprintf(logw, "%s daemon: %s; exiting so launchd starts the new one\n", time.Now().Format(time.RFC3339), why)
+			fmt.Fprintf(logw, "%s daemon: %s; exiting so the new one can start\n", time.Now().Format(time.RFC3339), why)
+			replaced()
+		})
+	}
+	// Started by the app: live exactly as long as it. A quit sends SIGTERM; this covers the app
+	// crashing or being force-quit, which would otherwise leave the daemon running on its own.
+	if pid, err := strconv.Atoi(os.Getenv("AGENTRM_PARENT_PID")); err == nil && pid > 1 {
+		go watchParent(ctx, pid, time.Second, os.Getppid, func() {
+			fmt.Fprintf(logw, "%s daemon: the app (pid %d) is gone; exiting with it\n", time.Now().Format(time.RFC3339), pid)
 			replaced()
 		})
 	}
@@ -102,10 +111,29 @@ func runDaemon() error {
 	return err
 }
 
+// watchParent calls gone once the process that started the daemon (pid) is no longer its
+// parent: when a parent exits, its children are handed to launchd, so getppid changes.
+func watchParent(ctx context.Context, pid int, every time.Duration, getppid func() int, gone func()) {
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		if getppid() != pid {
+			gone()
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+	}
+}
+
 // watchExecutable calls changed once if the daemon's own binary is replaced or removed: a
 // Sparkle update, a Homebrew upgrade or a rebuild swaps the file, and the old daemon would
 // otherwise keep running old code, speaking an API version the new hooks refuse (so they let
-// everything through). launchd's KeepAlive starts the new binary once this one exits.
+// everything through). The app (or launchd, for a daemon it runs) starts the new binary once
+// this one exits.
 func watchExecutable(ctx context.Context, path string, every time.Duration, changed func(why string)) {
 	orig, err := os.Stat(path)
 	if err != nil {

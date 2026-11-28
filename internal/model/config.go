@@ -32,6 +32,7 @@ type Config struct {
 	UnverifiedTTLMinutes int     `json:"unverified_ttl_minutes"`     // lifetime of a claim with no evidence behind it
 	MinDiskGB            float64 `json:"min_disk_gb"`                // refuse disk-heavy leases below this free space on /
 	MaxLoadPerCore       float64 `json:"max_load_per_core"`          // refuse builds above this 1-minute load per core
+	ThermalLevel         int     `json:"thermal_level"`              // running hot from this macOS thermal pressure (2 heavy, 3 critical, 0 off): builds wait, busy agents are asked to ease off
 	MaxSessionShare      float64 `json:"max_session_share"`          // while others wait, one session may hold at most this share of usable memory
 	MaxWaitMinutes       int     `json:"max_wait_minutes,omitempty"` // a queued request is granted after this long unless the Mac is swapping (0: 15, -1: never)
 	RequireAppApproval   bool    `json:"require_app_approval"`       // privileged actions from a terminal need a click in the app
@@ -70,7 +71,7 @@ func DefaultConfig() Config {
 		HeadroomGB: 1, MaxSwapMBPerMin: 300, PressureGraceMinutes: 2, PressureIdleMinutes: 5, UnleasedGB: 2,
 		HeavyGrowthGB: 1.5, PauseMinutes: 30, GraceMinutes: 10, DefaultTTLMinutes: 120, BuildTTLMinutes: 30,
 		SweepSeconds: 30, FastSweepSeconds: 3, DryRun: true, ExtraPatterns: map[string][]string{},
-		IdleMinutes: 30, ClaimWindowMinutes: 60, UnverifiedTTLMinutes: 30, MinDiskGB: 10, MaxLoadPerCore: 1.5,
+		IdleMinutes: 30, ClaimWindowMinutes: 60, UnverifiedTTLMinutes: 30, MinDiskGB: 10, MaxLoadPerCore: 1.5, ThermalLevel: 2,
 		MaxSessionShare: 0.6, RequireAppApproval: true, AutoThawOnConnect: true, LogLevel: "info",
 		OwnerGoneGraceMinutes: 2, OwnerGonePauseMinutes: 10, OldGenerationHours: 24, LeftoverMinMB: 40,
 		QueueMinutes: 10, GrantHoldMinutes: 3, TraceDays: 14,

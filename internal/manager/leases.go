@@ -91,7 +91,9 @@ func (m *Manager) acquire(c api.Caller, r api.Req) (any, []Effect, error) {
 	m.yieldsSeeUse(c.Session, nil, r.Kind, now)
 	fast := m.readFast() // pressure, load and disk right now, not as of the last sweep
 	m.mem.PressureLevel, m.mem.Load1, m.mem.Cores, m.mem.DiskFreeGB = fast.PressureLevel, fast.Load1, fast.Cores, fast.DiskFreeGB
+	m.mem.Thermal = fast.Thermal
 	if why := m.busy(r.Kind); why != "" {
+		m.noteHeatRefusal(c.Session)
 		return &api.AcquireResp{Reason: why}, nil, nil
 	}
 	want := model.Waiter{Session: c.Session, Agent: c.Agent, Kind: r.Kind, NeedMB: memGB * 1024, HeldGB: heldGB * b2f(extraGB > 0),
@@ -376,11 +378,12 @@ func (m *Manager) updateFootprints(procs map[int]*sys.Proc, now time.Time) {
 			continue // it said it ended; its process is on its way out
 		}
 		s.FootprintMB, s.AgentPID = mb, apid
+		s.CPUPercent, s.BusyProcs = busiest(tree)
 		live[id] = true
 	}
 	for id, s := range m.st.Sessions {
 		if !live[id] {
-			s.FootprintMB = 0
+			s.FootprintMB, s.CPUPercent, s.BusyProcs = 0, 0, nil
 		}
 	}
 	explained := map[string]bool{} // sessions whose growth a lease accounts for

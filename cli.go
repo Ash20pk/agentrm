@@ -399,7 +399,7 @@ func fail(err error) int {
 	}
 	switch {
 	case errors.Is(err, api.ErrDaemonDown):
-		fmt.Fprintln(os.Stderr, "agentrm: the daemon is not running. Open AgentRM, or check System Settings → General → Login Items.")
+		fmt.Fprintln(os.Stderr, "agentrm: the daemon is not running. Open AgentRM: it runs the daemon while it is open.")
 	default:
 		fmt.Fprintln(os.Stderr, "agentrm:", err)
 	}
@@ -558,6 +558,19 @@ func printReview(r *api.ReviewResp) {
 	fmt.Println("\nmark one: agentrm review mark ID right|wrong [--note \"why\"]")
 }
 
+// thermalWord names a thermal pressure level, in capitals from the level where macOS slows down.
+func thermalWord(level int) string {
+	switch level {
+	case 0:
+		return "nominal"
+	case 1:
+		return "moderate"
+	case 2:
+		return "HEAVY"
+	}
+	return "CRITICAL"
+}
+
 func printStatus(showStopped bool) error {
 	var st api.Status
 	if err := api.Call("/status", api.Req{}, &st); err != nil {
@@ -567,7 +580,15 @@ func printStatus(showStopped bool) error {
 	pressure := map[int]string{1: "normal", 2: "WARNING", 4: "CRITICAL"}[m.PressureLevel]
 	fmt.Printf("MEMORY   %.1f GB total · %.1f GB available · %.1f GB compressed · swap %.1f/%.1f GB · pressure %s · swapping out %.0f MB/min\n",
 		m.TotalMB/1024, m.AvailableMB/1024, m.CompressedMB/1024, m.SwapUsedMB/1024, m.SwapTotalMB/1024, pressure, st.SwapRate)
-	fmt.Printf("SYSTEM   disk %.0f GB free · load %.1f on %d cores\n", m.DiskFreeGB, m.Load1, m.Cores)
+	heat := ""
+	if m.Thermal >= 0 {
+		heat = " · thermal " + thermalWord(m.Thermal)
+	}
+	fmt.Printf("SYSTEM   disk %.0f GB free · load %.1f on %d cores%s\n", m.DiskFreeGB, m.Load1, m.Cores, heat)
+	if st.HotSince != nil {
+		fmt.Printf("HOT      running hot since %s: builds are refused and busy agents asked to ease off until it cools\n",
+			st.HotSince.Local().Format("15:04"))
+	}
 	fmt.Printf("HEADROOM %.1f GB can be granted now (%.1f GB available - %.1f GB promised - %.1f GB kept free)%s\n",
 		max(0, st.HeadroomMB)/1024, m.AvailableMB/1024, st.PendingMB/1024, st.Config.HeadroomGB,
 		map[bool]string{true: "   [DRY RUN]"}[st.Config.DryRun])

@@ -1,6 +1,5 @@
 import AppKit
 import Foundation
-import ServiceManagement
 import UserNotifications
 import os
 
@@ -13,8 +12,10 @@ final class Store: ObservableObject {
     @Published var review: ReviewResp?
     @Published var daemonError: String?
     @Published var lastActionError: String?
-    @Published var registrationError: String?
-    @Published var loginItemStatus: SMAppService.Status = .notRegistered
+    /// Vault approvals waiting on Touch ID right now.
+    @Published var authenticating: Set<String> = []
+    /// Whether the daemon the app runs is up (it lives exactly as long as the app).
+    @Published var daemonRunning = false
     @Published var hookPreview = ""
     @Published var receipt: Receipt?
     /// The meter once a minute for the last hour, oldest first: the Activity window's waterfall.
@@ -26,7 +27,7 @@ final class Store: ObservableObject {
     /// A preview store shows fixed data and never calls the daemon.
     private var frozen = false
     private var lastEventSeq = -1
-    let service = SMAppService.agent(plistName: "dev.agentrm.daemon.plist")
+    let daemon = Daemon()
     let notifications = NotificationHandler()
 
     var onboarded: Bool {
@@ -45,11 +46,16 @@ final class Store: ObservableObject {
     init() {
         // Writing a secret to a helper that already exited must fail the write, not kill the app.
         signal(SIGPIPE, SIG_IGN)
-        loginItemStatus = service.status
         notifications.store = self
         notifications.install()
-        if service.status != .enabled && service.status != .requiresApproval {
-            registerDaemon()
+        daemon.onChange = { [weak self] in
+            guard let self else { return }
+            self.daemonRunning = self.daemon.running
+            Task { await self.refresh() }
+        }
+        // Quitting the app stops the daemon; it thaws what it paused before it exits.
+        NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.daemon.stop() }
         }
         timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -60,6 +66,8 @@ final class Store: ObservableObject {
         }
         timer?.tolerance = 1
         Task {
+            await Daemon.removeLoginAgent()
+            daemon.start()
             await refresh()
             await restartDaemonIfStale()
             await refreshSetup()
@@ -75,7 +83,7 @@ final class Store: ObservableObject {
         self.status = status
         self.setup = setup
         self.review = review
-        loginItemStatus = status == nil ? .notRegistered : .enabled
+        daemonRunning = status != nil
     }
 
     func setPreviewWaterfall(_ w: [[Segment]]) { waterfall = w }
@@ -95,6 +103,9 @@ final class Store: ObservableObject {
         guard let s = status else { return false }
         return (s.mem.pressure_level ?? 1) >= 4 || (s.swap_rate_mb_min ?? 0) > s.swapLimit
     }
+
+    /// The daemon counts the Mac as running hot: builds wait, busy agents are asked to ease off.
+    var runningHot: Bool { status?.hot_since != nil }
 
     func refresh() async {
         if frozen { return }
@@ -127,10 +138,9 @@ final class Store: ObservableObject {
             if failedRefreshes >= Self.failuresBeforeOff || status == nil
                 || error.localizedDescription.contains("API version") {
                 status = nil
-                daemonError = error.localizedDescription
+                daemonError = daemon.lastError ?? error.localizedDescription
             }
         }
-        loginItemStatus = service.status
     }
 
     private var failedRefreshes = 0
@@ -145,11 +155,12 @@ final class Store: ObservableObject {
         Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
     }
 
-    /// After a Sparkle update the daemon launchd started from the old app keeps running old code;
-    /// if the API version changed, every hook fails open and nothing is enforced. Restart it once
-    /// per launch when it reports another version, or refuses to talk to this one.
+    /// A daemon running other code than this app bundles (it outlived an update, or was started
+    /// some other way) may speak another API version, and then every hook fails open and nothing
+    /// is enforced. Restart it once per launch when it reports another version, or refuses to
+    /// talk to this one.
     func restartDaemonIfStale() async {
-        if frozen || restartedStaleDaemon || service.status != .enabled { return }
+        if frozen || restartedStaleDaemon { return }
         let running = status?.daemon_version
         let versionMismatch = running != nil && running != "dev" && running != bundledVersion
         let apiMismatch = status == nil && (daemonError ?? "").contains("API version")
@@ -157,38 +168,9 @@ final class Store: ObservableObject {
         restartedStaleDaemon = true
         let was = running ?? "an older API", now = bundledVersion
         log.notice("daemon runs \(was, privacy: .public), app bundles \(now, privacy: .public): restarting it")
-        let label = "gui/\(getuid())/dev.agentrm.daemon"
-        if (try? await Self.launchctl(["kickstart", "-k", label])) == nil {
-            // Not loaded under that label (or launchctl refused): register it afresh.
-            try? await service.unregister()
-            registerDaemon()
-        }
+        daemon.restart()
         try? await Task.sleep(nanoseconds: 2_000_000_000)
         await refresh()
-    }
-
-    private static func launchctl(_ args: [String]) async throws {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
-            DispatchQueue.global(qos: .userInitiated).async {
-                let p = Process()
-                p.executableURL = URL(fileURLWithPath: "/bin/launchctl")
-                p.arguments = args
-                p.standardOutput = FileHandle.nullDevice
-                p.standardError = FileHandle.nullDevice
-                do {
-                    try p.run()
-                    p.waitUntilExit()
-                } catch {
-                    cont.resume(throwing: error)
-                    return
-                }
-                if p.terminationStatus == 0 {
-                    cont.resume()
-                } else {
-                    cont.resume(throwing: CLI.Failure(message: "launchctl \(args.joined(separator: " ")) exited \(p.terminationStatus)"))
-                }
-            }
-        }
     }
 
     private func record() {
@@ -314,7 +296,7 @@ final class Store: ObservableObject {
                 await refreshSetup()
                 return
             }
-            unregisterDaemon()
+            daemon.stop()
             UserDefaults.standard.removeObject(forKey: "onboarded")
             let alert = NSAlert()
             alert.messageText = "AgentRM is uninstalled"
@@ -326,20 +308,8 @@ final class Store: ObservableObject {
         }
     }
 
-    func registerDaemon() {
-        do {
-            try service.register()
-        } catch {
-            log.error("register failed: \(error.localizedDescription, privacy: .public)")
-            registrationError = "Could not register the background daemon: \(error.localizedDescription)"
-        }
-        loginItemStatus = service.status
-    }
-
-    func unregisterDaemon() {
-        try? service.unregister()
-        loginItemStatus = service.status
-    }
+    func startDaemon() { daemon.start() }
+    func restartDaemon() { daemon.restart() }
 
     private func newEvents(_ events: [AgentEvent]) -> [AgentEvent] {
         let maxSeq = events.map(\.seq).max() ?? 0

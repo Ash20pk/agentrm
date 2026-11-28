@@ -210,6 +210,7 @@ func ReadFast() MemStats {
 	m := MemStats{TotalMB: mi["MemTotal"], AvailableMB: mi["MemAvailable"], SwapTotalMB: mi["SwapTotal"],
 		SwapUsedMB: mi["SwapTotal"] - mi["SwapFree"]}
 	m.PressureLevel = PressureLevel()
+	m.Thermal = ThermalLevel()
 	m.Load1, m.Cores = LoadAvg()
 	m.DiskFreeGB = DiskFreeGB("/")
 	if m.TotalMB > 0 {

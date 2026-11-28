@@ -243,6 +243,9 @@ func call(name string, a map[string]any) (string, bool) {
 func Summary(st *api.Status) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "%.1f GB can be granted now (%.1f GB available, pressure %d). ", max(0, st.HeadroomMB)/1024, st.Mem.AvailableMB/1024, st.Mem.PressureLevel)
+	if st.HotSince != nil {
+		fmt.Fprintf(&b, "The Mac is running hot (since %s): builds are refused; ease off CPU-heavy work if you can. ", st.HotSince.Local().Format("15:04"))
+	}
 	var ls []string
 	for _, l := range st.Leases {
 		ls = append(ls, fmt.Sprintf("%s %s %.1f GB held by %s (used %s ago)", l.ID, l.Kind, l.MemGB, l.Session,

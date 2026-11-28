@@ -116,6 +116,7 @@ type Manager struct {
 	leakTracks      map[procKey]*leakTrack    // large processes watched for leaks (leaks.go)
 	leakProcs       map[int]*sys.Proc         // the process table the leak watch last saw
 	procUID         func(pid int) (int, bool) // who a process runs as; nil in tests
+	heat            heatState                 // the Mac running hot (heat.go)
 
 	// The vault (vault.go): live credentials, in memory only, and the API-key proxy.
 	vaultLive   map[string]*vaultLive // grant ID -> credential
@@ -159,6 +160,7 @@ func New(o Options) *Manager {
 		missing: map[string]int{}, hookSeen: map[string]time.Time{}, claimRefused: map[string]bool{}, infos: newInfoCache(nil), stale: map[int]bool{}, selfPID: os.Getpid(),
 		parked: map[*model.Waiter][]chan *api.AcquireResp{}, backfilled: map[*model.Waiter]map[string]bool{},
 		kick: make(chan struct{}, 1), readFast: sys.ReadFast, restartedAt: map[string]*restartMark{}, preps: map[string]*prep{},
+		heat:      heatState{refused: map[string]bool{}},
 		vaultLive: map[string]*vaultLive{}, vaultTok: map[string]string{},
 	}
 	m.notify = o.Notify
@@ -548,7 +550,7 @@ func (m *Manager) status(c api.Caller, r api.Req) (any, []Effect, error) {
 	week, _ := m.freedMB(now.AddDate(0, 0, -7), now)
 	return &api.Status{
 		APIVersion: api.Version, DaemonVersion: m.version,
-		Mem: m.mem, HeadroomMB: m.headroomMB(), PendingMB: m.pendingMB(), SwapRate: m.swapRate,
+		Mem: m.mem, HeadroomMB: m.headroomMB(), PendingMB: m.pendingMB(), SwapRate: m.swapRate, HotSince: m.heat.since,
 		Waiters: m.liveWaiters(m.now()), Config: m.cfg, Leases: m.st.Leases, Resources: m.st.Resources,
 		Sessions: m.st.Sessions, Questions: m.st.Questions, LastSweep: m.lastSweep, Events: m.events,
 		Learned: m.st.Learned, Stopped: m.st.Stopped, Approvals: m.st.Approvals, Sources: src,

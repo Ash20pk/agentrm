@@ -15,6 +15,8 @@ struct MemStats: Codable {
     var load1: Double?
     var cores: Int?
     var pressure_level: Int?
+    /// macOS thermal pressure: 0 nominal, 1 moderate, 2 heavy, 3+ critical; -1 unknown.
+    var thermal: Int?
 }
 
 struct Config: Codable {
@@ -97,6 +99,8 @@ struct AgentSession: Codable, Identifiable {
     var cwd: String
     var last_seen: Date
     var footprint_mb: Double?
+    /// CPU its agent's process tree is using, in percent of one core.
+    var cpu_percent: Double?
     var priority: Int?
     var ended_at: Date?
     var end_reason: String?
@@ -257,6 +261,8 @@ struct Status: Codable {
     var headroom_mb: Double
     var pending_mb: Double
     var swap_rate_mb_min: Double?
+    /// When the Mac started running hot; nil while cool.
+    var hot_since: Date?
     var fail_open: String?
     var waiters: [Waiter]?
     var config: Config
@@ -289,7 +295,7 @@ struct Status: Codable {
     enum CodingKeys: String, CodingKey {
         case mem, headroom_mb, pending_mb, swap_rate_mb_min, waiters, config, leases, resources, sessions,
              events, last_sweep, daemon_version, sources, stopped, approvals, notes, prediction, trust_levels, leaks, fail_open,
-             vault_accounts, vault_grants, freed_today_mb, freed_week_mb
+             vault_accounts, vault_grants, freed_today_mb, freed_week_mb, hot_since
         case selfUsage = "self"
     }
 }

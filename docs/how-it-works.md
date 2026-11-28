@@ -27,7 +27,27 @@ that. Warning alone is not enough: macOS sits there for hours while compression 
 - **Process trees are measured.** Each agent's whole process tree is sampled; growth of more than
   `heavy_growth_gb` that no lease explains becomes a lease of its own ("heavy", inferred), so a
   wrapper script whose name says nothing is still counted, held and learned from.
-- Disk-heavy work is refused below `min_disk_gb` free; builds above `max_load_per_core`.
+- Disk-heavy work is refused below `min_disk_gb` free; builds above `max_load_per_core`, and
+  while the Mac is running hot (below).
+
+## Heat: when the Mac runs hot
+
+A Mac can lag with memory to spare: a few agents each running a build, a test suite and a watcher
+heat it up, and macOS slows the CPU down to cool it. AgentRM reads the thermal pressure macOS
+itself reports (what Activity Monitor and `ProcessInfo.thermalState` show: nominal, moderate,
+heavy, critical). From `thermal_level` (heavy, by default) until it has stayed below that for two
+minutes:
+
+- builds and other CPU-heavy work are refused, with the reason, like on a saturated CPU;
+- every live agent session whose own processes use more than half a core, or that holds a build
+  lease, is asked on its next tool call to ease off if it can: stop what it does not need now,
+  run with fewer parallel jobs, hold back new heavy work. The message names its busiest
+  processes. It is asked, not made to: only the agent knows what can wait. Still hot and still
+  busy 15 minutes after reading it, it is asked again;
+- you get one notification saying who was asked, and the notch reads `HOT`.
+
+When it has cooled, unread requests are withdrawn, and each session that read one or was refused
+is told it can go back to full speed. Thermal pressure is read on macOS only; on Linux this is off.
 
 ## Contention: a queue, fairness and reclamation
 

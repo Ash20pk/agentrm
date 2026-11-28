@@ -1,7 +1,8 @@
 # Architecture
 
 AgentRM is a daemon (`agentrm daemon`), a CLI and hook client (the same binary), and a menu-bar
-app that runs the daemon as a login item and reads its state through the CLI.
+app that runs the daemon as its child process (started when the app opens, stopped when it quits,
+and exiting by itself if the app dies) and reads its state through the CLI.
 
 ```
 Claude Code ──hook──┐

@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -77,5 +78,23 @@ func TestExecutableReplacementIsNoticed(t *testing.T) {
 	case <-called:
 	case <-time.After(2 * time.Second):
 		t.Fatal("the watcher did not notice the new binary")
+	}
+}
+
+func TestWatchParent(t *testing.T) {
+	ppid := atomic.Int64{}
+	ppid.Store(42)
+	done := make(chan struct{})
+	go watchParent(context.Background(), 42, time.Millisecond, func() int { return int(ppid.Load()) }, func() { close(done) })
+	select {
+	case <-done:
+		t.Fatal("exited while the parent was alive")
+	case <-time.After(20 * time.Millisecond):
+	}
+	ppid.Store(1) // the parent died: launchd adopted the daemon
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("did not exit after the parent died")
 	}
 }

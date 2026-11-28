@@ -15,6 +15,7 @@ The Limits tab of the Activity window changes the common ones. Keys not listed a
 | `unleased_gb` | 2 (scaled) | Flag a session using this much with no lease at all |
 | `min_disk_gb` | 10 | Refuse disk-heavy leases below this free space on `/` |
 | `max_load_per_core` | 1.5 | Refuse builds above this 1-minute load per core |
+| `thermal_level` | 2 | macOS thermal pressure at which the Mac counts as running hot (2 heavy, 3 critical; 0 off): builds are refused and busy agents asked to ease off until it cools |
 | `kind_mem_gb` | per kind | Starting estimates, until AgentRM has learned real ones |
 
 ## Leases and claims

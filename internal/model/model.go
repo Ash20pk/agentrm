@@ -223,6 +223,11 @@ type Session struct {
 	// (said it was done, then used it again). Its later offers are weighted by the record.
 	YieldReports    int `json:"yield_reports,omitempty"`
 	YieldMisreports int `json:"yield_misreports,omitempty"`
+	// CPUPercent is what the agent's process tree uses (the agent itself left out), in percent
+	// of one core, as of the last sweep; BusyProcs names its busiest processes. What a session
+	// is asked to ease off when the Mac runs hot (manager/heat.go).
+	CPUPercent float64  `json:"cpu_percent,omitempty"`
+	BusyProcs  []string `json:"-"`
 	// Where it is working now.
 	Repo   string `json:"repo,omitempty"`
 	Branch string `json:"branch,omitempty"`

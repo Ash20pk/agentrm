@@ -124,11 +124,16 @@ func (m *Manager) priority(session string) int {
 }
 
 // busy says why work of this kind cannot start now for a reason other than memory: a nearly
-// full disk or a saturated CPU. Such a request is refused, not queued.
+// full disk, a saturated CPU or a Mac running hot. Such a request is refused, not queued.
 func (m *Manager) busy(kind string) string {
 	if model.DiskKinds[kind] && m.mem.DiskFreeGB >= 0 && m.mem.DiskFreeGB < m.cfg.MinDiskGB {
 		return fmt.Sprintf("the disk is nearly full (%.1f GB free on /, minimum %.0f GB). Prune Docker images or build caches first",
 			m.mem.DiskFreeGB, m.cfg.MinDiskGB)
+	}
+	if model.CPUKinds[kind] && m.hot() {
+		return fmt.Sprintf("the Mac is running hot (macOS reports %s thermal pressure) and is slowing itself down, so the person "+
+			"using it feels every extra build. Hold this back until it cools: you are told on your next tool call when it has "+
+			"(agentrm status shows the thermal state). %s", thermalName(m.mem.Thermal), m.holders())
 	}
 	if model.CPUKinds[kind] && m.mem.Cores > 0 && m.mem.Load1 > float64(m.mem.Cores)*m.cfg.MaxLoadPerCore {
 		return fmt.Sprintf("the CPU is saturated (load %.1f on %d cores, limit %.1f per core). %s",
