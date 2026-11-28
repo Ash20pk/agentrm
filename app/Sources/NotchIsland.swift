@@ -251,7 +251,7 @@ final class NotchController {
 
     private func set(_ mode: NotchModel.Mode) {
         guard model.mode != mode else { return }
-        withAnimation(.spring(response: 0.38, dampingFraction: 0.82)) { model.mode = mode }
+        withAnimation(NotchMotion.shape(opening: mode != .rest)) { model.mode = mode }
     }
 
     // MARK: actions from the island
@@ -295,6 +295,35 @@ final class NotchController {
         close()
         NSApp.activate(ignoringOtherApps: true)
         openActivity()
+    }
+}
+
+/// How the island moves. Opening, the black shape springs out of the notch with a little
+/// overshoot and what is in it comes into focus a moment later, already laid out at its final
+/// width, so no text reflows while the shape is still growing. Closing, what is in it goes first
+/// and the shape settles back without a bounce. With Reduce Motion on it is a short fade.
+enum NotchMotion {
+    static var reduced: Bool { NSWorkspace.shared.accessibilityDisplayShouldReduceMotion }
+
+    static func shape(opening: Bool) -> Animation {
+        if reduced { return .easeOut(duration: 0.15) }
+        return opening ? .spring(response: 0.46, dampingFraction: 0.76) : .spring(response: 0.36, dampingFraction: 0.94)
+    }
+
+    static var reveal: AnyTransition {
+        if reduced { return .opacity }
+        return .asymmetric(
+            insertion: .modifier(active: Focus(shown: 0), identity: Focus(shown: 1))
+                .animation(.easeOut(duration: 0.30).delay(0.09)),
+            removal: .modifier(active: Focus(shown: 0), identity: Focus(shown: 1))
+                .animation(.easeIn(duration: 0.13)))
+    }
+
+    private struct Focus: ViewModifier {
+        let shown: Double
+        func body(content: Content) -> some View {
+            content.opacity(shown).blur(radius: (1 - shown) * 10).scaleEffect(0.95 + 0.05 * shown, anchor: .top)
+        }
     }
 }
 
@@ -352,8 +381,8 @@ struct NotchIsland: View {
             wings
             switch mode {
             case .rest: EmptyView()
-            case .approval: if let a = current { approvalBody(a).transition(.opacity) }
-            case .stats: stats.transition(.opacity)
+            case .approval: if let a = current { approvalBody(a).frame(width: width).transition(NotchMotion.reveal) }
+            case .stats: stats.frame(width: width).transition(NotchMotion.reveal)
             }
         }
         .frame(width: width)
@@ -367,6 +396,8 @@ struct NotchIsland: View {
         // a background never arrives on macOS 27, which left the island with no size, so the
         // pointer was never over it and it neither opened nor took a click.
         .onGeometryChange(for: CGSize.self) { $0.size } action: { model.islandSize = $0 }
+        // Also when the daemon changes it (the approval shown is answered elsewhere or expires).
+        .animation(NotchMotion.shape(opening: mode != .rest), value: mode)
         .padding(.horizontal, 30).padding(.bottom, 40) // room for the glow
         .accessibilityElement(children: .contain)
         .accessibilityLabel("AgentRM")
