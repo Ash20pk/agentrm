@@ -1,4 +1,3 @@
-import ServiceManagement
 import Sparkle
 import SwiftUI
 
@@ -359,13 +358,11 @@ struct SetupTab: View {
                     .padding(12).panel(Ink.amberPanel, stroke: Color(hex: 0x8A6A12))
                 }
                 VStack(spacing: 0) {
-                    SetupRow(on: store.loginItemStatus == .enabled, title: "Background daemon", detail: daemonDetail) {
-                        if store.loginItemStatus == .enabled {
-                            Button("Turn off") { store.unregisterDaemon() }.buttonStyle(.key)
-                        } else if store.loginItemStatus == .requiresApproval {
-                            Button("Login Items") { SMAppServiceOpen.loginItems() }.buttonStyle(.key(.amber))
+                    SetupRow(on: store.daemonRunning, title: "Background daemon", detail: daemonDetail) {
+                        if store.daemonRunning {
+                            Button("Restart") { store.restartDaemon() }.buttonStyle(.key)
                         } else {
-                            Button("Turn on") { store.registerDaemon() }.buttonStyle(.key(.go))
+                            Button("Start") { store.startDaemon() }.buttonStyle(.key(.go))
                         }
                     }
                     divider
@@ -421,11 +418,9 @@ struct SetupTab: View {
     }
 
     private var daemonDetail: String {
-        switch store.loginItemStatus {
-        case .enabled: return "Runs at login and keeps running in the background."
-        case .requiresApproval: return "Waiting for your approval in System Settings, General, Login Items."
-        default: return "Not running. Leases, questions and auto-stop need it."
-        }
+        store.daemonRunning
+            ? "Runs while AgentRM is open and stops when you quit it, thawing anything it paused."
+            : "Not running. Leases, questions and auto-stop need it."
     }
 
     private func cliDetail(_ s: SetupCheck?) -> String {

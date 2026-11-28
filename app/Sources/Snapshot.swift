@@ -64,6 +64,14 @@ enum Snapshot {
             shoot(MenuIcon().padding(.horizontal, 10).frame(height: 24), store: store, dark: d, size: nil,
                   to: out.appendingPathComponent("\(name)-menubar-\(d ? "dark" : "light").png"))
         }
+        // The notch island in each mode, on a strip of menu bar the size of a 14-inch notch.
+        for (mode, tag) in [(NotchModel.Mode.rest, "rest"), (.approval, "approval"), (.stats, "stats")] {
+            let model = NotchModel()
+            model.notch = CGSize(width: 185, height: 32)
+            model.mode = mode
+            shoot(NotchIsland(model: model).frame(width: 680, height: mode == .rest ? 90 : 640).background(Color(hex: 0x2E3A47)),
+                  store: store, dark: true, size: nil, to: out.appendingPathComponent("\(name)-notch-\(tag).png"))
+        }
         guard all else { return }
         for tab in ActivityView.Tab.allCases {
             shoot(ActivityView(updater: updater, tab: tab), store: store, dark: dark, size: CGSize(width: 1060, height: 720),

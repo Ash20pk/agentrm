@@ -35,36 +35,24 @@ struct AgentRMApp: App {
     }
 }
 
-/// The menu-bar item: a miniature of the LED meter, one bar per GB lit in its state colour, and
-/// the memory a new lease could get. It also opens the welcome window on first launch.
+/// The menu-bar item: the app's logo. It also
+/// starts the notch island and opens the welcome window on first launch.
 struct MenuIcon: View {
     @EnvironmentObject var store: Store
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        HStack(spacing: 4) {
-            Image(nsImage: MiniMeter.image(store.reading?.segments ?? Array(repeating: .off, count: 16),
-                                           alert: store.underPressure || !store.pendingApprovals.isEmpty))
-            Text(text).monospacedDigit()
-        }
+        // Just the logo: the numbers are in the notch.
+        Image(nsImage: MenuLogo.image(alert: store.underPressure || store.runningHot || !store.pendingApprovals.isEmpty))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(label)
         .task {
+            NotchController.start(store: store) { openWindow(id: "activity") }
             if !store.onboarded {
                 NSApp.activate(ignoringOtherApps: true)
                 openWindow(id: "welcome")
             }
         }
-    }
-
-    /// The reading next to the meter: what a lease could get now, or why there is nothing.
-    private var text: String {
-        guard let s = store.status else { return "off" }
-        if !store.pendingApprovals.isEmpty { return "approve?" }
-        // Let through: nothing is being managed, so a headroom figure would mislead.
-        if s.fail_open != nil { return "open" }
-        if store.underPressure { return "swap \(Int(s.swap_rate_mb_min ?? 0))" }
-        return "\(Fmt.gb(max(0, s.headroom_mb)))G"
     }
 
     private var label: String {
@@ -73,36 +61,40 @@ struct MenuIcon: View {
         if !store.pendingApprovals.isEmpty { parts.append("approval waiting") }
         if let open = s.fail_open { parts.append("not managing memory: \(open)") }
         if store.underPressure { parts.append("memory pressure") }
+        if store.runningHot { parts.append("running hot, builds wait") }
         if r.nobodyMB > 0 { parts.append("\(Fmt.gb(r.nobodyMB)) GB owned by nobody") }
         return parts.joined(separator: ", ")
     }
 }
 
-/// Draws the meter small enough for the menu bar. Colours are kept (not a template image) because
-/// the colour is the information; unlit bars are a grey that shows on light and dark menu bars.
-enum MiniMeter {
-    static func image(_ segments: [Segment], alert: Bool) -> NSImage {
-        let bar: CGFloat = 2.5, gap: CGFloat = 1, h: CGFloat = 14
-        let w = CGFloat(segments.count) * bar + CGFloat(max(0, segments.count - 1)) * gap
-        let img = NSImage(size: NSSize(width: w + (alert ? 6 : 0), height: h), flipped: false) { _ in
-            for (i, seg) in segments.enumerated() {
-                let rect = NSRect(x: CGFloat(i) * (bar + gap), y: 1, width: bar, height: h - 2)
-                let color: NSColor
-                switch seg {
-                case .lit(let l): color = NSColor(l == .system ? Color(hex: 0x8E949C) : l.color)
-                case .kept: color = NSColor(white: 0.55, alpha: 0.45)
-                case .off: color = NSColor(white: 0.55, alpha: 0.28)
-                }
-                color.setFill()
-                NSBezierPath(roundedRect: rect, xRadius: 0.8, yRadius: 0.8).fill()
+/// The logo drawn for the menu bar: the meter's window with its seven bars, four lit, as in the
+/// app icon. A template image, so macOS draws it white on a dark menu bar like its own icons.
+/// When something needs you a dot sits on its corner (a template has one colour, so the dot is
+/// its shape, not red).
+enum MenuLogo {
+    static func image(alert: Bool) -> NSImage {
+        let w: CGFloat = 26, h: CGFloat = 18
+        let img = NSImage(size: NSSize(width: w, height: h), flipped: false) { _ in
+            NSColor.black.set()
+            let window = NSBezierPath(roundedRect: NSRect(x: 0.75, y: 1.75, width: w - 1.5, height: h - 3.5), xRadius: 4, yRadius: 4)
+            window.lineWidth = 1.5
+            window.stroke()
+            for i in 0..<7 {
+                NSColor.black.withAlphaComponent(i < 4 ? 1 : 0.35).setFill()
+                let bar = NSRect(x: 3.75 + CGFloat(i) * 2.75, y: 4.5, width: 2, height: h - 9)
+                NSBezierPath(roundedRect: bar, xRadius: 0.6, yRadius: 0.6).fill()
             }
             if alert {
-                NSColor(Lamp.nobody.color).setFill()
-                NSBezierPath(ovalIn: NSRect(x: w + 2, y: h - 5, width: 4, height: 4)).fill()
+                let dot = NSRect(x: w - 8, y: h - 8, width: 7, height: 7)
+                NSGraphicsContext.current?.compositingOperation = .clear
+                NSBezierPath(ovalIn: dot.insetBy(dx: -1.5, dy: -1.5)).fill()
+                NSGraphicsContext.current?.compositingOperation = .sourceOver
+                NSColor.black.setFill()
+                NSBezierPath(ovalIn: dot).fill()
             }
             return true
         }
-        img.isTemplate = false
+        img.isTemplate = true
         return img
     }
 }

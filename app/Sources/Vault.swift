@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import LocalAuthentication
 import Security
@@ -79,14 +80,34 @@ enum VaultKeychain {
     }
 }
 
+@MainActor
 enum VaultAuth {
-    /// Touch ID, or your Mac password where there is none. False if cancelled or failed.
-    static func confirm(_ reason: String) async -> Bool {
+    /// Touch ID, or your Mac password where there is none. Nil once confirmed, else why not.
+    static func check(_ reason: String) async -> String? {
+        // The prompt belongs to the active app. Clicked from the notch island (a panel that never
+        // activates AgentRM) it would go to whatever app is in front, and macOS cancels it or
+        // leaves it unfocused so the sensor does nothing. Activate first, like a click in the menu.
+        NSApp.activate(ignoringOtherApps: true)
         let ctx = LAContext()
+        ctx.localizedCancelTitle = "Don't approve"
         var err: NSError?
-        guard ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &err) else { return false }
-        return (try? await ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason)) ?? false
+        guard ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &err) else {
+            return err?.localizedDescription ?? "Touch ID and your Mac password are not available"
+        }
+        do {
+            return try await ctx.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) ? nil : "authentication failed"
+        } catch let e as LAError {
+            switch e.code {
+            case .userCancel, .appCancel: return "authentication was cancelled"
+            case .systemCancel: return "macOS cancelled the Touch ID prompt (another app took focus)"
+            default: return e.localizedDescription
+            }
+        } catch {
+            return error.localizedDescription
+        }
     }
+
+    static func confirm(_ reason: String) async -> Bool { await check(reason) == nil }
 }
 
 extension Store {
@@ -94,14 +115,17 @@ extension Store {
     var vaultGrants: [VaultGrant] { status?.vault_grants ?? [] }
 
     /// Approves a vault request: Touch ID, then the account's secret from the Keychain to the
-    /// daemon on the helper's stdin.
-    func approveVault(_ a: Approval, minutes: Int? = nil) {
-        guard let ask = a.vault else { return }
-        Task {
+    /// daemon on the helper's stdin. The task's value says whether the grant went through.
+    @discardableResult
+    func approveVault(_ a: Approval, minutes: Int? = nil) -> Task<Bool, Never> {
+        guard let ask = a.vault else { return Task { false } }
+        return Task {
+            authenticating.insert(a.id)
+            defer { authenticating.remove(a.id) }
             let reason = "give \(Self.agentName(ask.agent)) access to \(ask.account) for \(minutes ?? ask.minutes) minutes"
-            guard await VaultAuth.confirm(reason) else {
-                lastActionError = "Not approved: authentication was cancelled. The request stays open until it expires."
-                return
+            if let why = await VaultAuth.check(reason) {
+                lastActionError = "Not approved: \(why). The request stays open until it expires."
+                return false
             }
             do {
                 let (material, settings) = try VaultKeychain.readAll(ask.account)
@@ -117,8 +141,11 @@ extension Store {
                 lastActionError = nil
             } catch {
                 lastActionError = "Vault: \(error.localizedDescription)"
+                await refresh()
+                return false
             }
             await refresh()
+            return true
         }
     }
 

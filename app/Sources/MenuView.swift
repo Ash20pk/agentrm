@@ -1,4 +1,3 @@
-import ServiceManagement
 import Sparkle
 import SwiftUI
 
@@ -10,6 +9,7 @@ struct MenuView: View {
     @Environment(\.openWindow) private var openWindow
     @State private var keeping: Resource?
     @State private var gate = false
+    @AppStorage(NotchController.enabledKey) private var notchIsland = true
     @State private var listHeight: CGFloat = 100
 
     private let maxListHeight: CGFloat = 300
@@ -25,6 +25,9 @@ struct MenuView: View {
                 }
                 ForEach(s.leaks ?? []) { leak in
                     strip(color: Lamp.nobody.color, text: leakText(leak))
+                }
+                if let heat = heatText(s) {
+                    strip(color: store.runningHot ? Lamp.nobody.color : Lamp.waiting.color, text: heat)
                 }
                 meter(s, r)
                 gauges(s, r)
@@ -69,6 +72,7 @@ struct MenuView: View {
     private var headerLamp: (color: Color, text: String) {
         guard let s = store.status else { return (Ink.scale, "Offline") }
         if store.underPressure { return (Lamp.nobody.color, "Overload") }
+        if store.runningHot { return (Lamp.nobody.color, "Running hot") }
         if !store.pendingApprovals.isEmpty || (store.reading?.nobodyMB ?? 0) > 0 { return (Lamp.waiting.color, "Needs you") }
         let age = -s.last_sweep.timeIntervalSinceNow
         return age < 60 ? (Lamp.inUse.color, "All clear") : (Ink.scale, "Last read \(Fmt.since(s.last_sweep)) ago")
@@ -157,7 +161,7 @@ struct MenuView: View {
                 Text(["", "Normal", "Warning", "", "Critical"][min(s.mem.pressure_level ?? 1, 4)])
                     .font(Face.body(12)).foregroundStyle((s.mem.pressure_level ?? 1) >= 4 ? Lamp.nobody.textColor : Ink.dim)
             }
-            .frame(maxWidth: .infinity, alignment: .leading).padding(10).panel()
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading).padding(10).panel()
             Readout(label: "Swap", value: "\(swap)", unit: "MB/m", color: (s.swap_rate_mb_min ?? 0) > s.swapLimit ? Lamp.nobody.color : Ink.text)
         }
         .fixedSize(horizontal: false, vertical: true)
@@ -228,6 +232,15 @@ struct MenuView: View {
 
     // MARK: strips, offline, footer
 
+    /// Heat is shown only when it matters: nothing while the Mac is cool.
+    private func heatText(_ s: Status) -> String? {
+        if let since = s.hot_since {
+            return "Running hot for \(Fmt.since(since)). macOS is slowing the Mac to cool it, so builds wait and busy agents have been asked to ease off."
+        }
+        guard let t = s.mem.thermal, t >= 1 else { return nil }
+        return "Getting warm. If it heats up further, builds will wait and busy agents will be asked to ease off."
+    }
+
     private func strip(color: Color, text: String) -> some View {
         HStack(spacing: 8) {
             LampDot(color: color)
@@ -252,16 +265,10 @@ struct MenuView: View {
         VStack(spacing: 12) {
             LEDMeter(segments: Array(repeating: .off, count: 16), height: 40, showScale: false)
             Text("The background daemon is not running.").font(Face.body(15, .semibold))
-            if let e = store.registrationError ?? store.daemonError {
+            if let e = store.daemonError {
                 Text(e).font(Face.mono(11)).foregroundStyle(Ink.label).multilineTextAlignment(.center).lineLimit(4)
             }
-            if store.loginItemStatus == .requiresApproval {
-                Text("macOS needs your approval in System Settings, General, Login Items.")
-                    .font(Face.body(12)).foregroundStyle(Ink.dim).multilineTextAlignment(.center)
-                Button("Open Login Items") { SMAppServiceOpen.loginItems() }.buttonStyle(.key(.go, large: true))
-            } else {
-                Button("Start daemon") { store.registerDaemon() }.buttonStyle(.key(.go, large: true))
-            }
+            Button("Start daemon") { store.startDaemon() }.buttonStyle(.key(.go, large: true))
         }
         .frame(maxWidth: .infinity)
         .padding(16).panel()
@@ -290,6 +297,7 @@ struct MenuView: View {
                 } else {
                     Button("Let everything through for 1 hour") { store.bypass(minutes: 60) }
                 }
+                Toggle("Show in the notch", isOn: $notchIsland)
                 Divider()
                 Button("Check for Updates…") { updater.checkForUpdates() }
                 Divider()
@@ -458,13 +466,5 @@ struct AutoStopGate: View {
         .padding(18).frame(width: 560)
         .background(Ink.bg).foregroundStyle(Ink.text).environment(\.colorScheme, .dark)
         .task { await store.refreshReview() }
-    }
-}
-
-enum SMAppServiceOpen {
-    static func loginItems() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension") {
-            NSWorkspace.shared.open(url)
-        }
     }
 }

@@ -15,8 +15,11 @@ type MemStats struct {
 	Load1        float64 `json:"load1"`
 	Cores        int     `json:"cores"`
 	// PressureLevel is the kernel's own verdict: 1 normal, 2 warning, 4 critical.
-	PressureLevel int     `json:"pressure_level"`
-	Swapouts      float64 `json:"-"` // cumulative, in MB
+	PressureLevel int `json:"pressure_level"`
+	// Thermal is macOS's thermal pressure: 0 nominal, 1 moderate, 2 heavy (the Mac is slowing
+	// itself down), 3 and 4 critical; -1 unknown (Linux, or unreadable). See ThermalLevel.
+	Thermal  int     `json:"thermal"`
+	Swapouts float64 `json:"-"` // cumulative, in MB
 	// SwapUnread: vm_stat could not be read, so Swapouts is not a reading.
 	SwapUnread bool `json:"-"`
 }

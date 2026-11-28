@@ -57,6 +57,9 @@ VMs, apps and things you started are only ever asked about.
 - **Finished tasks.** A lease belongs to the branch it was taken on: when a pull request is opened
   from it or the session moves to another branch, the holder is asked, and an unused lease is
   released.
+- **Heat.** When macOS reports the Mac running hot and slowing itself down, builds wait, and
+  the agents keeping the CPU busy are asked to ease off (stop what they do not need now, run
+  fewer jobs) and told when it has cooled. Memory free is not the same as a usable Mac.
 - **Leaks.** A dev process whose memory keeps climbing for an hour (a stuck language server, a
   leaking dev server) is flagged, and you can restart or stop it in one click.
 
@@ -107,10 +110,16 @@ See [the vault](docs/vault.md).
 
 ### The menu-bar app
 
-The menu bar shows the memory meter, one bar per GB lit in its state (in use, waiting, nobody's,
-paused) and how much a new lease could get. The panel lists what is running and who holds it,
-with keys to keep, stop, release or resume, and approvals waiting for you. The Activity window has
-Now, Collected, Week, Decisions, Stopped, Vault, Setup and Limits.
+AgentRM sits either side of the notch: the memory meter on the left, one bar per GB lit in its
+state (in use, waiting, nobody's, paused), and on the right how much a new lease could get, or
+what needs you (`APPROVE`, `SWAP`, `HOT`). An approval drops out of the notch with its Approve and
+Deny keys. Rest the pointer on it for memory, pressure, swap, heat and the agents running; click it
+to keep it open. On a Mac without a notch it hangs from the middle of the menu bar, and "Show in
+the notch" in the menu turns it off.
+
+The menu-bar icon opens the panel: what is running and who holds it, with keys to keep, stop,
+release or resume, and approvals waiting for you. The Activity window has Now, Collected, Week,
+Decisions, Stopped, Vault, Setup and Limits.
 
 ## Install
 

@@ -7,6 +7,9 @@ struct VaultApprovalCard: View {
     @EnvironmentObject var store: Store
     let approval: Approval
     let ask: VaultAsk
+    /// Where the answer goes; the store by default. The notch island passes its own, to stay
+    /// open while Touch ID is up and say how it went.
+    var onAnswer: ((Bool) -> Void)?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -26,14 +29,23 @@ struct VaultApprovalCard: View {
             if ask.kind != "apikey" { warn(VaultText.protection(ask.kind)) }
             HStack(spacing: 8) {
                 Spacer()
-                Button("Deny") { store.answer(approval.id, approve: false) }.buttonStyle(.key)
-                Button("Approve · Touch ID") { store.approveVault(approval) }
+                Button("Deny") { answer(false) }.buttonStyle(.key)
+                    .disabled(waiting)
+                Button(waiting ? "Waiting for Touch ID…" : "Approve · Touch ID") { answer(true) }
                     .buttonStyle(.key(.amber)).keyboardShortcut(.defaultAction)
+                    .disabled(waiting)
             }
         }
         .padding(12)
         .panel(Ink.amberPanel, stroke: Color(hex: 0x8A6A12))
         .shadow(color: Lamp.waiting.color.opacity(0.12), radius: 12)
+    }
+
+    private var waiting: Bool { store.authenticating.contains(approval.id) }
+
+    private func answer(_ approve: Bool) {
+        if let onAnswer { return onAnswer(approve) }
+        if approve { store.approveVault(approval) } else { store.answer(approval.id, approve: false) }
     }
 
     // As saved in the app: the daemon's copy could have been edited.

@@ -123,6 +123,7 @@ func LoadConfig(dir string, totalMB float64) (model.Config, []string) {
 			notes = append(notes, fmt.Sprintf("config.json did not parse (%v); moved it to %s and wrote fresh defaults", err, bad))
 		}
 	}
+	notes = append(notes, cfg.Sanitize(totalMB)...)
 	return cfg, notes
 }
 

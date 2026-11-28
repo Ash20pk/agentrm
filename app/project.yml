@@ -31,6 +31,8 @@ targets:
     sources:
       - path: Sources
       - path: Resources/Assets.xcassets
+      # No longer registered: the app runs the daemon itself. Kept so the app can remove the
+      # login agent that versions up to 0.2 registered (SMAppService needs the plist to do it).
       - path: Resources/LaunchAgents/dev.agentrm.daemon.plist
         buildPhase:
           copyFiles:

@@ -44,7 +44,7 @@ func ReadMem() MemStats {
 }
 
 // ReadFast reads what sysctl gives directly, with no external command: total memory, swap,
-// pressure level, load, cores and disk. Cheap enough to call on every request.
+// pressure level, thermal pressure, load, cores and disk. Cheap enough to call on every request.
 func ReadFast() MemStats {
 	var m MemStats
 	if v, err := unix.SysctlUint64("hw.memsize"); err == nil {
@@ -56,6 +56,7 @@ func ReadFast() MemStats {
 		m.SwapUsedMB = float64(binary.LittleEndian.Uint64(b[16:24])) / 1048576
 	}
 	m.PressureLevel = PressureLevel()
+	m.Thermal = ThermalLevel()
 	m.Load1, m.Cores = LoadAvg()
 	m.DiskFreeGB = DiskFreeGB("/")
 	return m

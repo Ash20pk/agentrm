@@ -260,7 +260,7 @@ struct Readout: View {
             }
             .lineLimit(1).minimumScaleFactor(0.7)
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .padding(10).panel()
         .accessibilityElement(children: .combine)
     }

@@ -91,12 +91,22 @@ func (m *Manager) acquire(c api.Caller, r api.Req) (any, []Effect, error) {
 	m.yieldsSeeUse(c.Session, nil, r.Kind, now)
 	fast := m.readFast() // pressure, load and disk right now, not as of the last sweep
 	m.mem.PressureLevel, m.mem.Load1, m.mem.Cores, m.mem.DiskFreeGB = fast.PressureLevel, fast.Load1, fast.Cores, fast.DiskFreeGB
-	if why := m.busy(r.Kind); why != "" {
+	m.mem.Thermal = fast.Thermal
+	if lvl := m.cfg.ThermalLevel; lvl > 0 && m.mem.Thermal >= lvl && m.heat.since == nil {
+		// Hot as of this reading: the spell begins now, not at the next sweep. A refusal with
+		// no spell behind it was never followed by the promised word that it had cooled.
+		m.watchHeat(now)
+	}
+	// Not while everything is let through (your bypass, or the daemon not trusting its own
+	// figures): that covers a busy disk, CPU or a hot Mac as much as memory.
+	if why := m.busy(r.Kind); why != "" && m.failOpen(now) == "" {
+		m.noteHeatRefusal(c.Session)
 		return &api.AcquireResp{Reason: why}, nil, nil
 	}
 	want := model.Waiter{Session: c.Session, Agent: c.Agent, Kind: r.Kind, NeedMB: memGB * 1024, HeldGB: heldGB * b2f(extraGB > 0),
 		Purpose: r.Purpose, Cmd: trunc(r.Cmd, 200), Cwd: cwd, Via: r.Via,
-		TTLMinutes: r.TTLMinutes, UntilMinutes: r.UntilMinutes, Declared: r.MemGB > 0}
+		TTLMinutes: r.TTLMinutes, UntilMinutes: r.UntilMinutes, Declared: r.MemGB > 0,
+		Background: r.Via == "hook" && r.RunInBackground}
 	if why := m.failOpen(now); why != "" {
 		l := m.grant(&want, now, " ("+why+")")
 		m.dropWaiter(c.Session, r.Kind)
@@ -116,22 +126,26 @@ func (m *Manager) acquire(c api.Caller, r api.Req) (any, []Effect, error) {
 	return &api.AcquireResp{Granted: true, Lease: l}, nil, nil
 }
 
+// maxTTLMinutes is the longest a lease lasts without being renewed, whatever was asked.
+const maxTTLMinutes = 24 * 60
+
 // grant makes the lease w asks for. Must hold mu.
 func (m *Manager) grant(w *model.Waiter, now time.Time, note string) *model.Lease {
 	if m.onGrant != nil {
 		m.onGrant(w.NeedMB, m.headroomMB())
 	}
 	ttl := w.TTLMinutes
-	if ttl == 0 {
+	if ttl <= 0 {
 		ttl = m.cfg.DefaultTTLMinutes
 		if model.BuildKinds[w.Kind] {
 			ttl = m.cfg.BuildTTLMinutes
 		}
 	}
+	ttl = min(ttl, maxTTLMinutes)
 	l := &model.Lease{ID: newID(), Session: w.Session, Agent: w.Agent, Kind: w.Kind, MemGB: w.NeedMB / 1024,
 		Purpose: w.Purpose, Cmd: w.Cmd, Cwd: w.Cwd, TTL: ttl, Created: now,
 		Expires: now.Add(minutes(ttl)), Verified: true, Evidence: "requested before starting", LastUsed: now,
-		Declared: w.Declared}
+		Declared: w.Declared, Background: w.Background}
 	if w.UntilMinutes > 0 {
 		u := now.Add(minutes(w.UntilMinutes))
 		l.Until = &u
@@ -233,7 +247,8 @@ func (m *Manager) renew(c api.Caller, r api.Req) (any, []Effect, error) {
 	if r.Via == "hook" && r.Cmd != "" && !r.RunInBackground {
 		if kind := m.classifier.Classify(r.Cmd); model.BuildKinds[kind] {
 			for _, l := range m.st.Leases {
-				if l.Session == c.Session && l.Kind == kind {
+				// Not a build still running in the background, which returns no such call.
+				if l.Session == c.Session && l.Kind == kind && !l.Background {
 					m.dropLease(l, "its command finished")
 				}
 			}
@@ -376,11 +391,12 @@ func (m *Manager) updateFootprints(procs map[int]*sys.Proc, now time.Time) {
 			continue // it said it ended; its process is on its way out
 		}
 		s.FootprintMB, s.AgentPID = mb, apid
+		s.CPUPercent, s.BusyProcs = busiest(tree)
 		live[id] = true
 	}
 	for id, s := range m.st.Sessions {
 		if !live[id] {
-			s.FootprintMB = 0
+			s.FootprintMB, s.CPUPercent, s.BusyProcs = 0, 0, nil
 		}
 	}
 	explained := map[string]bool{} // sessions whose growth a lease accounts for
@@ -419,11 +435,17 @@ func (m *Manager) updateFootprints(procs map[int]*sys.Proc, now time.Time) {
 			continue
 		}
 		base, ok := m.footBase[id]
+		heavy := m.findLease(id, model.KHeavy)
 		if !ok {
-			m.footBase[id] = s.FootprintMB
+			// After a restart the tree may be mid-work: a lease inferred before it knows where
+			// the tree started. Taking the footprint now would end that lease on the next sweep.
+			if heavy != nil && inferred(heavy) && heavy.BaseFootprintMB > 0 {
+				m.footBase[id] = heavy.BaseFootprintMB
+			} else {
+				m.footBase[id] = s.FootprintMB
+			}
 			continue
 		}
-		heavy := m.findLease(id, model.KHeavy)
 		switch {
 		case heavy != nil && s.FootprintMB < base+growth/3:
 			m.dropLease(heavy, fmt.Sprintf("the process tree is back to %.1f GB", s.FootprintMB/1024))
@@ -444,6 +466,11 @@ func (m *Manager) updateFootprints(procs map[int]*sys.Proc, now time.Time) {
 		case heavy != nil:
 			heavy.Expires = now.Add(minutes(heavy.TTL))
 			heavy.PeakMB = max(heavy.PeakMB, s.FootprintMB-base)
+			if inferred(heavy) {
+				// It promises nothing ahead: it is what the tree has grown by now. Left at its
+				// first size, a tree that settled lower kept the difference from everyone else.
+				heavy.MemGB = max(0, s.FootprintMB-base) / 1024
+			}
 		case heavy == nil && !explained[id]:
 			// Track the idle baseline slowly, so a long-lived tool raises it gradually.
 			m.footBase[id] = 0.9*base + 0.1*s.FootprintMB
@@ -498,6 +525,12 @@ func (m *Manager) measureBuilds(ls []*model.Lease, tree []*sys.Proc, bound map[i
 		l.PeakMB = max(l.PeakMB, peak)
 		usedMB += peak
 		askedGB += l.MemGB
+	}
+	if len(ls) > 1 {
+		// One build under several leases: what it used in all is what the next one needs.
+		for _, l := range ls {
+			l.TogetherMB = max(l.TogetherMB, usedMB)
+		}
 	}
 	m.checkOverrunOf(ls, usedMB, askedGB, now)
 }

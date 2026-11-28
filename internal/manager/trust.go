@@ -226,7 +226,33 @@ func prevCat(cat string) string {
 
 // relock turns a level off when a stop taken under it is marked wrong.
 func (m *Manager) relock(d *model.Decision) {
-	if d.DryRun || d.Verdict != "wrong" || d.Category == "" || m.cfg.DryRun == false && len(m.cfg.AutoStop) == 0 {
+	if d.DryRun || d.Verdict != "wrong" || d.Category == "" {
+		return
+	}
+	if !optInLevel(d.Category) && !m.cfg.DryRun {
+		// Everything was on at once (dry_run off), where the levels decide nothing. Go over to
+		// the levels: those before this one stay on, this one and those after it only report.
+		// Before this, the mark was acknowledged and the stops went on.
+		cfg := m.cfg
+		cfg.DryRun = true
+		cfg.AutoStop = map[string]bool{}
+		for k, v := range m.cfg.AutoStop {
+			cfg.AutoStop[k] = v
+		}
+		on := true
+		for _, lv := range trustLevels {
+			if lv.optIn {
+				continue
+			}
+			if lv.cat == d.Category {
+				on = false
+			}
+			cfg.AutoStop[lv.cat] = on
+		}
+		m.cfg, m.cfgDirty = cfg, true
+		m.event("LOCKED auto-stop for %q: you marked its %s of %s wrong. It and the levels after it are back to asking and reporting.",
+			trustLevelTitle(d.Category), d.Action, d.Resource)
+		m.notify("Auto-stop paused for "+trustLevelTitle(d.Category), "You marked one of its stops wrong, so it only reports again.")
 		return
 	}
 	if !m.cfg.AutoStop[d.Category] {
@@ -266,8 +292,7 @@ func (m *Manager) collect(c api.Caller, r api.Req) (any, []Effect, error) {
 	var effects []Effect
 	for _, res := range targets {
 		why := "collected at your request: its session had ended"
-		m.decide("stop", res, why)
-		m.st.Decisions[len(m.st.Decisions)-1].DryRun = false
+		m.decideAs("stop", res, why, true)
 		m.pending[res.ID] = "stop"
 		effects = append(effects, Effect{Op: "stop", Res: *res, Why: why, By: "you"})
 	}

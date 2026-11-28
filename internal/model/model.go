@@ -159,6 +159,12 @@ type Lease struct {
 	LastUsed  time.Time  `json:"last_used"`
 	IdleAsked *time.Time `json:"idle_asked,omitempty"`
 	PeakMB    float64    `json:"peak_mb,omitempty"`
+	// TogetherMB is the peak of all the session's leases of this kind together, when a build
+	// ran under more than one (a top-up): what is learned from, since each holds only a part.
+	TogetherMB float64 `json:"together_mb,omitempty"`
+	// Background marks a build the agent runs in the background: another command of its kind
+	// returning does not end it.
+	Background bool `json:"background,omitempty"`
 	// UsedMB is what a build lease uses now: the footprint of what its session started since
 	// the grant.
 	UsedMB float64 `json:"used_mb,omitempty"`
@@ -223,6 +229,11 @@ type Session struct {
 	// (said it was done, then used it again). Its later offers are weighted by the record.
 	YieldReports    int `json:"yield_reports,omitempty"`
 	YieldMisreports int `json:"yield_misreports,omitempty"`
+	// CPUPercent is what the agent's process tree uses (the agent itself left out), in percent
+	// of one core, as of the last sweep; BusyProcs names its busiest processes. What a session
+	// is asked to ease off when the Mac runs hot (manager/heat.go).
+	CPUPercent float64  `json:"cpu_percent,omitempty"`
+	BusyProcs  []string `json:"-"`
 	// Where it is working now.
 	Repo   string `json:"repo,omitempty"`
 	Branch string `json:"branch,omitempty"`
@@ -376,6 +387,13 @@ type State struct {
 	Resources map[string]*Resource `json:"resources"`
 	Questions map[string]*Question `json:"questions"`
 	Pinned    map[string]bool      `json:"pinned"`
+	// Waiters is the queue, kept so a restart does not drop requests their sessions were told
+	// would be granted.
+	Waiters []*Waiter `json:"waiters,omitempty"`
+	// HotSince and HotRefused carry a hot spell across a restart: when it began, and the
+	// sessions refused work during it, who are told when it has cooled.
+	HotSince   *time.Time `json:"hot_since,omitempty"`
+	HotRefused []string   `json:"hot_refused,omitempty"`
 	// Touches records, per resource, when each session last ran a command that used it.
 	Touches map[string]map[string]time.Time `json:"touches"`
 	// Learned is the observed peak memory per estimate key (kind, or kind@project), in MB.
@@ -478,6 +496,8 @@ type Waiter struct {
 	TTLMinutes   int    `json:"ttl_minutes,omitempty"`
 	UntilMinutes int    `json:"until_minutes,omitempty"`
 	Declared     bool   `json:"declared,omitempty"`
+	// Background marks a command the agent runs in the background: no call says when it ends.
+	Background bool `json:"background,omitempty"`
 	// Retry marks a request only its own retry can complete (a restore has to start the thing
 	// as well), so no lease is granted for it from the queue.
 	Retry bool `json:"retry,omitempty"`

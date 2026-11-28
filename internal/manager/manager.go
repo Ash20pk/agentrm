@@ -64,6 +64,7 @@ type Manager struct {
 	agentSessions map[int]string
 	recent        map[string][]cmdRecord
 	hookSeen      map[string]time.Time // agent kind -> last hook call
+	switchHint    map[string]time.Time // session -> when it last ran a git checkout or switch
 	claimRefused  map[string]bool      // "pid session": a hook that named another agent's session, reported once
 	waiters       []*model.Waiter
 	swapRate      float64
@@ -116,6 +117,7 @@ type Manager struct {
 	leakTracks      map[procKey]*leakTrack    // large processes watched for leaks (leaks.go)
 	leakProcs       map[int]*sys.Proc         // the process table the leak watch last saw
 	procUID         func(pid int) (int, bool) // who a process runs as; nil in tests
+	heat            heatState                 // the Mac running hot (heat.go)
 
 	// The vault (vault.go): live credentials, in memory only, and the API-key proxy.
 	vaultLive   map[string]*vaultLive // grant ID -> credential
@@ -159,6 +161,7 @@ func New(o Options) *Manager {
 		missing: map[string]int{}, hookSeen: map[string]time.Time{}, claimRefused: map[string]bool{}, infos: newInfoCache(nil), stale: map[int]bool{}, selfPID: os.Getpid(),
 		parked: map[*model.Waiter][]chan *api.AcquireResp{}, backfilled: map[*model.Waiter]map[string]bool{},
 		kick: make(chan struct{}, 1), readFast: sys.ReadFast, restartedAt: map[string]*restartMark{}, preps: map[string]*prep{},
+		heat:      heatState{refused: map[string]bool{}},
 		vaultLive: map[string]*vaultLive{}, vaultTok: map[string]string{},
 	}
 	m.notify = o.Notify
@@ -180,6 +183,18 @@ func New(o Options) *Manager {
 	cfg, notes := store.LoadConfig(o.Dir, m.mem.TotalMB)
 	st, snotes := store.LoadState(o.Dir, now())
 	m.cfg, m.st = cfg, st
+	// The queue as it was. A restore's place is not kept: only its own retry completes it.
+	for _, w := range st.Waiters {
+		if w != nil && !w.Retry {
+			m.waiters = append(m.waiters, w)
+		}
+	}
+	// A hot spell the restart interrupted goes on: who was asked or refused is still told when
+	// it has cooled, and nobody is asked or notified a second time.
+	m.heat.since = st.HotSince
+	for _, id := range st.HotRefused {
+		m.heat.refused[id] = true
+	}
 	m.seedFreed()
 	m.notes = append(notes, snotes...)
 	m.applyLogLevel()
@@ -262,6 +277,12 @@ func (m *Manager) persist() {
 		m.mu.Unlock()
 		return
 	}
+	m.st.Waiters = m.waiters
+	m.st.HotSince, m.st.HotRefused = m.heat.since, nil
+	for id := range m.heat.refused {
+		m.st.HotRefused = append(m.st.HotRefused, id)
+	}
+	sort.Strings(m.st.HotRefused)
 	b, err := json.MarshalIndent(m.st, "", "  ")
 	m.dirty = false
 	m.mu.Unlock()
@@ -548,7 +569,7 @@ func (m *Manager) status(c api.Caller, r api.Req) (any, []Effect, error) {
 	week, _ := m.freedMB(now.AddDate(0, 0, -7), now)
 	return &api.Status{
 		APIVersion: api.Version, DaemonVersion: m.version,
-		Mem: m.mem, HeadroomMB: m.headroomMB(), PendingMB: m.pendingMB(), SwapRate: m.swapRate,
+		Mem: m.mem, HeadroomMB: m.headroomMB(), PendingMB: m.pendingMB(), SwapRate: m.swapRate, HotSince: m.heat.since,
 		Waiters: m.liveWaiters(m.now()), Config: m.cfg, Leases: m.st.Leases, Resources: m.st.Resources,
 		Sessions: m.st.Sessions, Questions: m.st.Questions, LastSweep: m.lastSweep, Events: m.events,
 		Learned: m.st.Learned, Stopped: m.st.Stopped, Approvals: m.st.Approvals, Sources: src,

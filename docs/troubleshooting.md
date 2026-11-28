@@ -2,9 +2,10 @@
 
 Start with `agentrm setup check` and `agentrm status`. Both say what is wrong in plain words.
 
-**"the daemon is not running"** — Open AgentRM. If the menu says macOS needs approval, allow
-AgentRM in System Settings → General → Login Items. The daemon's log is
-`~/.agentrm/agentrm.log`.
+**"the daemon is not running"** — Open AgentRM: the app runs the daemon while it is open and stops
+it when you quit. To have it running all the time, add AgentRM to System Settings → General →
+Login Items. The daemon's log is `~/.agentrm/agentrm.log`; if it fails to start, its last error
+is in `~/.agentrm/daemon.err`.
 
 **"this client speaks API version N and the daemon speaks M"** — the app was updated but the
 daemon was not restarted. The daemon exits within about 15 seconds of its binary being replaced,

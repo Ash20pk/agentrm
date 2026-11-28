@@ -32,6 +32,7 @@ type Config struct {
 	UnverifiedTTLMinutes int     `json:"unverified_ttl_minutes"`     // lifetime of a claim with no evidence behind it
 	MinDiskGB            float64 `json:"min_disk_gb"`                // refuse disk-heavy leases below this free space on /
 	MaxLoadPerCore       float64 `json:"max_load_per_core"`          // refuse builds above this 1-minute load per core
+	ThermalLevel         int     `json:"thermal_level"`              // running hot from this macOS thermal pressure (2 heavy, 3 critical, 0 off): builds wait, busy agents are asked to ease off
 	MaxSessionShare      float64 `json:"max_session_share"`          // while others wait, one session may hold at most this share of usable memory
 	MaxWaitMinutes       int     `json:"max_wait_minutes,omitempty"` // a queued request is granted after this long unless the Mac is swapping (0: 15, -1: never)
 	RequireAppApproval   bool    `json:"require_app_approval"`       // privileged actions from a terminal need a click in the app
@@ -64,13 +65,34 @@ type Config struct {
 	TraceDays   int  `json:"trace_days"`   // daily trace files kept
 }
 
+// Sanitize puts back the default for a value no setting of it can mean (a hand-edited
+// config.json): a lease that expires as it is granted, a reserve below nothing or above what
+// the Mac has (every request would be refused as never fitting), a share outside 0 to 1. It
+// says what it changed.
+func (c *Config) Sanitize(totalMB float64) []string {
+	def := DefaultConfig()
+	ScaleToMachine(&def, totalMB)
+	var notes []string
+	fix := func(name string, bad bool, set func()) {
+		if bad {
+			set()
+			notes = append(notes, "config.json: "+name+" was out of range; using the default")
+		}
+	}
+	fix("default_ttl_minutes", c.DefaultTTLMinutes < 1, func() { c.DefaultTTLMinutes = def.DefaultTTLMinutes })
+	fix("build_ttl_minutes", c.BuildTTLMinutes < 1, func() { c.BuildTTLMinutes = def.BuildTTLMinutes })
+	fix("headroom_gb", c.HeadroomGB < 0 || (totalMB > 0 && c.HeadroomGB*1024 > totalMB/2), func() { c.HeadroomGB = def.HeadroomGB })
+	fix("max_session_share", c.MaxSessionShare < 0 || c.MaxSessionShare > 1, func() { c.MaxSessionShare = def.MaxSessionShare })
+	return notes
+}
+
 // DefaultConfig is sized for a 16 GB Mac; ScaleToMachine adjusts it to the real one.
 func DefaultConfig() Config {
 	return Config{
 		HeadroomGB: 1, MaxSwapMBPerMin: 300, PressureGraceMinutes: 2, PressureIdleMinutes: 5, UnleasedGB: 2,
 		HeavyGrowthGB: 1.5, PauseMinutes: 30, GraceMinutes: 10, DefaultTTLMinutes: 120, BuildTTLMinutes: 30,
 		SweepSeconds: 30, FastSweepSeconds: 3, DryRun: true, ExtraPatterns: map[string][]string{},
-		IdleMinutes: 30, ClaimWindowMinutes: 60, UnverifiedTTLMinutes: 30, MinDiskGB: 10, MaxLoadPerCore: 1.5,
+		IdleMinutes: 30, ClaimWindowMinutes: 60, UnverifiedTTLMinutes: 30, MinDiskGB: 10, MaxLoadPerCore: 1.5, ThermalLevel: 2,
 		MaxSessionShare: 0.6, RequireAppApproval: true, AutoThawOnConnect: true, LogLevel: "info",
 		OwnerGoneGraceMinutes: 2, OwnerGonePauseMinutes: 10, OldGenerationHours: 24, LeftoverMinMB: 40,
 		QueueMinutes: 10, GrantHoldMinutes: 3, TraceDays: 14,
