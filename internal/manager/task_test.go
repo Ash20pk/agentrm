@@ -62,7 +62,15 @@ func TestUseAfterTheTaskEndsKeepsIt(t *testing.T) {
 	la := acquire(t, m, agent("s"), "server", 0.5)
 	ra := addRes(m, "srv:3000", model.RKServer, 600, la.Lease.ID)
 	ra.Ports = []string{"3000"}
+	// Restoring a file, or the words in a commit message, leave no branch.
+	m.touchCmd(agent("s"), api.Req{Cmd: "git checkout main -- go.sum"})
+	m.touchCmd(agent("s"), api.Req{Cmd: `git commit -m "explain git checkout usage"`})
+	onBranch(m, "s", "feat-a")
+	if m.st.Leases[la.Lease.ID].TaskDoneAt != nil {
+		t.Fatal("a checkout of a file ended the task")
+	}
 	m.touchCmd(agent("s"), api.Req{Cmd: "git switch main"})
+	onBranch(m, "s", "main") // its next request comes from main
 	if m.st.Leases[la.Lease.ID].TaskDoneAt == nil {
 		t.Fatal("switching branch did not end the task")
 	}
@@ -74,10 +82,11 @@ func TestUseAfterTheTaskEndsKeepsIt(t *testing.T) {
 	if ra.LeaseID == "" || m.st.Leases[la.Lease.ID].TaskDoneAt != nil {
 		t.Fatal("a server used after its task ended was released")
 	}
-	// Switching to the branch it is already on, or `git checkout -- file`, ends nothing.
-	m.noticeTaskEnd("s", "git checkout feat-a", c.Now())
-	m.noticeTaskEnd("s", "git checkout -- src/x.go", c.Now())
+	// Another worktree of the repository, with no checkout run, ends nothing either.
+	onBranch(m, "s", "feat-a")
+	c.Add(switchWindow + time.Second)
+	onBranch(m, "s", "other-worktree")
 	if m.st.Leases[la.Lease.ID].TaskDoneAt != nil {
-		t.Fatal("a checkout that does not leave the branch ended the task")
+		t.Fatal("a change of branch the session did not make ended the task")
 	}
 }

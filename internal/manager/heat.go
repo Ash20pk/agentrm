@@ -185,7 +185,7 @@ func (m *Manager) cooled(now time.Time) {
 }
 
 // dropCoolNotes forgets "cooled down" notes once read or an hour old, and any request to ease
-// off left from before a restart. Must hold mu.
+// off left with no hot spell to belong to. Must hold mu.
 func (m *Manager) dropCoolNotes(now time.Time) {
 	for key, q := range m.st.Questions {
 		if id, ok := strings.CutPrefix(key, "cool:"); ok && (q.Delivered[id] || now.Sub(q.Created) > time.Hour) {

@@ -64,6 +64,7 @@ type Manager struct {
 	agentSessions map[int]string
 	recent        map[string][]cmdRecord
 	hookSeen      map[string]time.Time // agent kind -> last hook call
+	switchHint    map[string]time.Time // session -> when it last ran a git checkout or switch
 	claimRefused  map[string]bool      // "pid session": a hook that named another agent's session, reported once
 	waiters       []*model.Waiter
 	swapRate      float64
@@ -188,6 +189,12 @@ func New(o Options) *Manager {
 			m.waiters = append(m.waiters, w)
 		}
 	}
+	// A hot spell the restart interrupted goes on: who was asked or refused is still told when
+	// it has cooled, and nobody is asked or notified a second time.
+	m.heat.since = st.HotSince
+	for _, id := range st.HotRefused {
+		m.heat.refused[id] = true
+	}
 	m.seedFreed()
 	m.notes = append(notes, snotes...)
 	m.applyLogLevel()
@@ -271,6 +278,11 @@ func (m *Manager) persist() {
 		return
 	}
 	m.st.Waiters = m.waiters
+	m.st.HotSince, m.st.HotRefused = m.heat.since, nil
+	for id := range m.heat.refused {
+		m.st.HotRefused = append(m.st.HotRefused, id)
+	}
+	sort.Strings(m.st.HotRefused)
 	b, err := json.MarshalIndent(m.st, "", "  ")
 	m.dirty = false
 	m.mu.Unlock()

@@ -390,6 +390,10 @@ type State struct {
 	// Waiters is the queue, kept so a restart does not drop requests their sessions were told
 	// would be granted.
 	Waiters []*Waiter `json:"waiters,omitempty"`
+	// HotSince and HotRefused carry a hot spell across a restart: when it began, and the
+	// sessions refused work during it, who are told when it has cooled.
+	HotSince   *time.Time `json:"hot_since,omitempty"`
+	HotRefused []string   `json:"hot_refused,omitempty"`
 	// Touches records, per resource, when each session last ran a command that used it.
 	Touches map[string]map[string]time.Time `json:"touches"`
 	// Learned is the observed peak memory per estimate key (kind, or kind@project), in MB.

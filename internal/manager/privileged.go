@@ -262,7 +262,7 @@ func (m *Manager) stopNow(c api.Caller, r api.Req) (any, []Effect, error) {
 	}
 	m.pending[res.ID] = "stop"
 	why := "stopped by " + c.Session
-	m.decide("stop", res, why+" (by hand)")
+	m.decideAs("stop", res, why+" (by hand)", true)
 	return &api.StopResp{Restart: "agentrm restore " + res.ID},
 		[]Effect{{Op: "stop", Res: *res, Why: why, By: c.Session}}, nil
 }

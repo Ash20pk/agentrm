@@ -387,6 +387,15 @@ func (m *Manager) merge(found discover.Result, procs map[int]*sys.Proc, est map[
 	for _, r := range found.Resources {
 		seen[r.ID] = true
 		old := m.st.Resources[r.ID]
+		if old != nil && old.PID > 0 && r.PID > 0 && !old.ProcStart.IsZero() && !r.ProcStart.IsZero() {
+			// An id made from a PID names another process once the PID is reused (across a
+			// restart or a reboot): it does not inherit who started the first, that it was
+			// paused, or your pin on it.
+			if d := r.ProcStart.Sub(old.ProcStart); old.PID != r.PID || d > 3*time.Second || d < -3*time.Second {
+				old = nil
+				delete(m.st.Pinned, r.ID)
+			}
+		}
 		if old != nil {
 			r.FirstSeen, r.LeaseID, r.OrphanSince = old.FirstSeen, old.LeaseID, old.OrphanSince
 			r.LastActive = old.LastActive
@@ -574,6 +583,9 @@ func (m *Manager) startedBy(r *model.Resource, procs map[int]*sys.Proc, now time
 // no agent is running, or every running agent reports its commands through hooks and none has
 // run one in the last 10 minutes.
 func (m *Manager) agentsQuiet(procs map[int]*sys.Proc, now time.Time) bool {
+	if procs == nil {
+		return false // the process table could not be read: nothing is certain
+	}
 	agents := 0
 	for _, p := range procs {
 		if k := sys.AgentKind(p); k != "" {

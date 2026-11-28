@@ -98,6 +98,7 @@ func (m *Manager) resolve(f facts, req *api.Req) api.Caller {
 	if c.Session != "detached" {
 		s := m.touchSession(c.Session, c.Agent, req.Cwd)
 		if s != nil && req.Branch != "" {
+			m.branchMoved(c.Session, s, req.Repo, req.Branch, m.now())
 			s.Repo, s.Branch = req.Repo, req.Branch
 		}
 	}

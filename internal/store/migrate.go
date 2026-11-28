@@ -1,6 +1,7 @@
 package store
 
 import (
+	"strings"
 	"time"
 
 	"agentrm/internal/model"
@@ -78,7 +79,19 @@ func Migrate(st *model.State, now time.Time) []string {
 	for _, r := range st.Resources {
 		r.OrphanSince = nil
 	}
-	st.Questions = fresh.Questions
+	// Except what was said about heat: a session that eased off is owed the news that it cooled.
+	kept := fresh.Questions
+	for key, q := range st.Questions {
+		if q != nil && (strings.HasPrefix(key, "hot:") || strings.HasPrefix(key, "cool:")) {
+			kept[key] = q
+		}
+	}
+	st.Questions = kept
+	// A lease asked about before the restart is asked again: the clock on an answer to a
+	// question that no longer exists would release it unheard.
+	for _, l := range st.Leases {
+		l.IdleAsked, l.TaskDoneAt, l.TaskDoneWhy = nil, nil, ""
+	}
 	// Approvals expire; a restart is a good moment to drop the stale ones.
 	for id, a := range st.Approvals {
 		if now.After(a.Expires) {

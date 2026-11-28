@@ -41,9 +41,31 @@ func (m *Manager) noticeTaskEnd(session, cmd string, now time.Time) {
 	case prCreate.MatchString(cmd):
 		m.taskDone(session, s.Repo, s.Branch, "a pull request was opened from it", now)
 	case branchSwitch.MatchString(cmd):
-		if to := branchSwitch.FindStringSubmatch(cmd)[1]; to != s.Branch && to != "." && !strings.HasPrefix(to, "--") {
-			m.taskDone(session, s.Repo, s.Branch, "the session switched to "+to, now)
+		// Only a hint: `git checkout src/x.go` restores a file, and the words can sit inside a
+		// commit message. The task ends when the branch is seen to have changed (branchMoved).
+		if m.switchHint == nil {
+			m.switchHint = map[string]time.Time{}
 		}
+		m.switchHint[session] = now
+	}
+}
+
+// switchWindow is how long after a checkout or switch command a change of branch counts as
+// the session leaving its task.
+const switchWindow = 2 * time.Minute
+
+// branchMoved is called when a session's requests start coming from another branch of the
+// repository it was in, before the session is moved to it. The task on the branch it left is
+// finished if the session itself just ran a checkout or switch: a session that only walked into
+// another worktree of the repository left nothing. Must hold mu.
+func (m *Manager) branchMoved(session string, s *model.Session, repo, branch string, now time.Time) {
+	if s.Branch == "" || s.Repo != repo || s.Branch == branch {
+		return
+	}
+	hint, ok := m.switchHint[session]
+	delete(m.switchHint, session)
+	if ok && now.Sub(hint) <= switchWindow {
+		m.taskDone(session, s.Repo, s.Branch, "the session switched to "+branch, now)
 	}
 }
 

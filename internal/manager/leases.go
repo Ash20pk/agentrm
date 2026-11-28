@@ -92,7 +92,14 @@ func (m *Manager) acquire(c api.Caller, r api.Req) (any, []Effect, error) {
 	fast := m.readFast() // pressure, load and disk right now, not as of the last sweep
 	m.mem.PressureLevel, m.mem.Load1, m.mem.Cores, m.mem.DiskFreeGB = fast.PressureLevel, fast.Load1, fast.Cores, fast.DiskFreeGB
 	m.mem.Thermal = fast.Thermal
-	if why := m.busy(r.Kind); why != "" {
+	if lvl := m.cfg.ThermalLevel; lvl > 0 && m.mem.Thermal >= lvl && m.heat.since == nil {
+		// Hot as of this reading: the spell begins now, not at the next sweep. A refusal with
+		// no spell behind it was never followed by the promised word that it had cooled.
+		m.watchHeat(now)
+	}
+	// Not while everything is let through (your bypass, or the daemon not trusting its own
+	// figures): that covers a busy disk, CPU or a hot Mac as much as memory.
+	if why := m.busy(r.Kind); why != "" && m.failOpen(now) == "" {
 		m.noteHeatRefusal(c.Session)
 		return &api.AcquireResp{Reason: why}, nil, nil
 	}
