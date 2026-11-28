@@ -1,6 +1,6 @@
 cask "agentrm" do
-  version "0.2.0"
-  sha256 "8f52012447692908ff86f179bdd5d9e4276090033fa156c2ffd9e16e57bc5ced"
+  version "0.3.0"
+  sha256 "870fec6ba98d3387b4c6524c49dbd501db7b1019aac619b2311a741b9758f841"
 
   url "https://github.com/Ash20pk/agentrm/releases/download/v#{version}/AgentRM-#{version}.dmg"
   name "AgentRM"
